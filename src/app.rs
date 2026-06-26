@@ -2158,12 +2158,27 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
             const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
             loop {
                 let mut disconnected = false;
-                while let Ok(shell_evt) = shell_rx.try_recv() {
-                    match shell_evt {
-                        SessionEvent::Output(text) => {
+                // Drain available events, capping accumulated output at
+                // MAX_BUF_SIZE. Under continuous high-volume output (tail -f,
+                // cat of a large file) the channel always has data, so an
+                // unbounded drain would buffer megabytes in one pass and then
+                // flush a single giant Output event — forcing the UI thread to
+                // vt100-parse it all synchronously and freezing the window
+                // until the backlog clears. Bounding the batch keeps each flush
+                // chunk small: the UI thread ingests only a little per frame
+                // and stays responsive while the rest drains across successive
+                // iterations. We also detect Empty/Disconnected in this same
+                // loop (the old second try_recv raced and could drop an event
+                // that arrived between the two calls).
+                loop {
+                    match shell_rx.try_recv() {
+                        Ok(SessionEvent::Output(text)) => {
                             output_buf.push_str(&text);
+                            if output_buf.len() >= MAX_BUF_SIZE {
+                                break; // flush this batch; resume draining next iteration
+                            }
                         }
-                        SessionEvent::CwdChanged(cwd) => {
+                        Ok(SessionEvent::CwdChanged(cwd)) => {
                             let changed = match sftp_last_cwd_pump.lock() {
                                 Ok(mut m) => {
                                     m.insert(tab_id_pump.clone(), cwd.clone())
@@ -2190,16 +2205,15 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 pending_events.push(SessionEvent::CwdChanged(cwd));
                             }
                         }
-                        other => {
+                        Ok(other) => {
                             pending_events.push(other);
                         }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
                     }
-                }
-                match shell_rx.try_recv() {
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                    }
-                    _ => {}
                 }
                 let now = std::time::Instant::now();
                 let should_flush = now.duration_since(last_flush) >= FLUSH_INTERVAL
