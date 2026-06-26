@@ -2132,6 +2132,10 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     };
 
     // --- Shell event pump (dedicated thread) ---
+    // Uses a streaming buffer with periodic flushing for smooth real-time output.
+    // When tail -f or other high-volume output occurs, data accumulates in a buffer
+    // and is flushed to the UI at regular intervals (every 50ms), preventing UI thread
+    // saturation while maintaining responsive streaming.
     {
         let weak_inner = ctx.weak.clone();
         let bufs_thread = ctx.bufs.clone();
@@ -2146,16 +2150,20 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
+            let mut output_buf = String::new();
+            let mut pending_events: Vec<SessionEvent> = Vec::new();
+            let mut last_flush = std::time::Instant::now();
+            const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+            const MAX_BUF_SIZE: usize = 64 * 1024;
+            const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
             loop {
-                match shell_rx.blocking_recv() {
-                    None => break,
-                    Some(shell_evt) => {
-                        if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
-                            // Shared map (not a thread-local) so manual SFTP
-                            // navigation can clear the entry — then the very
-                            // next OSC 7, same directory or not, snaps the
-                            // panel back to the shell's cwd. Unchanged repeats
-                            // (every prompt re-emits OSC 7) are ignored (#59).
+                let mut disconnected = false;
+                while let Ok(shell_evt) = shell_rx.try_recv() {
+                    match shell_evt {
+                        SessionEvent::Output(text) => {
+                            output_buf.push_str(&text);
+                        }
+                        SessionEvent::CwdChanged(cwd) => {
                             let changed = match sftp_last_cwd_pump.lock() {
                                 Ok(mut m) => {
                                     m.insert(tab_id_pump.clone(), cwd.clone())
@@ -2164,45 +2172,66 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 }
                                 Err(_) => false,
                             };
-                            // Swallow the event entirely when follow-cd is off:
-                            // forwarding it would set sftp_loading without any
-                            // ListDir to clear it (the #59 stuck-"loading" trap).
-                            if !changed
-                                || !follow_cd_pump
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                            {
-                                continue;
-                            }
-                            if let Some(prev) = cwd_debounce.take() {
-                                prev.abort();
-                            }
-                            let cwd = cwd.clone();
-                            let sftp_h = sftp_handles_pump.clone();
-                            let tid = tab_id_pump.clone();
-                            cwd_debounce = Some(rt_pump.spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                if let Ok(handles) = sftp_h.lock() {
-                                    if let Some(h) = handles.get(&tid) {
-                                        h.list_dir(cwd);
-                                    }
+                            if changed && follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed) {
+                                if let Some(prev) = cwd_debounce.take() {
+                                    prev.abort();
                                 }
-                            }));
-                        }
-                        let weak_evt = weak_inner.clone();
-                        let tid = tab_id_pump.clone();
-                        let bufs_evt = bufs_thread.clone();
-                        let st_evt = statuses_pump.clone();
-                        let lc_evt = local_pump.clone();
-                        let nh_evt = net_pump.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(win) = weak_evt.upgrade() {
-                                apply_session_event_to_window(
-                                    &win, &tid, shell_evt, &bufs_evt, &st_evt, &lc_evt, &nh_evt,
-                                );
+                                let cwd_clone = cwd.clone();
+                                let sftp_h = sftp_handles_pump.clone();
+                                let tid = tab_id_pump.clone();
+                                cwd_debounce = Some(rt_pump.spawn(async move {
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                    if let Ok(handles) = sftp_h.lock() {
+                                        if let Some(h) = handles.get(&tid) {
+                                            h.list_dir(cwd_clone);
+                                        }
+                                    }
+                                }));
+                                pending_events.push(SessionEvent::CwdChanged(cwd));
                             }
-                        });
+                        }
+                        other => {
+                            pending_events.push(other);
+                        }
                     }
                 }
+                match shell_rx.try_recv() {
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                    }
+                    _ => {}
+                }
+                let now = std::time::Instant::now();
+                let should_flush = now.duration_since(last_flush) >= FLUSH_INTERVAL
+                    || output_buf.len() >= MAX_BUF_SIZE
+                    || !pending_events.is_empty()
+                    || disconnected;
+                if should_flush && !output_buf.is_empty() {
+                    pending_events.push(SessionEvent::Output(std::mem::take(&mut output_buf)));
+                }
+                if !pending_events.is_empty() {
+                    let weak_evt = weak_inner.clone();
+                    let tid = tab_id_pump.clone();
+                    let bufs_evt = bufs_thread.clone();
+                    let st_evt = statuses_pump.clone();
+                    let lc_evt = local_pump.clone();
+                    let nh_evt = net_pump.clone();
+                    let events_to_send = std::mem::take(&mut pending_events);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(win) = weak_evt.upgrade() {
+                            for evt in events_to_send {
+                                apply_session_event_to_window(
+                                    &win, &tid, evt, &bufs_evt, &st_evt, &lc_evt, &nh_evt,
+                                );
+                            }
+                        }
+                    });
+                    last_flush = now;
+                }
+                if disconnected {
+                    break;
+                }
+                std::thread::sleep(POLL_INTERVAL);
             }
         });
     }
