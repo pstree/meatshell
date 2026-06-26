@@ -427,6 +427,12 @@ pub struct ConfigFile {
     /// Terminal font size in px. 0 = the built-in default.
     #[serde(default)]
     pub font_size: u32,
+    /// Command input font family. Empty = follow the built-in command default.
+    #[serde(default)]
+    pub command_font_family: String,
+    /// Command input font size in px. 0 = the built-in command default.
+    #[serde(default)]
+    pub command_font_size: u32,
     /// Global UI scale in percent (#100). 0 = default (100%).
     #[serde(default)]
     pub ui_scale: u32,
@@ -751,6 +757,28 @@ impl ConfigStore {
 
     pub fn set_font_size(&mut self, size: u32) {
         self.cache.font_size = size.clamp(8, 32);
+    }
+
+    /// Command input font family ("" = built-in command default).
+    pub fn command_font_family(&self) -> &str {
+        &self.cache.command_font_family
+    }
+
+    pub fn set_command_font_family(&mut self, family: String) {
+        self.cache.command_font_family = family;
+    }
+
+    /// Command input font size in px (falls back to 13 when unset).
+    pub fn command_font_size(&self) -> u32 {
+        if self.cache.command_font_size == 0 {
+            13
+        } else {
+            self.cache.command_font_size
+        }
+    }
+
+    pub fn set_command_font_size(&mut self, size: u32) {
+        self.cache.command_font_size = size.clamp(8, 32);
     }
 
     /// Global UI scale in percent (#100). Defaults to 100.

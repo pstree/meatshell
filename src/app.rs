@@ -339,8 +339,8 @@ pub fn run() -> Result<()> {
     // shell (#158); on Windows/Linux they stay Ctrl-based.
     window.set_is_mac(cfg!(target_os = "macos"));
 
-    // Apply the saved terminal font (Interface settings). An empty family keeps
-    // the built-in default; the size always applies (defaults to 13).
+    // Apply the saved font settings. Empty families keep the built-in defaults;
+    // sizes always apply (defaulting to 13).
     {
         let s = store.borrow();
         let fam = s.font_family().to_string();
@@ -348,6 +348,11 @@ pub fn run() -> Result<()> {
             window.set_term_font_family(fam.into());
         }
         window.set_term_font_size(s.font_size() as f32);
+        let cmd_fam = s.command_font_family().to_string();
+        if !cmd_fam.is_empty() {
+            window.set_command_font_family(cmd_fam.into());
+        }
+        window.set_command_font_size(s.command_font_size() as f32);
         window.set_ui_scale(s.ui_scale() as f32 / 100.0); // global UI zoom (#100)
     }
 
@@ -477,7 +482,7 @@ pub fn run() -> Result<()> {
         });
     }
 
-    // Interface settings: apply + persist the terminal font family / size.
+    // Interface settings: apply + persist terminal and command-input fonts.
     {
         let weak = window.as_weak();
         let store = store.clone();
@@ -503,6 +508,34 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_term_font_size(size as f32);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_command_font(move |family: SharedString| {
+            {
+                let mut s = store.borrow_mut();
+                s.set_command_font_family(family.to_string());
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_command_font_family(family);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_command_font_size(move |size: i32| {
+            {
+                let mut s = store.borrow_mut();
+                s.set_command_font_size(size as u32);
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_command_font_size(size as f32);
             }
         });
     }

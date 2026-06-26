@@ -326,6 +326,8 @@ export component AppWindow inherits Window {
     changed dark-mode => { Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light; }
     in-out property <string> term-font-family <=> Theme.term-font-family;
     in-out property <length> term-font-size <=> Theme.term-font-size;
+    in-out property <string> command-font-family <=> Theme.command-font-family;
+    in-out property <length> command-font-size <=> Theme.command-font-size;
     in-out property <float> ui-scale <=> Theme.ui-scale;   // global UI zoom (#100)
     in-out property <string> ui-font-family <=> Theme.ui-font-family;
     // Window focused & visible — Rust drives it from winit events; gates the
@@ -349,8 +351,10 @@ export component AppWindow inherits Window {
     property <length> ifd-base-y;
     property <length> ifd-grab-x;
     property <length> ifd-grab-y;
-    callback set-term-font(string);                // apply + persist font family
-    callback set-term-font-size(int);              // apply + persist font size (px)
+    callback set-term-font(string);                // apply + persist terminal font family
+    callback set-term-font-size(int);              // apply + persist terminal font size (px)
+    callback set-command-font(string);             // apply + persist command input font family
+    callback set-command-font-size(int);           // apply + persist command input font size (px)
     callback set-ui-scale(int);                    // apply + persist UI scale (percent) (#100)
     // Immersive wallpaper (set by Rust). The active id + custom file basename
     // feed the Interface → Wallpaper picker.
@@ -2895,6 +2899,8 @@ export component AppWindow inherits Window {
                     term-fonts: root.term-fonts;
                     term-font-family: root.term-font-family;
                     term-font-size: root.term-font-size;
+                    command-font-family: root.command-font-family;
+                    command-font-size: root.command-font-size;
                     ui-scale: root.ui-scale;
                     sftp-follow-cd <=> root.sftp-follow-cd;
                     collapse-sidebar-default <=> root.collapse-sidebar-default;
@@ -2907,6 +2913,8 @@ export component AppWindow inherits Window {
                     pick-wallpaper-file() => { root.pick-wallpaper-file(); }
                     set-term-font(v) => { root.set-term-font(v); }
                     set-term-font-size(v) => { root.set-term-font-size(v); }
+                    set-command-font(v) => { root.set-command-font(v); }
+                    set-command-font-size(v) => { root.set-command-font-size(v); }
                     set-ui-scale(v) => { root.set-ui-scale(v); }
                     set-sftp-follow-cd(v) => { root.set-sftp-follow-cd(v); }
                     set-collapse-sidebar-default(v) => { root.set-collapse-sidebar-default(v); }

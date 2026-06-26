@@ -114,6 +114,11 @@ export global Theme {
     in-out property <string> term-font-family: "Meatshell Mono";
     in-out property <length> term-font-size: 13px;
 
+    // Command input font — separate from the terminal grid so the command bar can
+    // use an editable-input-friendly font without changing PTY cell metrics.
+    in-out property <string> command-font-family: "Meatshell Mono";
+    in-out property <length> command-font-size: 13px;
+
     // --- Geometry ----------------------------------------------------------
     out property <length> radius-sm: 4px * root.ui-scale;
     out property <length> radius-md: 6px * root.ui-scale;

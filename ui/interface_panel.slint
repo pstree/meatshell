@@ -179,6 +179,8 @@ export component InterfacePanel inherits Rectangle {
     in property <[string]> term-fonts;
     in property <string> term-font-family;
     in property <length> term-font-size;
+    in property <string> command-font-family;
+    in property <length> command-font-size;
     in property <float> ui-scale;
     in-out property <bool> sftp-follow-cd;
     in-out property <bool> collapse-sidebar-default;
@@ -196,6 +198,8 @@ export component InterfacePanel inherits Rectangle {
 
     callback set-term-font(string);
     callback set-term-font-size(int);
+    callback set-command-font(string);
+    callback set-command-font-size(int);
     callback set-ui-scale(int);
     callback set-sftp-follow-cd(bool);
     callback set-collapse-sidebar-default(bool);
@@ -274,6 +278,24 @@ export component InterfacePanel inherits Rectangle {
                     Stepper {
                         value: root.term-font-size / 1px; minimum: 8; maximum: 32; step: 1; unit: "px";
                         changed(v) => { root.set-term-font-size(v); }
+                    }
+                }
+                SettingRow {
+                    label: root.lang-en ? "Command input font" : "命令输入字体";
+                    desc: root.lang-en ? "Used by the command bar only; terminal output keeps its own font."
+                                       : "仅用于底部命令栏,不影响终端输出字体。";
+                    ComboBox {
+                        width: 220px;
+                        model: root.term-fonts;
+                        current-value: root.command-font-family;
+                        selected(v) => { root.set-command-font(v); }
+                    }
+                }
+                SettingRow {
+                    label: root.lang-en ? "Command input font size" : "命令输入字体大小";
+                    Stepper {
+                        value: root.command-font-size / 1px; minimum: 8; maximum: 32; step: 1; unit: "px";
+                        changed(v) => { root.set-command-font-size(v); }
                     }
                 }
                 SettingRow {
