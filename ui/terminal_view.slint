@@ -96,6 +96,7 @@ export component TerminalView inherits Rectangle {
     in property <bool>   is-alt-screen;
     in property <[TermMatch]> find-matches; // search-highlight rectangles
     in property <[TermMatch]> selection;    // drag-selection highlight rectangles
+    callback select-word(int, int);
 
     in property <string>  sftp-path: "/";
     in property <[SftpEntry]> sftp-entries;
@@ -479,6 +480,12 @@ export component TerminalView inherits Rectangle {
                                 }
                                 accept
                             }
+                            double-clicked => {
+                                root.select-word(
+                                    floor(self.mouse-y / root.cell-h),
+                                    floor(self.mouse-x / root.cell-w)
+                                );
+                            }
                         }
 
                         // Drag-selection highlights (under the text, blue tint).
@@ -631,30 +638,26 @@ export component TerminalView inherits Rectangle {
                     // to reach the shell (^C/^X… work in nano/vim) (#158). The app
                     // accelerator below is `meta` on macOS, `control` elsewhere.
                     // ── Find: ⌘F / Ctrl+F (mirrors right-click → Find) ──
-                    if ((Theme.is-mac ? event.modifiers.meta : event.modifiers.control)
-                            && !event.modifiers.shift
+                    if (event.modifiers.control
                             && (event.text == "f" || event.text == "F"
                                 || event.text == "\u{0006}")) {
                         root.find-active = true;
                         accept
                     // ── Jump to command-history search: ⌘⇧R / Ctrl+Shift+R (#140).
                     // Shifted so the shell keeps its own Ctrl+R reverse-search.
-                    } else if ((Theme.is-mac ? event.modifiers.meta : event.modifiers.control)
-                            && event.modifiers.shift
+                    } else if ((event.modifiers.control)
                             && (event.text == "r" || event.text == "R"
                                 || event.text == "\u{0012}")) {
                         root.history-open = true;
                         accept
                     // ── Copy: ⌘C (macOS) / Ctrl+Shift+C ──
-                    } else if ((Theme.is-mac
-                                ? (event.modifiers.meta && !event.modifiers.shift)
-                                : (event.modifiers.control && event.modifiers.shift))
+                    } else if ((event.modifiers.control)
                             && (event.text == "c" || event.text == "C"
                                 || event.text == "\u{0003}")) {
                         root.copy-terminal-text();
                         accept
                     // ── Paste: ⌘V / Ctrl+V (Ctrl+Shift+V also accepted) ──
-                    } else if ((Theme.is-mac ? event.modifiers.meta : event.modifiers.control)
+                    } else if ((event.modifiers.control)
                             && (event.text == "v" || event.text == "V"
                                 || event.text == "\u{0016}")) {
                         root.paste-from-clipboard();
@@ -664,14 +667,14 @@ export component TerminalView inherits Rectangle {
                         accept
                     // ── macOS: swallow any other ⌘ combo so it isn't typed into
                     // the shell as a literal character. ──
-                    } else if (Theme.is-mac && event.modifiers.meta) {
+                    } else if (event.modifiers.control) {
                         accept
                     // ── All other keys (printable, Ctrl+X, arrows, …) → the shell.
                     // `control` here is the *physical* Ctrl key (Cmd is meta), so
                     // ^X/^C reach the PTY on every platform (#158). Return `accept`
                     // for everything: `reject` would bubble and drop the char.
                     } else {
-                        root.send-key(event.text, event.modifiers.control,
+                        root.send-key(event.text, event.modifiers.control || event.modifiers.meta,
                                       event.modifiers.alt, event.modifiers.shift);
                         accept
                     }
@@ -857,12 +860,12 @@ export component TerminalView inherits Rectangle {
                             root.history-cursor = -1;
                         }
                         key-pressed(e) => {
-                            // ⌘R / Ctrl+R opens the searchable history dropdown and
-                            // focuses its search box — full keyboard history recall
-                            // (#140). Esc closes it / returns to terminal. (The
-                            // Ctrl+A/E/K/U line-editing below stays on Ctrl — those
-                            // are the standard readline bindings on macOS too.)
-                            if ((Theme.is-mac ? e.modifiers.meta : e.modifiers.control)
+                            // Win+R (macOS mech kbd) / Ctrl+R opens the searchable history dropdown
+                            // and focuses its search box — full keyboard history recall (#140).
+                            // Esc closes it / returns to terminal. (The Ctrl+A/E/K/U
+                            // line-editing below stays on Ctrl — those are the standard
+                            // readline bindings on macOS too.)
+                            if ((Theme.is-mac ? e.modifiers.control : e.modifiers.control)
                                     && (e.text == "r" || e.text == "R" || e.text == "\u{0012}")) {
                                 root.history-open = true;
                                 accept

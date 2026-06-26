@@ -592,6 +592,7 @@ export component AppWindow inherits Window {
     callback term-select-update(string /* tab-id */, int /* row */, int /* col */);
     callback term-select-end(string /* tab-id */);
     callback term-select-autoscroll(string /* tab-id */, int /* dir */);
+    callback term-select-word(string /* tab-id */, int /* row */, int /* col */);
 
     // Immersive wallpaper layer — painted behind everything, filling the window.
     // Panels/terminal frost over it (see Theme.frost). Only present when active.
@@ -965,6 +966,7 @@ export component AppWindow inherits Window {
                     select-update(r, c) => { root.term-select-update(term.id, r, c); }
                     select-end() => { root.term-select-end(term.id); }
                     select-autoscroll(dir) => { root.term-select-autoscroll(term.id, dir); }
+                    select-word(r, c) => { root.term-select-word(term.id, r, c); }
                 }
             }
             }
@@ -1167,7 +1169,7 @@ export component AppWindow inherits Window {
             // Ctrl+S saves, Esc closes. These bubble up from the focused
             // TextInput because it doesn't consume them.
             key-pressed(e) => {
-                if (e.text == "s" && (Theme.is-mac ? e.modifiers.meta : e.modifiers.control)) {
+                if (e.text == "s" && (e.modifiers.control)) {
                     root.save-file();
                     return accept;
                 }
