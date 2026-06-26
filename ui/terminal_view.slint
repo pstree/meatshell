@@ -650,12 +650,6 @@ export component TerminalView inherits Rectangle {
                                 || event.text == "\u{0012}")) {
                         root.history-open = true;
                         accept
-                    // ── Copy: ⌘C (macOS) / Ctrl+Shift+C ──
-                    } else if ((event.modifiers.control)
-                            && (event.text == "c" || event.text == "C"
-                                || event.text == "\u{0003}")) {
-                        root.copy-terminal-text();
-                        accept
                     // ── Paste: ⌘V / Ctrl+V (Ctrl+Shift+V also accepted) ──
                     } else if ((event.modifiers.control)
                             && (event.text == "v" || event.text == "V"
@@ -666,8 +660,11 @@ export component TerminalView inherits Rectangle {
                         ime-input.focus();
                         accept
                     // ── macOS: swallow any other ⌘ combo so it isn't typed into
-                    // the shell as a literal character. ──
-                    } else if (event.modifiers.control) {
+                    // the shell as a literal character. Ctrl+C must reach the
+                    // shell to interrupt the foreground process (SIGINT). ──
+                    } else if (event.modifiers.control
+                            && !(event.text == "c" || event.text == "C"
+                                 || event.text == "\u{0003}")) {
                         accept
                     // ── All other keys (printable, Ctrl+X, arrows, …) → the shell.
                     // `control` here is the *physical* Ctrl key (Cmd is meta), so
