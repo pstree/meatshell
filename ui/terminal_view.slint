@@ -82,6 +82,124 @@ component MenuItem inherits Rectangle {
     }
 }
 
+// --- TerminalScrollbar -----------------------------------------------------
+// Slim overlay scrollbar on the right edge (#103). Only rendered when
+// there is scrollback and not in alt-screen mode.
+component TerminalScrollbar {
+    in property <float> scroll-max;
+    in property <float> scroll-offset;
+    in property <float> term-rows;
+    in property <bool> is-alt-screen;
+    in property <length> area-x;
+    in property <length> area-y;
+    in property <length> area-w;
+    in property <length> area-h;
+    callback terminal-scroll-to(int);
+
+    if root.scroll-max > 0 && !root.is-alt-screen : Rectangle {
+        x: root.area-x + root.area-w - 10px;
+        y: root.area-y + 4px;
+        width: 8px;
+        height: root.area-h - 8px;
+        property <float> total: root.scroll-max + root.term-rows;
+        track-ta := TouchArea {
+            moved => {
+                if (self.pressed) {
+                    root.terminal-scroll-to(clamp(
+                        round(root.scroll-max * (1 - self.mouse-y / self.height)),
+                        0, root.scroll-max));
+                }
+            }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                    root.terminal-scroll-to(clamp(
+                        round(root.scroll-max * (1 - self.mouse-y / self.height)),
+                        0, root.scroll-max));
+                }
+            }
+        }
+        Rectangle {
+            x: 1px;
+            width: 6px;
+            height: max(28px, parent.height * root.term-rows / parent.total);
+            y: (parent.height - self.height) * (root.scroll-max - root.scroll-offset) / max(1, root.scroll-max);
+            background: track-ta.has-hover || track-ta.pressed
+                ? Theme.text-secondary : Theme.border-strong;
+            border-radius: 3px;
+            animate background { duration: 100ms; }
+        }
+    }
+}
+
+// --- FindBar ----------------------------------------------------------------
+// Search overlay bar, pinned at the top of the terminal output area.
+component FindBar {
+    in property <length> area-width;
+    callback find-query-changed(string);
+    callback close();
+
+    Rectangle {
+        width: root.area-width;
+        height: 34px;
+        background: Theme.bg-panel;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        border-radius: Theme.radius-sm;
+
+        HorizontalLayout {
+            padding: 6px;
+            spacing: 6px;
+            Text {
+                text: "\u{E8B6}";
+                font-family: "Material Icons";
+                color: Theme.text-secondary;
+                font-size: Theme.fs-sm;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                background: Theme.bg-root;
+                border-radius: 3px;
+                horizontal-stretch: 1;
+                find-input := TextInput {
+                    x: 6px;
+                    width: parent.width - 12px;
+                    height: parent.height;
+                    color: Theme.text-primary;
+                    font-family: Theme.ui-font-family;
+                    font-size: Theme.fs-md;
+                    vertical-alignment: center;
+                    single-line: true;
+                    init => { self.focus(); }
+                    edited => { root.find-query-changed(self.text); }
+                    key-pressed(e) => {
+                        if (e.text == "\u{001b}") {
+                            root.close();
+                            accept
+                        } else {
+                            reject
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                width: 24px;
+                close-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.close(); }
+                }
+                Text {
+                    text: "\u{E5CD}";
+                    font-family: "Material Icons";
+                    color: close-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+
 // --- TerminalView ----------------------------------------------------------
 
 export component TerminalView inherits Rectangle {
@@ -137,6 +255,7 @@ export component TerminalView inherits Rectangle {
     property <bool> quick-open: false;         // quick-command popup visibility
     property <bool> history-open: false;       // history dropdown visibility
     property <string> selected-quick-group: ""; // selected group whose commands show inline
+    property <string> default-group-name: "default";
     property <bool> quick-more-open: false;     // "More" overflow popup visibility
     property <int> history-cursor: -1;         // ↑/↓ recall index (-1 = live input)
     // Keyboard-driven selection in the open history dropdown (#140): ↑/↓ move it,
@@ -557,9 +676,8 @@ export component TerminalView inherits Rectangle {
                         ctx-menu := PopupWindow {
                             x: root.ctx-x;
                             y: root.ctx-y;
-                            width: 132px;
-                            height: 132px;
-                            Rectangle {
+                            width: max(132px, ctx-body.preferred-width);
+                            ctx-body := Rectangle {
                                 background: Theme.bg-panel;
                                 border-radius: Theme.radius-sm;
                                 border-width: 1px;
@@ -691,109 +809,25 @@ export component TerminalView inherits Rectangle {
             }
 
             // --- Find bar (overlay, top) ------------------------------------
-            // Terminal scrollbar (#103) — a slim overlay on the right edge of the
-            // output area, shown only when there's scrollback (and not on the
-            // alternate screen). Driven by scroll-max/scroll-offset; click or drag
-            // the track to jump to an absolute position.
-            if root.scroll-max > 0 && !root.is-alt-screen : Rectangle {
-                x: flickable.x + flickable.width - 10px;
-                y: flickable.y + 4px;
-                width: 8px;
-                height: flickable.height - 8px;
-                track-ta := TouchArea {
-                    moved => {
-                        if (self.pressed) {
-                            root.terminal-scroll-to(clamp(round(root.scroll-max * (1 - self.mouse-y / self.height)), 0, root.scroll-max));
-                        }
-                    }
-                    pointer-event(e) => {
-                        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
-                            root.terminal-scroll-to(clamp(round(root.scroll-max * (1 - self.mouse-y / self.height)), 0, root.scroll-max));
-                        }
-                    }
-                }
-                Rectangle {
-                    property <float> total: root.scroll-max + root.term-rows;
-                    x: 1px;
-                    width: 6px;
-                    height: max(28px, parent.height * root.term-rows / total);
-                    y: (parent.height - self.height) * (root.scroll-max - root.scroll-offset) / max(1, root.scroll-max);
-                    background: track-ta.has-hover || track-ta.pressed
-                        ? Theme.text-secondary : Theme.border-strong;
-                    border-radius: 3px;
-                    animate background { duration: 100ms; }
-                }
+            TerminalScrollbar {
+                scroll-max: root.scroll-max;
+                scroll-offset: root.scroll-offset;
+                term-rows: root.term-rows;
+                is-alt-screen: root.is-alt-screen;
+                area-x: flickable.x;
+                area-y: flickable.y;
+                area-w: flickable.width;
+                area-h: flickable.height;
+                terminal-scroll-to(offset) => { root.terminal-scroll-to(offset); }
             }
 
-            if root.find-active : Rectangle {
-                x: 0;
-                y: 0;
-                width: parent.width;
-                height: 34px;
-                background: Theme.bg-panel;
-                border-width: 1px;
-                border-color: Theme.border-strong;
-                border-radius: Theme.radius-sm;
-
-                HorizontalLayout {
-                    padding: 6px;
-                    spacing: 6px;
-                    Text {
-                        text: "\u{E8B6}";
-                        font-family: "Material Icons";
-                        color: Theme.text-secondary;
-                        font-size: Theme.fs-sm;
-                        vertical-alignment: center;
-                    }
-                    Rectangle {
-                        background: Theme.bg-root;
-                        border-radius: 3px;
-                        horizontal-stretch: 1;
-                        find-input := TextInput {
-                            x: 6px;
-                            width: parent.width - 12px;
-                            height: parent.height;
-                            color: Theme.text-primary;
-                            font-family: Theme.ui-font-family; // CJK-capable (#54)
-                            font-size: Theme.fs-md;
-                            vertical-alignment: center;
-                            single-line: true;
-                            // Grab focus as soon as the bar appears.
-                            init => { self.focus(); }
-                            edited => { root.find-query-changed(self.text); }
-                            key-pressed(e) => {
-                                if (e.text == "\u{001b}") {       // Esc closes find
-                                    root.find-active = false;
-                                    root.find-query-changed("");
-                                    self.text = "";
-                                    ime-input.focus();
-                                    accept
-                                } else {
-                                    reject
-                                }
-                            }
-                        }
-                    }
-                    Rectangle {
-                        width: 24px;
-                        close-ta := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                root.find-active = false;
-                                root.find-query-changed("");
-                                find-input.text = "";
-                                ime-input.focus();
-                            }
-                        }
-                        Text {
-                            text: "\u{E5CD}";
-                            font-family: "Material Icons";
-                            color: close-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
-                            font-size: Theme.fs-sm;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
+            if root.find-active : FindBar {
+                area-width: parent.width;
+                find-query-changed(query) => { root.find-query-changed(query); }
+                close() => {
+                    root.find-active = false;
+                    root.find-query-changed("");
+                    ime-input.focus();
                 }
             }
         }
@@ -948,7 +982,7 @@ export component TerminalView inherits Rectangle {
                                 // Esc closes it / returns to terminal. (The Ctrl+A/E/K/U
                                 // line-editing below stays on Ctrl — those are the standard
                                 // readline bindings on macOS too.)
-                                if ((Theme.is-mac ? e.modifiers.control : e.modifiers.control)
+                                if (e.modifiers.control
                                         && (e.text == "r" || e.text == "R" || e.text == "\u{0012}")) {
                                     root.history-open = true;
                                     accept
@@ -1147,8 +1181,8 @@ export component TerminalView inherits Rectangle {
                             }
                             qpop-grp-menu := PopupWindow {
                                 x: gmx; y: gmy; width: 150px;
-                                height: (q.orig-index == -1 ? 3 : 2) * 30px + 9px;
-                                Rectangle {
+                                height: qpop-grp-body.preferred-height;
+                                qpop-grp-body := Rectangle {
                                     background: Theme.bg-panel; border-radius: Theme.radius-sm;
                                     border-width: 1px; border-color: Theme.border-strong;
                                     drop-shadow-blur: 10px; drop-shadow-color: #00000050;
@@ -1280,15 +1314,15 @@ export component TerminalView inherits Rectangle {
                                             Text { text: "\u{E2C7}"; font-family: "Material Icons"; color: Theme.text-muted; font-size: Theme.fs-xs; vertical-alignment: center; }
                                             Text { text: @tr("Move to"); color: Theme.text-muted; font-size: Theme.fs-xs; vertical-alignment: center; horizontal-stretch: 1;
                                                    font-family: Theme.ui-font-family; } }
-                                        if q.group != "default" : Rectangle { height: 28px; border-radius: Theme.radius-sm;
+                                        if q.group != root.default-group-name : Rectangle { height: 28px; border-radius: Theme.radius-sm;
                                             background: pi-md-ta.has-hover ? Theme.bg-hover : transparent;
-                                            pi-md-ta := TouchArea { mouse-cursor: pointer; clicked => { root.move-quick-command(q.orig-index, "default"); } }
+                                            pi-md-ta := TouchArea { mouse-cursor: pointer; clicked => { root.move-quick-command(q.orig-index, root.default-group-name); } }
                                             HorizontalLayout { padding-left: 10px; spacing: 8px;
                                                 Text { text: "\u{E2C7}"; font-family: "Material Icons"; color: Theme.text-secondary; font-size: Theme.fs-sm; vertical-alignment: center; }
-                                                Text { text: "default"; color: Theme.text-primary; font-size: Theme.fs-md; vertical-alignment: center; horizontal-stretch: 1;
+                                                Text { text: root.default-group-name; color: Theme.text-primary; font-size: Theme.fs-md; vertical-alignment: center; horizontal-stretch: 1;
                                                        font-family: Theme.ui-font-family; } } }
                                         for s in root.quick-commands : Rectangle {
-                                            visible: s.group-header != "" && s.group != "default" && s.group != q.group;
+                                            visible: s.group-header != "" && s.group != root.default-group-name && s.group != q.group;
                                             height: self.visible ? 28px : 0px;
                                             border-radius: Theme.radius-sm;
                                             background: pi-mv-ta.has-hover ? Theme.bg-hover : transparent;
@@ -1309,7 +1343,8 @@ export component TerminalView inherits Rectangle {
             if root.history-open : Rectangle {
                 x: parent.width - 308px;
                 width: 300px;
-                height: min(296px, 46px + max(28px, min(228px, h-col.preferred-height + 8px)));
+                property <length> hist-list-h: max(28px, min(228px, h-col.preferred-height + 8px));
+                height: min(296px, 46px + self.hist-list-h);
                 y: -self.height - 2px;
                 background: Theme.bg-panel;
                 border-radius: Theme.radius-md;
