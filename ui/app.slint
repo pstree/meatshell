@@ -886,10 +886,10 @@ export component AppWindow inherits Window {
                     delete-history(i) => { root.delete-history(i); }
                     delete-history-cmd(c) => { root.delete-history-cmd(c); }
                     search-history(q) => { root.search-history(q); }
-                    manage-quick-commands() => {
+                    manage-quick-commands(g) => {
                         root.qcm-name = "";
                         root.qcm-command = "";
-                        root.qcm-group = "";
+                        root.qcm-group = g;
                         root.qcm-edit-index = -1;
                         root.quick-cmd-manage-open = true;
                     }
