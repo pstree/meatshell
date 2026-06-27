@@ -143,7 +143,7 @@ export component TerminalView inherits Rectangle {
     // Enter runs history-view[history-selected].
     property <int> history-selected: 0;
     callback run-command(string /* cmd */, bool /* to-all */);
-    callback manage-quick-commands();          // open the add/edit/delete dialog
+    callback manage-quick-commands(string /* selected group */);  // open the add/edit/delete dialog
     callback toggle-quick-group(string /* group */);  // collapse/expand a group (#55)
     // Right-click management on the popup, mirroring the welcome session list (#55).
     callback edit-quick-command(int /* index */);
@@ -1186,7 +1186,7 @@ export component TerminalView inherits Rectangle {
                             background: mng-ta.has-hover ? Theme.bg-hover : transparent;
                             mng-ta := TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { root.quick-open = false; root.manage-quick-commands(); }
+                                clicked => { root.quick-open = false; root.manage-quick-commands(root.selected-quick-group); }
                             }
                             Text { text: @tr("Manage…"); color: Theme.accent; font-size: Theme.fs-sm;
                                    horizontal-alignment: center; vertical-alignment: center;
