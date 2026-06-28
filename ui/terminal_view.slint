@@ -753,25 +753,33 @@ export component TerminalView inherits Rectangle {
                 }
 
                 key-pressed(event) => {
-                    // App shortcuts use the Cmd (⌘) modifier on macOS and Ctrl on
-                    // Windows/Linux, so on macOS the *physical Ctrl* key stays free
-                    // to reach the shell (^C/^X… work in nano/vim) (#158). The app
-                    // accelerator below is `meta` on macOS, `control` elsewhere.
+                    // ⚠ macOS modifier naming is SWAPPED by Slint (see the winit
+                    // backend's muda.rs): `event.modifiers.control` is the **Cmd (⌘)**
+                    // key and `event.modifiers.meta` is the **physical Ctrl** key.
+                    // So `control` already gives ⌘ shortcuts on macOS for free, and
+                    // the physical Ctrl (meta on macOS) is what must reach the shell
+                    // so ^C/^X work in nano/vim (#158).
                     // ── Find: ⌘F / Ctrl+F (mirrors right-click → Find) ──
-                    if (event.modifiers.control
+                    if (event.modifiers.control && !event.modifiers.shift
                             && (event.text == "f" || event.text == "F"
                                 || event.text == "\u{0006}")) {
                         root.find-active = true;
                         accept
-                    // ── Jump to command-history search: ⌘⇧R / Ctrl+Shift+R (#140).
-                    // Shifted so the shell keeps its own Ctrl+R reverse-search.
-                    } else if ((event.modifiers.control)
+                    // ── Jump to command-history search: ⌘⇧R / Ctrl+Shift+R (#140) ──
+                    } else if (event.modifiers.control && event.modifiers.shift
                             && (event.text == "r" || event.text == "R"
                                 || event.text == "\u{0012}")) {
                         root.history-open = true;
                         accept
+                    // ── Copy: ⌘C (macOS, no Shift) / Ctrl+Shift+C ──
+                    } else if (event.modifiers.control
+                            && (Theme.is-mac ? !event.modifiers.shift : event.modifiers.shift)
+                            && (event.text == "c" || event.text == "C"
+                                || event.text == "\u{0003}")) {
+                        root.copy-terminal-text();
+                        accept
                     // ── Paste: ⌘V / Ctrl+V (Ctrl+Shift+V also accepted) ──
-                    } else if ((event.modifiers.control)
+                    } else if (event.modifiers.control
                             && (event.text == "v" || event.text == "V"
                                 || event.text == "\u{0016}")) {
                         root.paste-from-clipboard();
@@ -779,19 +787,17 @@ export component TerminalView inherits Rectangle {
                         // Restore focus explicitly so the cursor keeps blinking.
                         ime-input.focus();
                         accept
-                    // ── macOS: swallow any other ⌘ combo so it isn't typed into
-                    // the shell as a literal character. Ctrl+C must reach the
-                    // shell to interrupt the foreground process (SIGINT). ──
-                    } else if (event.modifiers.control
-                            && !(event.text == "c" || event.text == "C"
-                                 || event.text == "\u{0003}")) {
+                    // ── macOS: swallow any other ⌘ combo (control == Cmd here) so it
+                    // isn't typed into the shell as a literal character. ──
+                    } else if (Theme.is-mac && event.modifiers.control) {
                         accept
                     // ── All other keys (printable, Ctrl+X, arrows, …) → the shell.
-                    // `control` here is the *physical* Ctrl key (Cmd is meta), so
-                    // ^X/^C reach the PTY on every platform (#158). Return `accept`
-                    // for everything: `reject` would bubble and drop the char.
+                    // The control flag is the *physical* Ctrl key: `meta` on macOS,
+                    // `control` elsewhere, so ^X/^C reach the PTY everywhere (#158).
+                    // Return `accept` for everything: `reject` would drop the char.
                     } else {
-                        root.send-key(event.text, event.modifiers.control || event.modifiers.meta,
+                        root.send-key(event.text,
+                                      Theme.is-mac ? event.modifiers.meta : event.modifiers.control,
                                       event.modifiers.alt, event.modifiers.shift);
                         accept
                     }
