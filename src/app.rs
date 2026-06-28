@@ -49,7 +49,15 @@ struct TermBuffer {
     /// absolute-positioned full-screen output collapses into a scrolling mess.
     /// Kept here so a sequence split across read chunks is still translated.
     csi_state: CsiState,
+    /// Capped copy of the (post-HVP-rewrite) byte stream fed to vt100, so a window
+    /// resize can replay it at the new width and reflow already-printed output to
+    /// match — the way FinalShell rewraps on resize (#169). Only the most recent
+    /// `RAW_CAP` bytes are kept; scrollback older than that won't reflow.
+    raw: std::collections::VecDeque<u8>,
 }
+
+/// How much of the byte stream we retain per tab for resize-reflow (#169).
+const RAW_CAP: usize = 2 * 1024 * 1024;
 
 /// Minimal CSI-final-byte rewriter state (persists across read chunks).
 #[derive(Clone, Copy, PartialEq)]
@@ -343,6 +351,21 @@ pub fn run() -> Result<()> {
                 w.window().with_winit_window(|ww| {
                     let _ = ww.drag_resize_window(ResizeDirection::SouthEast);
                 });
+                // Drop Slint's pointer grab after the WM takes over, deferred to the
+                // next event-loop turn (see #159 in the main window's on_win_resize).
+                if cfg!(target_os = "linux") {
+                    let weak2 = weak.clone();
+                    slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+                        if let Some(w) = weak2.upgrade() {
+                            let win = w.window();
+                            win.dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                                position: slint::LogicalPosition::new(0.0, 0.0),
+                                button: slint::platform::PointerEventButton::Left,
+                            });
+                            win.dispatch_event(slint::platform::WindowEvent::PointerExited);
+                        }
+                    });
+                }
             }
         });
     }
@@ -1207,6 +1230,31 @@ pub fn run() -> Result<()> {
                 w.window().with_winit_window(|ww| {
                     let _ = ww.drag_resize_window(d);
                 });
+                // On Linux the window manager / Wayland compositor takes over the
+                // resize and consumes the button-release that ends it (winit ungrabs
+                // + hands off via _NET_WM_MOVERESIZE / xdg_toplevel.resize), so Slint
+                // never sees the release and keeps its pointer grab on the resize
+                // handle — afterwards the cursor stays a resize-arrow and a click
+                // *anywhere* re-starts a resize (#159). Synthesize a release + exit
+                // so Slint drops the grab. It must be DEFERRED: Slint establishes the
+                // press grab while processing this very pointer event, so a release
+                // dispatched synchronously here is too early. A 0 ms single-shot runs
+                // on the next event-loop turn, once the grab is in place. Windows/
+                // macOS deliver the release natively; the runtime cfg! gate keeps
+                // this compiling (and a no-op) there.
+                if cfg!(target_os = "linux") {
+                    let weak2 = weak.clone();
+                    slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+                        if let Some(w) = weak2.upgrade() {
+                            let win = w.window();
+                            win.dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                                position: slint::LogicalPosition::new(0.0, 0.0),
+                                button: slint::platform::PointerEventButton::Left,
+                            });
+                            win.dispatch_event(slint::platform::WindowEvent::PointerExited);
+                        }
+                    });
+                }
             }
         });
     }
@@ -1366,6 +1414,77 @@ fn handle_file_drop(_win: &AppWindow, _sftp_handles: &SftpHandles, _path: String
 // Model helpers
 // ---------------------------------------------------------------------------
 
+/// Parse the batch-import textarea (#150). Each non-empty, non-`#` line is
+/// `host|port|user|password|name`; trailing fields are optional (port → 22,
+/// user → root, password → none, name → user@host). A leading header row such as
+/// `host|port|username|password|name` is skipped. Dedup happens at the call site.
+fn parse_batch_import(text: &str) -> Vec<Session> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // splitn(5) so the last field (name) may itself contain '|'.
+        let parts: Vec<&str> = line.splitn(5, '|').map(str::trim).collect();
+        let host = parts.first().copied().unwrap_or("");
+        // Skip blank hosts and a header row like "host|port|username|...".
+        if host.is_empty() || host.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        let port = parts
+            .get(1)
+            .and_then(|p| p.parse::<u16>().ok())
+            .filter(|&p| p > 0)
+            .unwrap_or(22);
+        let user = parts.get(2).copied().filter(|s| !s.is_empty()).unwrap_or("root");
+        let password = parts.get(3).copied().unwrap_or("");
+        let name = parts
+            .get(4)
+            .copied()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{user}@{host}"));
+        let mut sess = Session {
+            name,
+            host: host.to_string(),
+            port,
+            user: user.to_string(),
+            auth: AuthMethod::Password,
+            ..Session::new_empty()
+        };
+        if !password.is_empty() {
+            sess.password = Secret::new(password.to_string());
+        }
+        out.push(sess);
+    }
+    out
+}
+
+/// Distinct named groups (explicit folders ∪ the groups sessions are filed under),
+/// de-duplicated and sorted alphabetically — feeds the new/edit dialog's group
+/// dropdown (#179). Ungrouped ("") is excluded; the dialog leaves the field blank
+/// for that case.
+fn session_groups_model(store: &ConfigStore) -> ModelRc<SharedString> {
+    let sessions = store.sessions();
+    let mut named: Vec<String> = store
+        .groups()
+        .iter()
+        .cloned()
+        .chain(
+            sessions
+                .iter()
+                .filter(|s| !s.group.is_empty())
+                .map(|s| s.group.clone()),
+        )
+        .collect();
+    named.sort_by_key(|g| g.to_lowercase());
+    named.dedup();
+    ModelRc::from(Rc::new(VecModel::from(
+        named.into_iter().map(SharedString::from).collect::<Vec<_>>(),
+    )))
+}
+
 fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
     // Group sessions by their `group` (named groups alphabetically, ungrouped
     // last), then by name within each group, and tag the first row of every
@@ -1481,9 +1600,11 @@ fn wire_session_callbacks(
     // New session -> open dialog with blank draft.
     let weak = window.as_weak();
     let ef_new = edit_forwards.clone();
+    let store_ng = store.clone();
     window.on_new_session_clicked(move || {
         if let Some(w) = weak.upgrade() {
             ef_new.borrow_mut().clear();
+            w.set_session_groups(session_groups_model(&store_ng.borrow()));
             w.set_dialog_forwards(forward_model(&[]));
             let empty = Session::new_empty();
             w.set_dialog_id(empty.id.into());
@@ -1592,6 +1713,47 @@ fn wire_session_callbacks(
         });
     }
 
+    // Batch-import connections from pasted text (#150). One per line:
+    // `host|port|user|password|name` (trailing fields optional).
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let sessions_model = sessions_model.clone();
+        window.on_batch_import_confirm(move |text: SharedString| {
+            let parsed = parse_batch_import(text.as_str());
+            let total = parsed.len();
+            let mut added = 0usize;
+            {
+                let mut s = store.borrow_mut();
+                for sess in parsed {
+                    // Skip a host/user/port we already have.
+                    let dup = s.sessions().iter().any(|x| {
+                        x.host == sess.host && x.user == sess.user && x.port == sess.port
+                    });
+                    if dup {
+                        continue;
+                    }
+                    s.upsert(sess);
+                    added += 1;
+                }
+                if added > 0 {
+                    let _ = s.save();
+                }
+            }
+            sync_sessions_to_model(&store.borrow(), &sessions_model);
+            if let Some(w) = weak.upgrade() {
+                let hint = if total == 0 {
+                    t("没有可导入的连接", "nothing to import").to_string()
+                } else if added > 0 {
+                    format!("{} {}/{}", t("已导入", "imported"), added, total)
+                } else {
+                    t("没有新连接可导入(已存在)", "no new connections (all exist)").to_string()
+                };
+                w.set_ssh_import_hint(hint.into());
+            }
+        });
+    }
+
     // Import sessions from a portable JSON file (issue #46).
     {
         let weak = window.as_weak();
@@ -1634,6 +1796,7 @@ fn wire_session_callbacks(
             let Some(session) = store.get(&id) else { return; };
             *ef_edit.borrow_mut() = session.forwards.clone();
             if let Some(w) = weak.upgrade() {
+                w.set_session_groups(session_groups_model(&store));
                 w.set_dialog_forwards(forward_model(&session.forwards));
                 w.set_dialog_id(session.id.clone().into());
                 w.set_dialog_name(session.name.clone().into());
@@ -2083,6 +2246,7 @@ fn wire_session_callbacks(
                     view_offset: 0,
                     displayed_text: Vec::new(),
                     csi_state: CsiState::Normal,
+                    raw: std::collections::VecDeque::new(),
                 },
             );
             // No followed-cwd yet: the first OSC 7 always triggers a follow.
@@ -2729,32 +2893,21 @@ fn apply_terminal_resize(
     }
     if let Some(buf) = bufs.lock().unwrap().get_mut(tab_id) {
         let (old_rows, old_cols) = buf.parser.screen().size();
-        let new_rows = rows as u16;
-        // Shrinking the grid makes vt100 truncate rows from the bottom (dropping
-        // recent output + the prompt, #18). Scroll up just enough to keep the
-        // cursor on-screen first. Skipped on the alternate screen.
-        if new_rows < old_rows && !buf.parser.screen().alternate_screen() {
-            let (cursor_row, _) = buf.parser.screen().cursor_position();
-            let scroll = (cursor_row + 1).saturating_sub(new_rows);
-            if scroll > 0 {
-                let saved: Vec<Line> = {
-                    let s = buf.parser.screen();
-                    (0..scroll).map(|r| build_row(s, r, old_cols)).collect()
-                };
-                for line in saved {
-                    buf.history.push(line);
-                }
-                if buf.history.len() > MAX_HISTORY {
-                    let drop = buf.history.len() - MAX_HISTORY;
-                    buf.history.drain(0..drop);
-                }
-                buf.parser.process(format!("\x1b[{scroll}S").as_bytes());
+        let (new_rows, new_cols) = (rows as u16, cols as u16);
+        if (new_rows, new_cols) != (old_rows, old_cols) {
+            if buf.parser.screen().alternate_screen() {
+                // Alt-screen (tmux/vim/btop): the remote redraws the whole screen
+                // on SIGWINCH, so just resize the grid and let that redraw fill it.
+                buf.parser.set_size(new_rows, new_cols);
+            } else {
+                // Reflow already-printed output to the new width by replaying the
+                // byte stream — vt100's set_size only truncates/pads (#169).
+                buf.reflow(new_rows, new_cols);
             }
+            // The pre/post-resize screens differ; drop the scroll-detection
+            // snapshot so the next output isn't mis-read as a scroll.
+            buf.prev.clear();
         }
-        buf.parser.set_size(new_rows, cols as u16);
-        // The pre/post-resize screens differ; drop the scroll-detection snapshot
-        // so the next output isn't mis-read as a scroll.
-        buf.prev.clear();
     }
 }
 
@@ -3503,9 +3656,18 @@ fn resolve_front_hostkey(win: &AppWindow, accept: bool) {
     let has_next = HOSTKEY_QUEUE.with(|q| {
         let mut q = q.borrow_mut();
         if let Some(p) = q.pop_front() {
-            HOSTKEY_DECIDED.with(|d| {
-                d.borrow_mut().insert(format!("{}:{}", p.host, p.port), accept);
-            });
+            // Only remember an *accept* for this run (so a slightly-later SFTP
+            // prompt for the same host is answered without a second dialog). We
+            // must NOT cache a reject: a single dismissal — e.g. an accidental
+            // backdrop click instead of "Trust & connect" — used to poison the
+            // host for the whole session, auto-rejecting every later connect with
+            // "Unknown server key" until the app was restarted (#152). A reject now
+            // only fails the current attempt; the next connect prompts again.
+            if accept {
+                HOSTKEY_DECIDED.with(|d| {
+                    d.borrow_mut().insert(format!("{}:{}", p.host, p.port), true);
+                });
+            }
             for r in &p.responders {
                 r.respond(accept);
             }
@@ -4842,6 +5004,7 @@ fn wire_key_input(
                             b.view_offset = 0;
                             b.sel_anchor = None;
                             b.sel_focus = None;
+                            b.raw.clear();
                         }
                     }
                     if let Some(st) =
@@ -5092,6 +5255,7 @@ fn wire_key_input(
     {
         let handles = handles.clone();
         let bufs_resize = bufs.clone(); // keep bufs alive for the copy handler below
+        let weak_resize = window.as_weak();
         // The Slint side now measures the real Consolas cell size (via a hidden
         // probe Text) and passes whole column/row counts directly, so there is
         // no pixel→cell guesswork here.  This keeps full-screen programs like
@@ -5117,6 +5281,7 @@ fn wire_key_input(
             let handles = handles.clone();
             let bufs = bufs_resize.clone();
             let last = last_term_size.clone();
+            let weak = weak_resize.clone();
             // (Re)arm the single-shot timer; rapid changes keep resetting it so
             // only the final, settled size is applied.
             resize_debounce.start(
@@ -5128,6 +5293,11 @@ fn wire_key_input(
                     for (tab, (cols, rows)) in settled {
                         tracing::debug!("terminal_resize tab={} cols={} rows={}", tab, cols, rows);
                         apply_terminal_resize(&handles, &bufs, &last, &tab, cols, rows);
+                        // Re-render so the reflowed (or resized) grid shows at once
+                        // instead of waiting for the next remote output (#169).
+                        if let Some(win) = weak.upgrade() {
+                            rebuild_tab_display(&win, &bufs, &tab);
+                        }
                     }
                 },
             );
@@ -5208,6 +5378,7 @@ fn wire_key_input(
                 buf.sel_anchor = None;
                 buf.sel_focus = None;
                 buf.displayed_text = Vec::new();
+                buf.raw.clear();
             }
             if let Some(win) = weak.upgrade() {
                 set_terminal_row(&win, &tid, |row| {
@@ -5272,6 +5443,54 @@ fn wire_key_input(
             }
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_scroll, &tid);
+            }
+        });
+    }
+
+    // Wheel inside an alt-screen program (tmux / less / vim): forward it to the PTY
+    // so the program scrolls, instead of doing nothing (#170 — FinalShell /
+    // MobaXterm behave this way). If the app is tracking the mouse (e.g. tmux with
+    // `mouse on`), send a real wheel mouse-event in the encoding it asked for;
+    // otherwise fall back to arrow keys (xterm "alternate scroll"), which scrolls
+    // less / man / vim.
+    {
+        let bufs_wheel = bufs.clone();
+        let handles_wheel = handles.clone();
+        window.on_terminal_wheel(move |tab_id: SharedString, dir: i32, col: i32, row: i32| {
+            let tid = tab_id.to_string();
+            let bytes = {
+                let map = bufs_wheel.lock().unwrap();
+                let Some(buf) = map.get(&tid) else { return };
+                let screen = buf.parser.screen();
+                if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
+                    // 1-based cell under the cursor, clamped to the screen.
+                    let (rows, cols) = screen.size();
+                    let c = (col.clamp(0, cols.saturating_sub(1) as i32) as u16) + 1;
+                    let r = (row.clamp(0, rows.saturating_sub(1) as i32) as u16) + 1;
+                    let btn: u16 = if dir > 0 { 64 } else { 65 }; // wheel up / down
+                    if screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr {
+                        format!("\x1b[<{btn};{c};{r}M").into_bytes()
+                    } else {
+                        // Legacy X10 encoding: ESC [ M  Cb Cx Cy  (each value + 32).
+                        let cb = (btn + 32) as u8;
+                        let cx = (c.min(223) + 32) as u8;
+                        let cy = (r.min(223) + 32) as u8;
+                        vec![0x1b, b'[', b'M', cb, cx, cy]
+                    }
+                } else {
+                    // alternate-scroll: 3 arrow presses per notch, app-cursor aware.
+                    let one: &[u8] = if dir > 0 {
+                        if screen.application_cursor() { b"\x1bOA" } else { b"\x1b[A" }
+                    } else if screen.application_cursor() {
+                        b"\x1bOB"
+                    } else {
+                        b"\x1b[B"
+                    };
+                    one.repeat(3)
+                }
+            };
+            if let Some(h) = handles_wheel.borrow().get(&tid) {
+                h.send_raw(bytes);
             }
         });
     }
@@ -6256,11 +6475,22 @@ impl TermBuffer {
     /// after each — that way no batch ever scrolls more than the diff can see,
     /// and nothing is lost.  (Splitting only on `\n` is safe: VT escape
     /// sequences never contain a newline.)
-    fn ingest(&mut self, raw: &[u8]) {
+    fn ingest(&mut self, input: &[u8]) {
         // Rewrite HVP (`ESC [ … f`) → CUP (`ESC [ … H`) so vt100 (which only
         // implements `H`) honours btop/htop's absolute cursor positioning.
-        let bytes = self.rewrite_hvp(raw);
-        let bytes = &bytes[..];
+        let bytes = self.rewrite_hvp(input);
+        // Retain the (post-rewrite) stream, capped, so a resize can replay it at
+        // the new width and reflow already-printed output (#169).
+        self.raw.extend(bytes.iter().copied());
+        self.cap_raw();
+        self.feed_batched(&bytes);
+    }
+
+    /// Feed a (already HVP-rewritten) byte slice to vt100 in newline-bounded
+    /// batches, capturing scrolled-off lines into history after each (see the
+    /// `ingest` doc comment). Does NOT touch `self.raw`, so it is reused by both
+    /// live ingest and resize-reflow replay.
+    fn feed_batched(&mut self, bytes: &[u8]) {
         let rows = self.parser.screen().size().0 as usize;
         let batch_lines = (rows / 2).max(1);
         let mut start = 0usize;
@@ -6278,6 +6508,41 @@ impl TermBuffer {
         if start < bytes.len() {
             self.ingest_chunk(&bytes[start..]);
         }
+    }
+
+    /// Trim the retained stream to `RAW_CAP`, dropping from the front up to the
+    /// next line boundary so a replay never starts mid-escape / mid-wrapped-line.
+    fn cap_raw(&mut self) {
+        if self.raw.len() <= RAW_CAP {
+            return;
+        }
+        let overflow = self.raw.len() - RAW_CAP;
+        self.raw.drain(0..overflow);
+        while let Some(&b) = self.raw.front() {
+            self.raw.pop_front();
+            if b == b'\n' {
+                break;
+            }
+        }
+    }
+
+    /// Resize-reflow (#169): rebuild the screen + scrollback at a new width by
+    /// replaying the retained byte stream through a fresh parser. vt100 itself
+    /// can't reflow (`set_size` just truncates/pads each row), and we only keep
+    /// rendered grid rows in `history`, so replaying the raw stream is what lets
+    /// long lines rewrap to the new width like FinalShell. Used only on the normal
+    /// screen — alt-screen programs (tmux/vim) get a SIGWINCH redraw from the
+    /// remote instead.
+    fn reflow(&mut self, new_rows: u16, new_cols: u16) {
+        let stream: Vec<u8> = self.raw.iter().copied().collect();
+        self.parser = vt100::Parser::new(new_rows, new_cols, 5000);
+        self.history.clear();
+        self.prev.clear();
+        self.view_offset = 0;
+        // Scrollback line count changes, so absolute selection coords no longer map.
+        self.sel_anchor = None;
+        self.sel_focus = None;
+        self.feed_batched(&stream);
     }
 
     /// Translate every CSI sequence terminated by `f` (HVP) into the identical
@@ -6835,6 +7100,7 @@ mod selection_tests {
             view_offset,
             displayed_text: Vec::new(),
             csi_state: CsiState::Normal,
+            raw: std::collections::VecDeque::new(),
         }
     }
 

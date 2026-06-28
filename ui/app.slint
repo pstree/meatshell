@@ -502,6 +502,8 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-proxy-type: "none";  // "none" | "socks5" | "http"
     in-out property <string> dialog-proxy-hostport;
     in-out property <string> dialog-group;
+    // Existing group names (from Rust) for the dialog's group dropdown (#179).
+    in property <[string]> session-groups;
     in-out property <string> dialog-kind: "ssh";
     in-out property <string> dialog-serial-port;
     in-out property <string> dialog-baud: "115200";
@@ -523,6 +525,9 @@ export component AppWindow inherits Window {
     in-out property <string> ssh-import-hint;  // result text shown after import
     callback export-sessions();               // export all sessions to a file (#46)
     callback import-sessions();               // import sessions from a file (#46)
+    in-out property <bool> batch-import-open: false;  // text batch-import dialog (#150)
+    in-out property <string> batch-import-text;       // the textarea content
+    callback batch-import-confirm(string /* pasted text */);
     callback connect-session(string /* session-id */);
     callback edit-session(string /* session-id */);
     callback duplicate-session(string /* session-id */);
@@ -603,6 +608,8 @@ export component AppWindow inherits Window {
     callback find-query-changed(string /* tab-id */, string /* query */);
     // Scroll a session's scrollback history by N lines (+ = up/older).
     callback terminal-scroll(string /* tab-id */, int /* delta-lines */);
+    // Wheel forwarded to an alt-screen program (#170): tab-id, dir (+1 up/-1 down), col, row.
+    callback terminal-wheel(string, int, int, int);
     callback terminal-scroll-to(string /* tab-id */, int /* offset */); // scrollbar drag (#103)
     // Drag-selection lifecycle (grid row/col coordinates).
     callback term-select-start(string /* tab-id */, int /* row */, int /* col */);
@@ -988,6 +995,7 @@ export component AppWindow inherits Window {
                     clear-terminal() => { root.clear-terminal(term.id); }
                     find-query-changed(q) => { root.find-query-changed(term.id, q); }
                     terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
+                    terminal-wheel(d, c, r) => { root.terminal-wheel(term.id, d, c, r); }
                     terminal-scroll-to(o) => { root.terminal-scroll-to(term.id, o); }
                     select-start(r, c) => { root.term-select-start(term.id, r, c); }
                     select-update(r, c) => { root.term-select-update(term.id, r, c); }
@@ -1889,7 +1897,9 @@ export component AppWindow inherits Window {
         x: parent.width - 196px - root.toolbar-x-off;
         y: (root.custom-titlebar ? 78px : 40px + root.titlebar-inset) + root.toolbar-y-off;
         width: 198px;
-        height: 220px;
+        // Size to the menu's content so adding/removing items (or the
+        // ~/.ssh/config import hint expanding) never overflows the card (#150-fix).
+        height: menu-vl.preferred-height;
         visible: root.settings-open;
         background: Theme.bg-panel;
         border-radius: Theme.radius-md;
@@ -1900,7 +1910,7 @@ export component AppWindow inherits Window {
 
         TouchArea {}   // swallow events so they don't reach the terminal
 
-        VerticalLayout {
+        menu-vl := VerticalLayout {
             padding: 4px;
             spacing: 1px;
             // Interface (font) settings.
@@ -1965,6 +1975,29 @@ export component AppWindow inherits Window {
                            color: Theme.text-secondary; font-size: Theme.fs-sm;
                            vertical-alignment: center; }
                     Text { text: root.lang-en ? "Import connections" : "导入连接";
+                           color: Theme.text-primary; font-size: Theme.fs-md;
+                           vertical-alignment: center; horizontal-stretch: 1; }
+                }
+            }
+            // Batch-import connections from pasted text (#150).
+            Rectangle {
+                height: 28px;
+                border-radius: Theme.radius-sm;
+                background: batchimp-ta.has-hover ? Theme.bg-hover : transparent;
+                batchimp-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.settings-open = false;
+                        root.batch-import-text = "";
+                        root.batch-import-open = true;
+                    }
+                }
+                HorizontalLayout {
+                    padding-left: 8px; spacing: 8px;
+                    Text { text: "\u{E1C3}"; font-family: "Material Icons"; // table/rows
+                           color: Theme.text-secondary; font-size: Theme.fs-sm;
+                           vertical-alignment: center; }
+                    Text { text: root.lang-en ? "Batch import (text)" : "批量导入(文本)";
                            color: Theme.text-primary; font-size: Theme.fs-md;
                            vertical-alignment: center; horizontal-stretch: 1; }
                 }
@@ -2912,6 +2945,7 @@ export component AppWindow inherits Window {
         draft-proxy-type <=> root.dialog-proxy-type;
         draft-proxy-hostport <=> root.dialog-proxy-hostport;
         draft-group <=> root.dialog-group;
+        session-groups: root.session-groups;
         draft-kind <=> root.dialog-kind;
         draft-serial-port <=> root.dialog-serial-port;
         draft-baud <=> root.dialog-baud;
@@ -2952,18 +2986,107 @@ export component AppWindow inherits Window {
         cancel => { root.confirm-delete-batch = false; root.confirm-delete-open = false; }
     }
 
-    // Host-key confirmation (#109-5). Reuses the confirm-dialog card; the
-    // backdrop / Cancel both reject (safe default = don't connect).
+    // Host-key confirmation (#109-5). Reuses the confirm-dialog card. The backdrop
+    // is NOT a dismiss here (#152): clicking outside the card used to count as a
+    // reject and — worse — poison the host for the whole run. The user must pick
+    // "Trust & connect" or the explicit Cancel/Reject button.
     ConfirmDialog {
         width: parent.width;
         height: parent.height;
         is-open <=> root.hostkey-prompt-open;
+        dismiss-on-backdrop: false;
         title: root.hostkey-title;
         message: root.hostkey-message;
         detail: root.hostkey-detail;
         confirm-label: root.hostkey-confirm-label;
         confirm => { root.hostkey-accept(); }
         cancel => { root.hostkey-reject(); }
+    }
+
+    // Batch-import connections from pasted text (#150).
+    if root.batch-import-open : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #000000aa;
+        TouchArea { clicked => { root.batch-import-open = false; } }   // backdrop closes
+        Rectangle {
+            width: 540px;
+            height: 440px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Theme.bg-panel;
+            border-radius: Theme.radius-lg;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #00000080;
+            TouchArea {}   // swallow clicks inside the card
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+                Text {
+                    text: root.lang-en ? "Batch import connections" : "批量导入连接";
+                    color: Theme.text-primary;
+                    font-size: Theme.fs-xl;
+                    font-weight: 600;
+                }
+                Text {
+                    text: root.lang-en
+                        ? "One per line:  host|port|user|password|name   (port/user/password/name optional)"
+                        : "每行一个:  host|port|user|password|name   (端口/用户/密码/名称可省略)";
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
+                // Paste area — themed multiline input.
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: bi-input.has-focus ? Theme.accent : Theme.border-subtle;
+                    background: Theme.bg-root;
+                    clip: true;
+                    Flickable {
+                        viewport-height: max(self.height, bi-input.preferred-height + 16px);
+                        bi-input := TextInput {
+                            x: 10px;
+                            y: 8px;
+                            width: parent.width - 20px;
+                            text <=> root.batch-import-text;
+                            color: Theme.text-primary;
+                            font-family: Theme.font-mono;
+                            font-size: Theme.fs-md;
+                            single-line: false;
+                            wrap: no-wrap;
+                        }
+                    }
+                    if root.batch-import-text == "" : Text {
+                        x: 10px;
+                        y: 8px;
+                        text: "192.168.1.108|22|root|pass@123|服务器1";
+                        color: Theme.text-muted;
+                        font-family: Theme.font-mono;
+                        font-size: Theme.fs-md;
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    GhostButton {
+                        text: @tr("Cancel");
+                        clicked => { root.batch-import-open = false; }
+                    }
+                    PrimaryButton {
+                        text: root.lang-en ? "Import" : "导入";
+                        clicked => {
+                            root.batch-import-confirm(root.batch-import-text);
+                            root.batch-import-open = false;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Connect-time credential prompt (#110). Backdrop / Cancel abort the connect.
