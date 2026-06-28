@@ -90,17 +90,11 @@ component TerminalScrollbar {
     in property <float> scroll-offset;
     in property <float> term-rows;
     in property <bool> is-alt-screen;
-    in property <length> area-x;
-    in property <length> area-y;
-    in property <length> area-w;
-    in property <length> area-h;
     callback terminal-scroll-to(int);
 
     if root.scroll-max > 0 && !root.is-alt-screen : Rectangle {
-        x: root.area-x + root.area-w - 10px;
-        y: root.area-y + 4px;
-        width: 8px;
-        height: root.area-h - 8px;
+        width: 100%;
+        height: 100%;
         property <float> total: root.scroll-max + root.term-rows;
         track-ta := TouchArea {
             moved => {
@@ -120,7 +114,7 @@ component TerminalScrollbar {
         }
         Rectangle {
             x: 1px;
-            width: 6px;
+            width: parent.width - 2px;
             height: max(28px, parent.height * root.term-rows / parent.total);
             y: (parent.height - self.height) * (root.scroll-max - root.scroll-offset) / max(1, root.scroll-max);
             background: track-ta.has-hover || track-ta.pressed
@@ -831,14 +825,14 @@ export component TerminalView inherits Rectangle {
 
             // --- Find bar (overlay, top) ------------------------------------
             TerminalScrollbar {
+                x: flickable.x + flickable.width - 10px;
+                y: flickable.y + 4px;
+                width: 8px;
+                height: flickable.height - 8px;
                 scroll-max: root.scroll-max;
                 scroll-offset: root.scroll-offset;
                 term-rows: root.term-rows;
                 is-alt-screen: root.is-alt-screen;
-                area-x: flickable.x;
-                area-y: flickable.y;
-                area-w: flickable.width;
-                area-h: flickable.height;
                 terminal-scroll-to(offset) => { root.terminal-scroll-to(offset); }
             }
 
