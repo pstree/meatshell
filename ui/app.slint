@@ -447,6 +447,19 @@ export component AppWindow inherits Window {
     callback save-file();                     // Ctrl+S / Save button (edit only)
     callback close-editor();                  // X / Esc; uploads if dirty
     callback editor-recount(string);          // rebuild line numbers after an edit
+
+    // --- Editor find / replace (Ctrl+F) ----------------------------------
+    in-out property <bool>   editor-find-visible: false;
+    in-out property <string> editor-find-query: "";
+    in-out property <string> editor-replace-query: "";
+    in-out property <[int]>  editor-match-offsets: [];
+    in-out property <int>    editor-current-match: -1;
+    in-out property <string> editor-find-status: "";
+    in-out property <int>    editor-highlight-trigger: 0;
+    pure callback editor-search-matches(string, string) -> [int];
+    pure callback editor-byte-length-of(string) -> int;
+    callback editor-replace-all(string);
+
     // Editor card geometry: draggable by its title bar, resizable from the
     // bottom-right grip (same absolute-position pattern as the Interface
     // dialog). Defaults centre the card; user drags/resizes override them.
@@ -1157,6 +1170,80 @@ export component AppWindow inherits Window {
     // --- Built-in file viewer / editor (#70) ------------------------------
     // View = read-only (selectable/copyable); Edit = writable, Ctrl+S or the
     // Save button uploads, and closing uploads any unsaved changes.
+
+    // Deferred search + highlight: `editor-open-find()` sets `editor-find-visible`
+    // first, then a Timer runs the search + highlight outside Slint's
+    // binding-evaluation pass (otherwise creating the find panel and bumping
+    // `editor-highlight-trigger` in the same pass freezes the UI).
+    property <bool> editor-pending-open: false;
+    Timer {
+        interval: 0ms;
+        running: root.editor-pending-open;
+        triggered => {
+            root.editor-pending-open = false;
+            root.editor-search-refresh();
+            root.editor-highlight-trigger = root.editor-highlight-trigger + 1;
+        }
+    }
+
+    // Recompute match offsets when content changes (Replace, typing, etc.).
+    changed editor-content => {
+        if (root.editor-find-visible) {
+            root.editor-search-refresh();
+        }
+    }
+
+    function editor-update-status() {
+        if (root.editor-match-offsets.length == 0) {
+            root.editor-find-status = @tr("0 / 0");
+        } else {
+            root.editor-find-status =
+                (root.editor-current-match + 1) + " / " + root.editor-match-offsets.length;
+        }
+    }
+
+    function editor-search-refresh() {
+        root.editor-match-offsets =
+            root.editor-search-matches(root.editor-content, root.editor-find-query);
+        let n = root.editor-match-offsets.length;
+        if (n == 0) {
+            root.editor-current-match = -1;
+        } else if (root.editor-current-match >= n) {
+            root.editor-current-match = n - 1;
+        } else if (root.editor-current-match < 0) {
+            root.editor-current-match = 0;
+        }
+        root.editor-update-status();
+    }
+
+    function editor-find-next() {
+        let n = root.editor-match-offsets.length;
+        if (n == 0) { return; }
+        let next = root.editor-current-match + 1;
+        root.editor-current-match = next >= n ? 0 : next;
+        root.editor-update-status();
+        root.editor-highlight-trigger = root.editor-highlight-trigger + 1;
+    }
+
+    function editor-find-prev() {
+        let n = root.editor-match-offsets.length;
+        if (n == 0) { return; }
+        let prev = root.editor-current-match - 1 + n;
+        root.editor-current-match = prev >= n ? prev - n : prev;
+        root.editor-update-status();
+        root.editor-highlight-trigger = root.editor-highlight-trigger + 1;
+    }
+
+    function editor-open-find() {
+        root.editor-find-visible = true;
+        root.editor-pending-open = true;
+    }
+
+    function editor-close-find() {
+        root.editor-find-visible = false;
+        root.editor-highlight-trigger = root.editor-highlight-trigger + 1;
+    }
+
     if root.editor-open : Rectangle {
         // Modal backdrop; clicking it does NOT close (avoids losing edits to a
         // stray click) — use the close button or Esc. Also swallow wheel events
@@ -1166,18 +1253,46 @@ export component AppWindow inherits Window {
             scroll-event(event) => { accept }
         }
         edit-fs := FocusScope {
-            // Ctrl+S saves, Esc closes. These bubble up from the focused
-            // TextInput because it doesn't consume them.
+            // Ctrl+S saves, Ctrl+F toggles find/replace, F3 steps through
+            // matches, Esc closes the find panel (or the editor if the panel
+            // is already hidden). These bubble up from the focused TextInput
+            // because it doesn't consume them.
             key-pressed(e) => {
                 if (e.text == "s" && (e.modifiers.control)) {
                     root.save-file();
                     return accept;
                 }
+                if (e.text == "f" && (e.modifiers.control)) {
+                    root.editor-open-find();
+                    return accept;
+                }
                 if (e.text == Key.Escape) {
+                    if (root.editor-find-visible) {
+                        root.editor-close-find();
+                        return accept;
+                    }
                     root.close-editor();
                     return accept;
                 }
                 return reject;
+            }
+            // Mirror of root.editor-highlight-trigger; bumping the root
+            // property fires this `changed` handler, which re-selects the
+            // current match in the TextInput.
+            property <int> hl-trigger: root.editor-highlight-trigger;
+            changed hl-trigger => {
+                self.editor-highlight-current();
+            }
+
+            function editor-highlight-current() {
+                if (root.editor-current-match < 0
+                    || root.editor-current-match >= root.editor-match-offsets.length) {
+                    edit-input.clear-selection();
+                    return;
+                }
+                let off = root.editor-match-offsets[root.editor-current-match];
+                let len = root.editor-byte-length-of(root.editor-find-query);
+                edit-input.set-selection-offsets(off, off + len);
             }
             Rectangle {
                 x: root.ed-x;
@@ -1264,6 +1379,179 @@ export component AppWindow inherits Window {
                         }
                     }
                     Rectangle { height: 1px; background: Theme.border-subtle; }
+
+                    // Find / replace panel (Ctrl+F): slides in below the title
+                    // bar when toggled. Find works in view mode too; replace
+                    // buttons are disabled for read-only files.
+                    if root.editor-find-visible : Rectangle {
+                        height: 92px;
+                        background: Theme.bg-panel-alt;
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 6px;
+
+                            // --- Find row --------------------------------------
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    border-width: 1px;
+                                    border-color: find-input.has-focus ? Theme.accent : Theme.border-strong;
+                                    background: Theme.bg-root;
+                                    find-input := TextInput {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        text <=> root.editor-find-query;
+                                        single-line: true;
+                                        font-size: Theme.fs-sm;
+                                        font-family: Theme.ui-font-family;
+                                        color: Theme.text-primary;
+                                        vertical-alignment: center;
+                                        edited => {
+                                            root.editor-search-refresh();
+                                            root.editor-highlight-trigger =
+                                                root.editor-highlight-trigger + 1;
+                                        }
+                                        key-pressed(e) => {
+                                            if (e.text == Key.Return) {
+                                                if (e.modifiers.shift) {
+                                                    root.editor-find-prev();
+                                                } else {
+                                                    root.editor-find-next();
+                                                }
+                                                return accept;
+                                            }
+                                            if (e.text == Key.Escape) {
+                                                root.editor-close-find();
+                                                return accept;
+                                            }
+                                            return reject;
+                                        }
+                                    }
+                                }
+                                Text {
+                                    width: 56px;
+                                    text: root.editor-find-status;
+                                    color: Theme.text-secondary;
+                                    font-size: Theme.fs-xs;
+                                    font-family: Theme.ui-font-family;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                }
+                                Rectangle {
+                                    width: 28px; height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    background: find-prev-ta.has-hover ? Theme.bg-hover : transparent;
+                                    find-prev-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.editor-find-prev(); }
+                                    }
+                                    Text {
+                                        text: "\u{E5CB}";
+                                        font-family: "Material Icons";
+                                        color: Theme.text-secondary;
+                                        font-size: Theme.fs-md;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Rectangle {
+                                    width: 28px; height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    background: find-next-ta.has-hover ? Theme.bg-hover : transparent;
+                                    find-next-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.editor-find-next(); }
+                                    }
+                                    Text {
+                                        text: "\u{E5CC}";
+                                        font-family: "Material Icons";
+                                        color: Theme.text-secondary;
+                                        font-size: Theme.fs-md;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Rectangle {
+                                    width: 28px; height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    background: find-close-ta.has-hover ? Theme.bg-hover : transparent;
+                                    find-close-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => {
+                                            root.editor-close-find();
+                                            edit-input.focus();
+                                        }
+                                    }
+                                    Text {
+                                        text: "\u{E5CD}";
+                                        font-family: "Material Icons";
+                                        color: Theme.text-secondary;
+                                        font-size: Theme.fs-md;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            // --- Replace row -----------------------------------
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    border-width: 1px;
+                                    border-color: replace-input.has-focus ? Theme.accent : Theme.border-strong;
+                                    background: Theme.bg-root;
+                                    replace-input := TextInput {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        text <=> root.editor-replace-query;
+                                        single-line: true;
+                                        font-size: Theme.fs-sm;
+                                        font-family: Theme.ui-font-family;
+                                        color: Theme.text-primary;
+                                        vertical-alignment: center;
+                                        key-pressed(e) => {
+                                            if (e.text == Key.Escape) {
+                                                root.editor-close-find();
+                                                return accept;
+                                            }
+                                            return reject;
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    width: 100px; height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    border-width: 1px;
+                                    border-color: Theme.border-subtle;
+                                    background: replall-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated;
+                                    replall-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        enabled: !root.editor-readonly
+                                            && root.editor-match-offsets.length > 0;
+                                        clicked => {
+                                            root.editor-replace-all(root.editor-replace-query);
+                                        }
+                                    }
+                                    Text {
+                                        text: @tr("Replace All");
+                                        color: (root.editor-readonly
+                                            || root.editor-match-offsets.length == 0)
+                                            ? Theme.text-muted : Theme.text-primary;
+                                        font-size: Theme.fs-sm;
+                                        font-family: Theme.ui-font-family;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // Text area: a line-number gutter on the left + the editor.
                     // word-wrap is OFF so one logical line == one display line and

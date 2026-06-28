@@ -3186,6 +3186,7 @@ fn apply_session_event_to_window(
                 win.set_editor_content(content.into());
                 win.set_editor_readonly(!edit);
                 win.set_editor_dirty(false);
+                win.set_editor_find_visible(false);
                 win.set_editor_open(true);
             } else {
                 // Couldn't open as text. The SFTP status line alone is easy to
@@ -4370,6 +4371,67 @@ fn wire_sftp_callbacks(
             }
             w.set_editor_open(false);
             w.set_editor_dirty(false);
+            w.set_editor_find_visible(false);
+        });
+    }
+
+    // --- Editor find / replace (Ctrl+F) --------------------------------------
+    // Slint can't search strings or measure UTF-8 byte length, so the heavy
+    // lifting lives here. The find panel stores match offsets + current index
+    // in Slint; Rust only (a) computes matches, (b) measures byte length, and
+    // (c) performs the actual text mutation for Replace / Replace All.
+
+    // Pure: every byte offset where `query` occurs in `text` (ascending).
+    {
+        let weak = window.as_weak();
+        window.on_editor_search_matches(
+            move |text: SharedString, query: SharedString| {
+                let _ = &weak; // weak kept for symmetry with other handlers
+                ModelRc::from(Rc::new(VecModel::from(editor_find_offsets(
+                    text.as_str(),
+                    query.as_str(),
+                ))))
+            },
+        );
+    }
+
+    // Pure: UTF-8 byte length of a string. Used by Slint to set the selection
+    // end on the TextInput (selection offsets are byte-based in Slint).
+    {
+        window.on_editor_byte_length_of(move |s: SharedString| {
+            s.as_str().len() as i32
+        });
+    }
+
+    // Replace every occurrence of the query with `replacement`. Uses Rust's
+    // `str::replace` (handles non-overlapping matches identically to the find
+    // loop). After writing the new content back, Slint refreshes the search.
+    {
+        let weak = window.as_weak();
+        window.on_editor_replace_all(move |replacement: SharedString| {
+            let Some(w) = weak.upgrade() else { return };
+            if w.get_editor_readonly() {
+                return;
+            }
+            let query = w.get_editor_find_query().to_string();
+            if query.is_empty() {
+                return;
+            }
+            let content = w.get_editor_content().to_string();
+            let new_content = content.replace(query.as_str(), replacement.as_str());
+            if new_content == content {
+                return;
+            }
+            w.set_editor_content(new_content.into());
+            w.set_editor_dirty(true);
+            w.set_editor_line_numbers(
+                line_numbers_for(w.get_editor_content().as_str()).into(),
+            );
+            // After replace-all all intended occurrences are gone.  Clear the
+            // selection so the user doesn't see a spurious highlight on any
+            // incidental matches inside the replacement text.
+            w.set_editor_current_match(-1);
+            w.set_editor_highlight_trigger(w.get_editor_highlight_trigger() + 1);
         });
     }
 }
@@ -5408,6 +5470,23 @@ fn line_numbers_for(content: &str) -> String {
         let _ = write!(s, "{i}");
     }
     s
+}
+
+/// Every byte offset where `query` occurs in `text` (ascending, non-overlapping).
+/// Used by the editor's find/replace panel — Slint has no string-search op so
+/// the search runs here and the offsets are returned to Slint for highlighting.
+fn editor_find_offsets(text: &str, query: &str) -> Vec<i32> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut offsets = Vec::new();
+    let mut start = 0;
+    while let Some(idx) = text[start..].find(query) {
+        let abs = start + idx;
+        offsets.push(abs as i32);
+        start = abs + query.len();
+    }
+    offsets
 }
 
 /// Write `text` to the system clipboard. Call from a dedicated thread, never the
