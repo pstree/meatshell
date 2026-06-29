@@ -4565,16 +4565,6 @@ fn wire_sftp_callbacks(
         let weak = window.as_weak();
         window.on_close_editor(move || {
             let Some(w) = weak.upgrade() else { return };
-            if !w.get_editor_readonly() && w.get_editor_dirty() {
-                let path = w.get_editor_path().to_string();
-                let content = w.get_editor_content().to_string();
-                let tab_id = w.get_active_tab_id().to_string();
-                if let Ok(handles) = sftp_handles.lock() {
-                    if let Some(h) = handles.get(&tab_id) {
-                        h.write_text(path, content);
-                    }
-                }
-            }
             w.set_editor_open(false);
             w.set_editor_dirty(false);
             w.set_editor_find_visible(false);
