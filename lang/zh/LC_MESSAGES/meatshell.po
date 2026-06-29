@@ -291,6 +291,9 @@ msgstr "暂无历史"
 msgid "e.g. tail log"
 msgstr "例如：查看日志"
 
+msgid "Append Enter after sending"
+msgstr "添加回车"
+
 msgid "Port forwarding"
 msgstr "端口转发"
 

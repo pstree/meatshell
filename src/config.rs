@@ -405,6 +405,13 @@ pub struct QuickCommand {
     /// Optional group/folder name. Empty = the implicit "default" group (#55).
     #[serde(default)]
     pub group: String,
+    /// Whether to append a newline (Enter) after sending the command (#55).
+    #[serde(default = "default_true")]
+    pub append_enter: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// On-disk layout. Keep additive to ease forward-compat.

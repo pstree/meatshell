@@ -44,6 +44,7 @@ export struct QuickCmd {
     group-header: string,
     collapsed: bool,
     orig-index: int,
+    append-enter: bool,
 }
 
 // --- MenuItem --------------------------------------------------------------
@@ -255,7 +256,7 @@ export component TerminalView inherits Rectangle {
     // Keyboard-driven selection in the open history dropdown (#140): ↑/↓ move it,
     // Enter runs history-view[history-selected].
     property <int> history-selected: 0;
-    callback run-command(string /* cmd */, bool /* to-all */);
+    callback run-command(string /* cmd */, bool /* to-all */, bool /* append-enter */);
     callback manage-quick-commands(string /* selected group */);  // open the add/edit/delete dialog
     callback toggle-quick-group(string /* group */);  // collapse/expand a group (#55)
     // Right-click management on the popup, mirroring the welcome session list (#55).
@@ -263,6 +264,7 @@ export component TerminalView inherits Rectangle {
     callback duplicate-quick-command(int /* index */);
     callback delete-quick-command(int /* index */);
     callback move-quick-command(int /* index */, string /* group */);
+    callback toggle-append-enter(int /* index */);
     callback new-quick-group();
     callback rename-quick-group(string /* group */);
     callback delete-quick-group(string /* group */);
@@ -924,7 +926,7 @@ export component TerminalView inherits Rectangle {
                                 background: qbtn-ta.has-hover ? Theme.accent : Theme.bg-elevated;
                                 qbtn-ta := TouchArea {
                                     mouse-cursor: pointer;
-                                    clicked => { root.run-command(q.command, root.send-to-all); }
+                                    clicked => { root.run-command(q.command, root.send-to-all, q.append-enter); }
                                 }
                                 qbtn-text := Text {
                                     text: q.name;
@@ -987,7 +989,7 @@ export component TerminalView inherits Rectangle {
                             single-line: true;
                             // Enter sends; ↑/↓ recall history.
                             accepted => {
-                                root.run-command(self.text, root.send-to-all);
+                                root.run-command(self.text, root.send-to-all, true);
                                 self.text = "";
                                 root.history-cursor = -1;
                             }
@@ -1103,7 +1105,7 @@ export component TerminalView inherits Rectangle {
                         send-ta := TouchArea {
                             mouse-cursor: pointer;
                             clicked => {
-                                root.run-command(cmd-input.text, root.send-to-all);
+                                root.run-command(cmd-input.text, root.send-to-all, true);
                                 cmd-input.text = "";
                                 root.history-cursor = -1;
                             }
@@ -1274,7 +1276,7 @@ export component TerminalView inherits Rectangle {
                             qmore-item-ta := TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => {
-                                    root.run-command(q.command, root.send-to-all);
+                                    root.run-command(q.command, root.send-to-all, q.append-enter);
                                     root.quick-more-open = false;
                                 }
                                 pointer-event(e) => {
@@ -1420,7 +1422,7 @@ export component TerminalView inherits Rectangle {
                                     hrun := TouchArea {
                                         mouse-cursor: pointer;
                                         clicked => {
-                                            root.run-command(h, root.send-to-all);
+                                            root.run-command(h, root.send-to-all, true);
                                             root.history-open = false;
                                         }
                                     }
@@ -1508,7 +1510,7 @@ export component TerminalView inherits Rectangle {
                                         } else if (e.text == Key.Return) {
                                             if (root.history-view.length > 0
                                                     && root.history-selected < root.history-view.length) {
-                                                root.run-command(root.history-view[root.history-selected], root.send-to-all);
+                                                root.run-command(root.history-view[root.history-selected], root.send-to-all, true);
                                                 root.history-open = false;
                                                 ime-input.focus();
                                             }

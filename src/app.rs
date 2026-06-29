@@ -2679,6 +2679,7 @@ fn quick_cmd_model(
                 group_header: group.clone().into(),
                 collapsed: is_collapsed,
                 orig_index: -1,
+                append_enter: true,
             });
         } else {
             for (i, (orig_idx, c)) in members.iter().enumerate() {
@@ -2689,6 +2690,7 @@ fn quick_cmd_model(
                     group_header: if i == 0 { group.clone().into() } else { "".into() },
                     collapsed: is_collapsed,
                     orig_index: *orig_idx as i32,
+                    append_enter: c.append_enter,
                 });
             }
         }
@@ -4657,13 +4659,15 @@ fn wire_key_input(
         let handles_rc = handles.clone();
         let store_rc = store.clone();
         let weak = window.as_weak();
-        window.on_run_command(move |tab_id: SharedString, cmd: SharedString, to_all: bool| {
+        window.on_run_command(move |tab_id: SharedString, cmd: SharedString, to_all: bool, append_enter: bool| {
             let line = cmd.trim_end().to_string();
             if line.is_empty() {
                 return;
             }
             let mut bytes = line.clone().into_bytes();
-            bytes.push(b'\n');
+            if append_enter {
+                bytes.push(b'\n');
+            }
             {
                 let h = handles_rc.borrow();
                 if to_all {
@@ -4755,7 +4759,7 @@ fn wire_key_input(
         let weak = window.as_weak();
         let collapsed = collapsed_quick_groups.clone();
         window.on_add_quick_command(
-            move |name: SharedString, command: SharedString, group: SharedString| {
+            move |name: SharedString, command: SharedString, group: SharedString, append_enter: bool| {
                 let name = name.trim().to_string();
                 let command = command.to_string();
                 let group = group.trim().to_string();
@@ -4769,6 +4773,7 @@ fn wire_key_input(
                         name,
                         command,
                         group,
+                        append_enter,
                     });
                     s.set_quick_commands(v);
                     let _ = s.save();
@@ -4827,6 +4832,7 @@ fn wire_key_input(
                 w.set_qcm_name(c.name.into());
                 w.set_qcm_command(c.command.into());
                 w.set_qcm_group(c.group.into());
+                w.set_qcm_append_enter(c.append_enter);
                 w.set_qcm_edit_index(index);
                 w.set_quick_cmd_manage_open(true);
             }
@@ -4838,7 +4844,7 @@ fn wire_key_input(
         let weak = window.as_weak();
         let collapsed = collapsed_quick_groups.clone();
         window.on_save_quick_command(
-            move |index: i32, name: SharedString, command: SharedString, group: SharedString| {
+            move |index: i32, name: SharedString, command: SharedString, group: SharedString, append_enter: bool| {
                 let name = name.trim().to_string();
                 let command = command.to_string();
                 let group = group.trim().to_string();
@@ -4853,6 +4859,7 @@ fn wire_key_input(
                             name,
                             command,
                             group,
+                            append_enter,
                         },
                     );
                     let _ = s.save();
@@ -4877,6 +4884,7 @@ fn wire_key_input(
                         name: format!("{} (copy)", c.name),
                         command: c.command,
                         group: c.group,
+                        append_enter: c.append_enter,
                     };
                     v.insert(index as usize + 1, dup);
                     s.set_quick_commands(v);
@@ -4901,6 +4909,26 @@ fn wire_key_input(
                 let mut v = s.quick_commands().to_vec();
                 if let Some(c) = v.get_mut(index as usize) {
                     c.group = target;
+                }
+                s.set_quick_commands(v);
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_quick_commands(quick_cmd_model(&store_rc.borrow(), &collapsed.borrow()));
+            }
+        });
+    }
+    // Toggle append-enter on a quick command (#55).
+    {
+        let store_rc = store.clone();
+        let weak = window.as_weak();
+        let collapsed = collapsed_quick_groups.clone();
+        window.on_toggle_append_enter(move |index: i32| {
+            {
+                let mut s = store_rc.borrow_mut();
+                let mut v = s.quick_commands().to_vec();
+                if let Some(c) = v.get_mut(index as usize) {
+                    c.append_enter = !c.append_enter;
                 }
                 s.set_quick_commands(v);
                 let _ = s.save();

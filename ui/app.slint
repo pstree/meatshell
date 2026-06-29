@@ -294,7 +294,7 @@ export component AppWindow inherits Window {
     in property <[QuickCmd]> quick-commands;
     in property <[string]> command-history;          // oldest first (newest last, #113)
     in property <[string]> history-view;             // filtered dropdown list (#101)
-    callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */);
+    callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */, bool /* append-enter */);
     callback copy-text(string);                 // copy a history command (#96)
     callback delete-history(int /* index */);   // remove a history entry (#96)
     callback delete-history-cmd(string /* cmd */);   // remove a history entry by command (#101)
@@ -303,13 +303,15 @@ export component AppWindow inherits Window {
     in-out property <string> qcm-name;                // manage form: name field
     in-out property <string> qcm-command;             // manage form: command field
     in-out property <string> qcm-group;               // manage form: group field (#55)
+    in-out property <bool> qcm-append-enter: true;    // manage form: append Enter toggle (#55)
     in-out property <int> qcm-edit-index: -1;         // -1 = add, >=0 = edit that entry (#55)
-    callback add-quick-command(string /* name */, string /* command */, string /* group */);
-    callback save-quick-command(int /* index */, string /* name */, string /* command */, string /* group */);
+    callback add-quick-command(string /* name */, string /* command */, string /* group */, bool /* append-enter */);
+    callback save-quick-command(int /* index */, string /* name */, string /* command */, string /* group */, bool /* append-enter */);
     callback delete-quick-command(int /* index */);
     callback edit-quick-command(int /* index */);
     callback duplicate-quick-command(int /* index */);
     callback move-quick-command(int /* index */, string /* group */);
+    callback toggle-append-enter(int /* index */);
     callback toggle-quick-group(string /* group */);  // collapse/expand a group (#55)
     // Quick-command group management (mirror session groups) (#55).
     in-out property <bool> qcg-open: false;           // group name dialog open
@@ -916,7 +918,7 @@ export component AppWindow inherits Window {
                     quick-commands: root.quick-commands;
                     command-history: root.command-history;
                     history-view: root.history-view;
-                    run-command(cmd, all) => { root.run-command(term.id, cmd, all); }
+                    run-command(cmd, all, ae) => { root.run-command(term.id, cmd, all, ae); }
                     copy-text(t) => { root.copy-text(t); }
                     delete-history(i) => { root.delete-history(i); }
                     delete-history-cmd(c) => { root.delete-history-cmd(c); }
@@ -933,6 +935,7 @@ export component AppWindow inherits Window {
                     duplicate-quick-command(i) => { root.duplicate-quick-command(i); }
                     delete-quick-command(i) => { root.delete-quick-command(i); }
                     move-quick-command(i, g) => { root.move-quick-command(i, g); }
+                    toggle-append-enter(i) => { root.toggle-append-enter(i); }
                     new-quick-group() => { root.qcg-orig = ""; root.qcg-name = ""; root.qcg-open = true; }
                     rename-quick-group(g) => { root.qcg-orig = g; root.qcg-name = g; root.qcg-open = true; }
                     delete-quick-group(g) => { root.delete-quick-group(g); }
@@ -2238,9 +2241,9 @@ export component AppWindow inherits Window {
                         accepted => {
                             if (root.qcm-name != "" && root.qcm-command != "") {
                                 if (root.qcm-edit-index >= 0) {
-                                    root.save-quick-command(root.qcm-edit-index, root.qcm-name, root.qcm-command, root.qcm-group);
+                                    root.save-quick-command(root.qcm-edit-index, root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-append-enter);
                                 } else {
-                                    root.add-quick-command(root.qcm-name, root.qcm-command, root.qcm-group);
+                                    root.add-quick-command(root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-append-enter);
                                 }
                                 root.qcm-edit-index = -1;
                                 root.qcm-name = ""; root.qcm-command = ""; root.qcm-group = "";
@@ -2262,16 +2265,37 @@ export component AppWindow inherits Window {
                         enabled: root.qcm-name != "" && root.qcm-command != "";
                         clicked => {
                             if (root.qcm-edit-index >= 0) {
-                                root.save-quick-command(root.qcm-edit-index, root.qcm-name, root.qcm-command, root.qcm-group);
+                                root.save-quick-command(root.qcm-edit-index, root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-append-enter);
                             } else {
-                                root.add-quick-command(root.qcm-name, root.qcm-command, root.qcm-group);
+                                root.add-quick-command(root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-append-enter);
                             }
                             root.qcm-edit-index = -1;
                             root.qcm-name = ""; root.qcm-command = ""; root.qcm-group = "";
+                            root.qcm-append-enter = true;
                         }
                     }
                 }
-
+                HorizontalLayout {
+                    spacing: 8px; padding-top: 4px; alignment: center;
+                    Rectangle {
+                        width: 18px; height: 18px; border-radius: 2px;
+                        border-width: 2px; border-color: root.qcm-append-enter ? Theme.accent : Theme.border-strong;
+                        background: root.qcm-append-enter ? Theme.accent : transparent;
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.qcm-append-enter = !root.qcm-append-enter; }
+                        }
+                        Text {
+                            visible: root.qcm-append-enter;
+                            text: "\u{E5CA}"; font-family: "Material Icons"; color: #fff;
+                            font-size: 14px; horizontal-alignment: center; vertical-alignment: center;
+                        }
+                    }
+                    Text {
+                        text: @tr("Append Enter after sending"); color: Theme.text-primary; font-size: Theme.fs-sm;
+                        vertical-alignment: center; horizontal-stretch: 1; font-family: Theme.ui-font-family;
+                    }
+                }
                 // New (empty) group.
                 HorizontalLayout {
                     Rectangle { horizontal-stretch: 1; }
