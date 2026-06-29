@@ -414,6 +414,7 @@ pub fn run() -> Result<()> {
         }
         window.set_term_font_size(s.font_size() as f32);
         window.set_ui_scale(s.ui_scale() as f32 / 100.0); // global UI zoom (#100)
+        window.set_panel_font(s.panel_font() as f32 / 100.0); // settings-panel font scale
     }
 
     // Apply the saved immersive wallpaper (overrides dark/light when set; a
@@ -490,6 +491,10 @@ pub fn run() -> Result<()> {
         window.set_sftp_panel_width(s.sftp_panel_width());
         window.set_sftp_panel_height(s.sftp_panel_height());
         window.set_sftp_dock(s.sftp_dock().into());
+        window.set_welcome_as_sidebar(s.welcome_as_sidebar());
+        window.set_welcome_sidebar_width(s.welcome_sidebar_width());
+        window.set_welcome_collapsed(s.welcome_collapsed());
+        window.set_wallpaper_overlay(s.wallpaper_overlay());
         if collapse_sidebar {
             window.set_sidebar_collapsed(true);
         }
@@ -518,6 +523,30 @@ pub fn run() -> Result<()> {
         window.on_persist_sidebar_width(move |w| {
             let mut s = store.borrow_mut();
             s.set_sidebar_width(w);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
+        window.on_persist_welcome_sidebar_width(move |w| {
+            let mut s = store.borrow_mut();
+            s.set_welcome_sidebar_width(w);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
+        window.on_set_welcome_collapsed(move |v| {
+            let mut s = store.borrow_mut();
+            s.set_welcome_collapsed(v);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
+        window.on_persist_wallpaper_overlay(move |v| {
+            let mut s = store.borrow_mut();
+            s.set_wallpaper_overlay(v);
             let _ = s.save();
         });
     }
@@ -587,6 +616,21 @@ pub fn run() -> Result<()> {
             }
         });
     }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_panel_font(move |percent: i32| {
+            let clamped = (percent.max(0) as u32).clamp(80, 160);
+            {
+                let mut s = store.borrow_mut();
+                s.set_panel_font(clamped);
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_panel_font(clamped as f32 / 100.0);
+            }
+        });
+    }
 
     // Wallpaper: pick a built-in / none, or open the file dialog for a custom one.
     {
@@ -650,6 +694,129 @@ pub fn run() -> Result<()> {
     let terminals_model: Rc<VecModel<TerminalState>> = Rc::new(VecModel::default());
     window.set_terminals(ModelRc::from(terminals_model.clone()));
 
+    // Split-pane layout tree (v0.5). Starts as a single pane owning the welcome
+    // tab; tab opens/closes/moves mutate it and re-flatten into the `panes`
+    // model. `content_size` is the pane-area px size reported from Slint.
+    // In welcome-as-sidebar mode the session list lives in a left panel, so the
+    // layout starts empty (no "welcome" tab); otherwise it owns the welcome tab.
+    let welcome_sidebar = store.borrow().welcome_as_sidebar();
+    let layout: Rc<RefCell<crate::panes::Layout>> = Rc::new(RefCell::new(if welcome_sidebar {
+        crate::panes::Layout::new(Vec::new(), String::new())
+    } else {
+        crate::panes::Layout::new(vec!["welcome".into()], "welcome".into())
+    }));
+    let content_size: Rc<std::cell::Cell<(f32, f32)>> =
+        Rc::new(std::cell::Cell::new((1200.0, 800.0)));
+    // Persistent pane / splitter models. refresh_panes updates these IN PLACE so
+    // the rendered `for pane` / `for sp` elements are reused (terminals survive,
+    // and the splitter keeps its pointer-grab during a drag).
+    let panes_model: Rc<VecModel<PaneInfo>> = Rc::new(VecModel::default());
+    window.set_panes(ModelRc::from(panes_model.clone()));
+    let splitters_model: Rc<VecModel<SplitterInfo>> = Rc::new(VecModel::default());
+    window.set_splitters(ModelRc::from(splitters_model.clone()));
+    refresh_panes(
+        &window,
+        &layout.borrow(),
+        content_size.get(),
+        &tabs_model,
+        &panes_model,
+        &splitters_model,
+    );
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_content_resized(move |w: f32, h: f32| {
+            content_size.set((w, h));
+            if let Some(win) = weak.upgrade() {
+                refresh_panes(
+                    &win,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+    // Toggle welcome-as-sidebar at runtime: persist, then move the welcome tab in
+    // or out of the split-tree (sidebar mode = no welcome tab) and re-flatten.
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_set_welcome_as_sidebar(move |v| {
+            {
+                let mut s = store.borrow_mut();
+                s.set_welcome_as_sidebar(v);
+                let _ = s.save();
+            }
+            {
+                let mut lay = layout.borrow_mut();
+                if v {
+                    lay.remove_tab("welcome");
+                } else if lay.leaf_of_tab("welcome").is_none() {
+                    lay.add_tab("welcome".into());
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+    // Per-session SFTP state: collapse + sizes live in each tab's TerminalState so
+    // split panes / other tabs each keep their own (resizing/collapsing one no
+    // longer bleeds onto the rest) (#v0.5).
+    {
+        let terminals_model = terminals_model.clone();
+        window.on_set_pane_sftp_collapsed(move |tab_id: SharedString, v: bool| {
+            update_terminal_row(&terminals_model, &tab_id, |r| r.sftp_collapsed = v);
+        });
+    }
+    {
+        let terminals_model = terminals_model.clone();
+        let weak = window.as_weak();
+        window.on_set_pane_sftp_height(move |tab_id: SharedString, v: f32| {
+            update_terminal_row(&terminals_model, &tab_id, |r| r.sftp_panel_height = v);
+            // Mirror to the global default so it persists (saved on close) and
+            // seeds new sessions; other open tabs use their own field, unaffected.
+            if let Some(w) = weak.upgrade() {
+                w.set_sftp_panel_height(v);
+            }
+        });
+    }
+    {
+        let terminals_model = terminals_model.clone();
+        let weak = window.as_weak();
+        window.on_set_pane_sftp_width(move |tab_id: SharedString, v: f32| {
+            update_terminal_row(&terminals_model, &tab_id, |r| r.sftp_panel_width = v);
+            if let Some(w) = weak.upgrade() {
+                w.set_sftp_panel_width(v);
+            }
+        });
+    }
+    {
+        let terminals_model = terminals_model.clone();
+        window.on_set_pane_sftp_saved_height(move |tab_id: SharedString, v: f32| {
+            update_terminal_row(&terminals_model, &tab_id, |r| r.sftp_saved_height = v);
+        });
+    }
+
     // Per-tab connection status + remote resources, the latest local sample,
     // and the local machine's network history (bottom sparkline).
     let tab_statuses: TabStatuses = Arc::new(Mutex::new(HashMap::new()));
@@ -663,6 +830,10 @@ pub fn run() -> Result<()> {
         sessions_model.clone(),
         tabs_model.clone(),
         terminals_model.clone(),
+        layout.clone(),
+        content_size.clone(),
+        panes_model.clone(),
+        splitters_model.clone(),
         handles.clone(),
         bufs.clone(),
         runtime.clone(),
@@ -880,6 +1051,16 @@ pub fn run() -> Result<()> {
         #[cfg(all(not(windows), not(target_os = "macos")))]
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     });
+    // The open-source link in the About dialog opens the project page.
+    window.on_open_repo(move || {
+        let url = "https://github.com/jeff141/meatshell";
+        #[cfg(windows)]
+        let _ = std::process::Command::new("explorer").arg(url).spawn();
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("open").arg(url).spawn();
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    });
     // Query the GitHub releases API on a background thread; if a newer version
     // exists, flip the banner on. Best-effort: any network/parse error is
     // silently ignored and the app keeps working on the current version.
@@ -968,6 +1149,10 @@ pub fn run() -> Result<()> {
         &window,
         tabs_model.clone(),
         terminals_model.clone(),
+        layout.clone(),
+        content_size.clone(),
+        panes_model.clone(),
+        splitters_model.clone(),
         handles.clone(),
         bufs.clone(),
         sftp_handles.clone(),
@@ -1580,6 +1765,10 @@ fn wire_session_callbacks(
     sessions_model: Rc<VecModel<SessionInfo>>,
     tabs_model: Rc<VecModel<TabInfo>>,
     terminals_model: Rc<VecModel<TerminalState>>,
+    layout: Rc<RefCell<crate::panes::Layout>>,
+    content_size: Rc<std::cell::Cell<(f32, f32)>>,
+    panes_model: Rc<VecModel<PaneInfo>>,
+    splitters_model: Rc<VecModel<SplitterInfo>>,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
     runtime: Arc<Runtime>,
@@ -2152,6 +2341,8 @@ fn wire_session_callbacks(
         let store = store.clone();
         let tabs_model = tabs_model.clone();
         let terminals_model = terminals_model.clone();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
         let handles = handles.clone();
         let bufs = bufs.clone();
         let runtime = runtime.clone();
@@ -2202,6 +2393,19 @@ fn wire_session_callbacks(
                 kind: "terminal".into(),
                 connected: false,
             });
+            // Each session keeps its own SFTP collapse state + sizes, seeded from
+            // the global defaults (the "collapse SFTP by default" pref and the
+            // persisted panel sizes) so they no longer bleed across panes (#v0.5).
+            let (sftp_collapsed_default, sftp_h_default, sftp_w_default) = weak
+                .upgrade()
+                .map(|w| {
+                    (
+                        w.get_collapse_sftp_default(),
+                        w.get_sftp_panel_height(),
+                        w.get_sftp_panel_width(),
+                    )
+                })
+                .unwrap_or((false, 220.0, 380.0));
             terminals_model.push(TerminalState {
                 id: tab_id.clone().into(),
                 status: t("连接中...", "Connecting...").into(),
@@ -2228,6 +2432,10 @@ fn wire_session_callbacks(
                     std::rc::Rc::new(VecModel::<SftpTreeNode>::default()),
                 ),
                 sftp_selected_count: 0,
+                sftp_collapsed: sftp_collapsed_default,
+                sftp_panel_height: sftp_h_default,
+                sftp_panel_width: sftp_w_default,
+                sftp_saved_height: sftp_h_default,
             });
             // Create vt100 parser for this tab (default 24×80; resized on first
             // terminal-resize callback). 5000-line scrollback is stored for
@@ -2251,8 +2459,18 @@ fn wire_session_callbacks(
             );
             // No followed-cwd yet: the first OSC 7 always triggers a follow.
             sftp_last_cwd.lock().unwrap().remove(&tab_id);
+            // Add the new tab to the focused pane and re-flatten (this also sets
+            // active-tab-id to the new tab via refresh_panes).
+            layout.borrow_mut().add_tab(tab_id.clone());
             if let Some(w) = weak.upgrade() {
-                w.set_active_tab_id(tab_id.clone().into());
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
             }
 
             // Spawn the shell (+ SFTP) workers and their event-pump threads.
@@ -2271,6 +2489,36 @@ fn wire_session_callbacks(
                 sftp_follow_cd: sftp_follow_cd.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
+        });
+    }
+
+    // Duplicate a tab's connection (#v0.5): open a fresh tab to the same saved
+    // session, landing in the same pane as the source tab.
+    {
+        let weak = window.as_weak();
+        let tab_statuses = tab_statuses.clone();
+        let layout = layout.clone();
+        window.on_tab_duplicate(move |tab_id: SharedString| {
+            let tab_id = tab_id.to_string();
+            let session_id = tab_statuses
+                .lock()
+                .unwrap()
+                .get(&tab_id)
+                .map(|s| s.session_id.clone())
+                .unwrap_or_default();
+            if session_id.is_empty() {
+                return;
+            }
+            // Land the new tab in the same pane as the source. Read the pane id
+            // into a local first so the immutable borrow is dropped before the
+            // borrow_mut (else RefCell panics on the overlapping borrow).
+            let pane = layout.borrow().leaf_of_tab(&tab_id);
+            if let Some(pane) = pane {
+                layout.borrow_mut().focused = pane;
+            }
+            if let Some(w) = weak.upgrade() {
+                w.invoke_connect_session(session_id.into());
+            }
         });
     }
 }
@@ -3203,6 +3451,28 @@ fn apply_session_event_to_window(
                 }
             }
         }
+        // The per-pane tab strips (v0.5 split panes) render snapshots copied from
+        // `tabs_model`, so they don't track this change on their own — propagate
+        // it into each pane's tab sub-model too (e.g. so the connected dot turns
+        // green without needing a tab switch).
+        let panes = win.get_panes();
+        if let Some(pm) = panes.as_any().downcast_ref::<VecModel<PaneInfo>>() {
+            for pi in 0..pm.row_count() {
+                let Some(pane) = pm.row_data(pi) else { continue };
+                let Some(tm) = pane.tabs.as_any().downcast_ref::<VecModel<TabInfo>>() else {
+                    continue;
+                };
+                for ti in 0..tm.row_count() {
+                    if let Some(mut row) = tm.row_data(ti) {
+                        if row.id.as_str() == tab_id {
+                            mutator(&mut row);
+                            tm.set_row_data(ti, row);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     };
 
     match event {
@@ -3914,6 +4184,175 @@ fn resolve_front_mfa(win: &AppWindow, accept: bool) {
 }
 
 // ---------------------------------------------------------------------------
+// Split panes (v0.5)
+// ---------------------------------------------------------------------------
+
+/// Re-flatten the split-tree `layout` for the current content-area size and push
+/// the result into the AppWindow's `panes` / `splitters` models. Also keeps the
+/// single global `active-tab-id` pointing at the focused pane's active tab — the
+/// sidebar and key routing still read that one id.
+/// True when two tab sub-models hold the same ids in the same order.
+fn tabs_eq(a: &ModelRc<TabInfo>, b: &ModelRc<TabInfo>) -> bool {
+    if a.row_count() != b.row_count() {
+        return false;
+    }
+    (0..a.row_count()).all(|i| match (a.row_data(i), b.row_data(i)) {
+        (Some(x), Some(y)) => x.id == y.id,
+        _ => false,
+    })
+}
+
+/// Find the terminal row with `tab_id`, apply `mutator`, and write it back.
+fn update_terminal_row(
+    model: &VecModel<TerminalState>,
+    tab_id: &str,
+    mutator: impl FnOnce(&mut TerminalState),
+) {
+    for i in 0..model.row_count() {
+        if let Some(mut row) = model.row_data(i) {
+            if row.id.as_str() == tab_id {
+                mutator(&mut row);
+                model.set_row_data(i, row);
+                return;
+            }
+        }
+    }
+}
+
+fn refresh_panes(
+    window: &AppWindow,
+    layout: &crate::panes::Layout,
+    content: (f32, f32),
+    tabs_model: &VecModel<TabInfo>,
+    panes_model: &VecModel<PaneInfo>,
+    splitters_model: &VecModel<SplitterInfo>,
+) {
+    let (cw, ch) = (content.0.max(1.0), content.1.max(1.0));
+    let (panes, splits) = layout.flatten(0.0, 0.0, cw, ch);
+
+    let pane_infos: Vec<PaneInfo> = panes
+        .iter()
+        .map(|p| {
+            // Map this pane's tab ids to their TabInfo rows (skipping any not yet
+            // in the model).
+            let tabs: Vec<TabInfo> = p
+                .tabs
+                .iter()
+                .filter_map(|tid| {
+                    (0..tabs_model.row_count()).find_map(|i| {
+                        let row = tabs_model.row_data(i)?;
+                        (row.id.as_str() == tid.as_str()).then_some(row)
+                    })
+                })
+                .collect();
+            // Only the pane touching the top-right corner keeps room for the
+            // floating toolbar icons (#122).
+            let top_right = p.x + p.w >= cw - 0.5 && p.y <= 0.5;
+            PaneInfo {
+                id: p.id as i32,
+                x: p.x,
+                y: p.y,
+                w: p.w,
+                h: p.h,
+                active_id: p.active.clone().into(),
+                focused: p.focused,
+                reserve_right: if top_right { 140.0 } else { 0.0 },
+                tabs: ModelRc::from(Rc::new(VecModel::from(tabs))),
+            }
+        })
+        .collect();
+
+    // Update the models IN PLACE rather than replacing them, so the `for pane` /
+    // `for sp` elements are reused: this keeps terminals from being recreated on
+    // every refresh AND preserves the splitter's pointer-grab during a drag (a
+    // fresh model would destroy the element mid-drag and drop the grab). When the
+    // structure changes (split/close → different row count) a full rebuild is fine
+    // since no drag is in flight.
+    if panes_model.row_count() == pane_infos.len() {
+        for (i, mut r) in pane_infos.into_iter().enumerate() {
+            if let Some(old) = panes_model.row_data(i) {
+                // Reuse the existing tab sub-model when the tabs are unchanged so a
+                // geometry-only refresh doesn't churn the tab strips.
+                if old.id == r.id && tabs_eq(&old.tabs, &r.tabs) {
+                    r.tabs = old.tabs;
+                }
+            }
+            panes_model.set_row_data(i, r);
+        }
+    } else {
+        panes_model.set_vec(pane_infos);
+    }
+
+    let split_infos: Vec<SplitterInfo> = splits
+        .iter()
+        .map(|s| SplitterInfo {
+            split_id: s.split_id as i32,
+            x: s.x,
+            y: s.y,
+            w: s.w,
+            h: s.h,
+            vertical: s.vertical,
+        })
+        .collect();
+    if splitters_model.row_count() == split_infos.len() {
+        for (i, r) in split_infos.into_iter().enumerate() {
+            splitters_model.set_row_data(i, r);
+        }
+    } else {
+        splitters_model.set_vec(split_infos);
+    }
+
+    if let Some(fp) = panes.iter().find(|p| p.focused) {
+        if window.get_active_tab_id().as_str() != fp.active.as_str() {
+            window.set_active_tab_id(fp.active.clone().into());
+        }
+    }
+}
+
+/// Hit-test a drag point (pane-area coords) to a target pane + edge zone, plus
+/// the highlight rect the dropped tab's new pane would occupy. Zone is one of
+/// "left"/"right"/"up"/"down"/"center"; `None` when the point is outside every
+/// pane. The 30% edge bands trigger a split; the middle drops into the pane's
+/// tab group.
+fn drag_target(
+    layout: &crate::panes::Layout,
+    content: (f32, f32),
+    x: f32,
+    y: f32,
+) -> Option<(u64, &'static str, (f32, f32, f32, f32))> {
+    const STRIP: f32 = 36.0;
+    const EDGE: f32 = 0.30;
+    let (cw, ch) = (content.0.max(1.0), content.1.max(1.0));
+    let (panes, _) = layout.flatten(0.0, 0.0, cw, ch);
+    let p = panes
+        .iter()
+        .find(|p| x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h)?;
+    // Still on the tab strip — that's reorder territory, no split/move highlight.
+    let body_top = p.y + STRIP;
+    if y < body_top {
+        return None;
+    }
+    let bw = p.w.max(1.0);
+    let bh = (p.h - STRIP).max(1.0);
+    let rx = (x - p.x) / bw;
+    let ry = (y - body_top) / bh;
+    let (dl, dr, dt, db) = (rx, 1.0 - rx, ry, 1.0 - ry);
+    let m = dl.min(dr).min(dt).min(db);
+    let (zone, rect) = if m > EDGE {
+        ("center", (p.x, p.y, p.w, p.h))
+    } else if m == dl {
+        ("left", (p.x, p.y, p.w * 0.5, p.h))
+    } else if m == dr {
+        ("right", (p.x + p.w * 0.5, p.y, p.w * 0.5, p.h))
+    } else if m == dt {
+        ("up", (p.x, p.y, p.w, p.h * 0.5))
+    } else {
+        ("down", (p.x, p.y + p.h * 0.5, p.w, p.h * 0.5))
+    };
+    Some((p.id, zone, rect))
+}
+
+// ---------------------------------------------------------------------------
 // Tab callbacks
 // ---------------------------------------------------------------------------
 
@@ -3921,28 +4360,103 @@ fn wire_tab_callbacks(
     window: &AppWindow,
     tabs_model: Rc<VecModel<TabInfo>>,
     terminals_model: Rc<VecModel<TerminalState>>,
+    layout: Rc<RefCell<crate::panes::Layout>>,
+    content_size: Rc<std::cell::Cell<(f32, f32)>>,
+    panes_model: Rc<VecModel<PaneInfo>>,
+    splitters_model: Rc<VecModel<SplitterInfo>>,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
 ) {
-    // Selecting a tab is already applied inside the Slint callback; we just
-    // need to keep the C++/Rust state in sync if needed.
+    // Select a tab inside a pane: make it that pane's active tab and focus the
+    // pane. refresh_panes propagates active-tab-id (→ sidebar refresh).
     {
-        window.on_tab_selected(move |_id: SharedString| {
-            // No-op: AppWindow.active-tab-id is updated inline in the .slint.
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_tab_selected(move |pane_id: i32, id: SharedString| {
+            let id = id.to_string();
+            {
+                let mut lay = layout.borrow_mut();
+                lay.focused = pane_id as u64;
+                if let Some(l) = lay.leaf_mut(pane_id as u64) {
+                    if l.tabs.iter().any(|t| t == &id) {
+                        l.active = id;
+                    }
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
         });
     }
 
+    // Drag-to-reorder within a pane's strip: move the tab at `from` one slot in
+    // `dir`. Only the pane's own tab order changes; content shows by active id.
     {
         let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_tab_reorder(move |pane_id: i32, from: i32, dir: i32| {
+            {
+                let mut lay = layout.borrow_mut();
+                if let Some(l) = lay.leaf_mut(pane_id as u64) {
+                    let n = l.tabs.len() as i32;
+                    if n <= 1 {
+                        return;
+                    }
+                    let from = from.clamp(0, n - 1);
+                    let to = (from + dir).clamp(0, n - 1);
+                    if from == to {
+                        return;
+                    }
+                    let item = l.tabs.remove(from as usize);
+                    l.tabs.insert(to as usize, item);
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+
+    // Close a tab: tear down its session / buffers, drop it from the models, then
+    // remove it from the split tree (which re-homes the pane's active tab and
+    // collapses the pane if it becomes empty).
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
         let tabs_model = tabs_model.clone();
         let terminals_model = terminals_model.clone();
         let handles = handles.clone();
         let bufs = bufs.clone();
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
-        window.on_tab_closed(move |id: SharedString| {
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_tab_closed(move |_pane_id: i32, id: SharedString| {
             let id = id.to_string();
             if id == "welcome" {
                 return;
@@ -3986,20 +4500,239 @@ fn wire_tab_callbacks(
                 terminals_model.remove(i);
             }
 
-            // If we closed the active tab, fall back to the welcome page.
+            layout.borrow_mut().remove_tab(&id);
             if let Some(w) = weak.upgrade() {
-                if w.get_active_tab_id().as_str() == id {
-                    w.set_active_tab_id("welcome".into());
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+
+    // "+" in a pane's strip: focus the welcome page (there is a single welcome
+    // tab; move focus to whichever pane owns it and make it active).
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_new_tab(move |pane_id: i32| {
+            // In welcome-as-sidebar mode there is no welcome tab — the session list
+            // lives in the left panel, so "+" has nothing to open.
+            if weak.upgrade().map(|w| w.get_welcome_as_sidebar()).unwrap_or(false) {
+                return;
+            }
+            {
+                let mut lay = layout.borrow_mut();
+                if let Some(owner) = lay.leaf_of_tab("welcome") {
+                    lay.focused = owner;
+                    if let Some(l) = lay.leaf_mut(owner) {
+                        l.active = "welcome".into();
+                    }
+                } else {
+                    lay.focused = pane_id as u64;
+                    lay.add_tab("welcome".into());
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+
+    // Click anywhere in a pane → focus it (drives which terminal the sidebar and
+    // key routing follow). A single pane is always focused, so this is a no-op
+    // until splits exist.
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_focus(move |pane_id: i32| {
+            {
+                let mut lay = layout.borrow_mut();
+                if lay.leaf(pane_id as u64).is_some() {
+                    lay.focused = pane_id as u64;
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+
+    // Drag a splitter to re-balance the two panes it divides. `pos` is the new
+    // boundary position in content coordinates along the split's axis; we look
+    // the split's axis window up from a fresh flatten and convert it to a ratio.
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_splitter_drag(move |split_id: i32, pos: f32, _vertical: bool| {
+            {
+                let mut lay = layout.borrow_mut();
+                let (cw, ch) = content_size.get();
+                let extent = {
+                    let (_, splits) = lay.flatten(0.0, 0.0, cw.max(1.0), ch.max(1.0));
+                    splits
+                        .iter()
+                        .find(|s| s.split_id == split_id as u64)
+                        .map(|s| (s.axis_start, s.axis_len))
+                };
+                if let Some((start, len)) = extent {
+                    lay.set_ratio(split_id as u64, start, len, pos);
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+
+    // Split a pane: peel `tab-id` out of pane `pane-id` into a new pane on the
+    // given side ("left"/"right"/"up"/"down"). Needs >1 tab so the source pane
+    // doesn't empty and immediately collapse back.
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_split(
+            move |pane_id: i32, tab_id: SharedString, dir: SharedString| {
+                let tab_id = tab_id.to_string();
+                {
+                    let mut lay = layout.borrow_mut();
+                    let can = lay
+                        .leaf(pane_id as u64)
+                        .map(|l| l.tabs.len() > 1 && l.tabs.iter().any(|t| t == &tab_id))
+                        .unwrap_or(false);
+                    if !can {
+                        return;
+                    }
+                    let (d, before) = match dir.as_str() {
+                        "left" => (crate::panes::Dir::Horizontal, true),
+                        "right" => (crate::panes::Dir::Horizontal, false),
+                        "up" => (crate::panes::Dir::Vertical, true),
+                        _ => (crate::panes::Dir::Vertical, false), // "down"
+                    };
+                    lay.split(pane_id as u64, d, &tab_id, before);
+                }
+                if let Some(w) = weak.upgrade() {
+                    refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+                }
+            },
+        );
+    }
+
+    // Drag-to-split: while a tab is dragged over the pane area, highlight the
+    // drop zone the cursor is in (an edge band → split, the middle → move).
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        window.on_tab_drag_move(move |_tab_id: SharedString, x: f32, y: f32| {
+            if let Some(w) = weak.upgrade() {
+                match drag_target(&layout.borrow(), content_size.get(), x, y) {
+                    Some((_, _, (hx, hy, hw, hh))) => {
+                        w.set_drag_active(true);
+                        w.set_drag_hl_x(hx);
+                        w.set_drag_hl_y(hy);
+                        w.set_drag_hl_w(hw);
+                        w.set_drag_hl_h(hh);
+                    }
+                    None => w.set_drag_active(false),
                 }
             }
         });
     }
 
+    // Drop: split the target pane toward the dropped-on edge (peeling the tab
+    // into the new pane), or drop into another pane's tab group from the middle.
     {
         let weak = window.as_weak();
-        window.on_new_tab_clicked(move || {
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_tab_drag_drop(move |tab_id: SharedString, x: f32, y: f32| {
+            let tab_id = tab_id.to_string();
+            let target = drag_target(&layout.borrow(), content_size.get(), x, y);
+            if let Some((pane, zone, _)) = target {
+                let mut lay = layout.borrow_mut();
+                let src = lay.leaf_of_tab(&tab_id);
+                match zone {
+                    "left" => {
+                        lay.split(pane, crate::panes::Dir::Horizontal, &tab_id, true);
+                    }
+                    "right" => {
+                        lay.split(pane, crate::panes::Dir::Horizontal, &tab_id, false);
+                    }
+                    "up" => {
+                        lay.split(pane, crate::panes::Dir::Vertical, &tab_id, true);
+                    }
+                    "down" => {
+                        lay.split(pane, crate::panes::Dir::Vertical, &tab_id, false);
+                    }
+                    _ => {
+                        if src != Some(pane) {
+                            lay.move_tab(&tab_id, pane);
+                        }
+                    }
+                }
+            }
             if let Some(w) = weak.upgrade() {
-                w.set_active_tab_id("welcome".into());
+                w.set_drag_active(false);
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
             }
         });
     }
@@ -5290,6 +6023,15 @@ fn wire_key_input(
             Rc::new(RefCell::new(HashMap::new()));
         let resize_debounce = Rc::new(slint::Timer::default());
         window.on_terminal_resize(move |tab_id: SharedString, cols_f: f32, rows_f: f32| {
+            // A hidden terminal (inactive tab, or a split sibling not currently
+            // shown) reports 0 width/height. Ignore those: flooring 0 to the 10-col
+            // minimum and applying it would shrink that tab's PTY *and* poison
+            // `last_term_size`, so the next connection (e.g. "Duplicate connection")
+            // would start at 10 cols and wrap its first output to ~10 chars (#v0.5).
+            // Only genuine, visible sizes drive a resize.
+            if cols_f < 1.0 || rows_f < 1.0 {
+                return;
+            }
             let cols = (cols_f as u32).max(10);
             let rows = (rows_f as u32).max(5);
             pending_size
