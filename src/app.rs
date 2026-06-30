@@ -2586,10 +2586,6 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     };
 
     // --- Shell event pump (dedicated thread) ---
-    // Uses a streaming buffer with periodic flushing for smooth real-time output.
-    // When tail -f or other high-volume output occurs, data accumulates in a buffer
-    // and is flushed to the UI at regular intervals (every 50ms), preventing UI thread
-    // saturation while maintaining responsive streaming.
     {
         let weak_inner = ctx.weak.clone();
         let bufs_thread = ctx.bufs.clone();
@@ -2604,102 +2600,104 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
-            let mut output_buf = String::new();
-            let mut pending_events: Vec<SessionEvent> = Vec::new();
-            let mut last_flush = std::time::Instant::now();
-            const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
-            const MAX_BUF_SIZE: usize = 64 * 1024;
-            const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+            // Reusable scratch so a fast firehose doesn't reallocate every batch.
+            let mut drained: Vec<SessionEvent> = Vec::new();
             loop {
-                let mut disconnected = false;
-                // Drain available events, capping accumulated output at
-                // MAX_BUF_SIZE. Under continuous high-volume output (tail -f,
-                // cat of a large file) the channel always has data, so an
-                // unbounded drain would buffer megabytes in one pass and then
-                // flush a single giant Output event — forcing the UI thread to
-                // vt100-parse it all synchronously and freezing the window
-                // until the backlog clears. Bounding the batch keeps each flush
-                // chunk small: the UI thread ingests only a little per frame
-                // and stays responsive while the rest drains across successive
-                // iterations. We also detect Empty/Disconnected in this same
-                // loop (the old second try_recv raced and could drop an event
-                // that arrived between the two calls).
-                loop {
+                // Block for the first event, then sweep up everything else that's
+                // already queued. A burst — e.g. `tail -f` on a busy log (#171) —
+                // then collapses into ONE invoke_from_event_loop and (after merging
+                // adjacent Output below) ONE vt100 ingest + render, instead of one
+                // UI task per chunk flooding the event loop and freezing the app.
+                match shell_rx.blocking_recv() {
+                    None => break,
+                    Some(first) => drained.push(first),
+                }
+                // Cap the sweep so an unending stream still yields to the renderer
+                // between batches (keeps the UI live rather than starved).
+                const DRAIN_CAP: usize = 2048;
+                while drained.len() < DRAIN_CAP {
                     match shell_rx.try_recv() {
-                        Ok(SessionEvent::Output(text)) => {
-                            output_buf.push_str(&text);
-                            if output_buf.len() >= MAX_BUF_SIZE {
-                                break; // flush this batch; resume draining next iteration
-                            }
-                        }
-                        Ok(SessionEvent::CwdChanged(cwd)) => {
+                        Ok(evt) => drained.push(evt),
+                        Err(_) => break,
+                    }
+                }
+
+                // Run CwdChanged side-effects here (off the UI thread), drop the
+                // swallowed ones, and concatenate runs of Output into a single chunk
+                // so the UI parses + renders the whole burst once.
+                let mut ui_batch: Vec<SessionEvent> = Vec::with_capacity(drained.len());
+                for evt in drained.drain(..) {
+                    match evt {
+                        SessionEvent::CwdChanged(cwd) => {
+                            // Shared map (not a thread-local) so manual SFTP
+                            // navigation can clear the entry — then the very next
+                            // OSC 7, same directory or not, snaps the panel back to
+                            // the shell's cwd. Unchanged repeats (every prompt
+                            // re-emits OSC 7) are ignored (#59).
                             let changed = match sftp_last_cwd_pump.lock() {
                                 Ok(mut m) => {
-                                    m.insert(tab_id_pump.clone(), cwd.clone())
-                                        .as_deref()
+                                    m.insert(tab_id_pump.clone(), cwd.clone()).as_deref()
                                         != Some(cwd.as_str())
                                 }
                                 Err(_) => false,
                             };
-                            if changed && follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed) {
-                                if let Some(prev) = cwd_debounce.take() {
-                                    prev.abort();
-                                }
-                                let cwd_clone = cwd.clone();
-                                let sftp_h = sftp_handles_pump.clone();
-                                let tid = tab_id_pump.clone();
-                                cwd_debounce = Some(rt_pump.spawn(async move {
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                    if let Ok(handles) = sftp_h.lock() {
-                                        if let Some(h) = handles.get(&tid) {
-                                            h.list_dir(cwd_clone);
-                                        }
+                            // Swallow when follow-cd is off: forwarding it would set
+                            // sftp_loading without any ListDir to clear it (the #59
+                            // stuck-"loading" trap).
+                            if !changed
+                                || !follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                continue;
+                            }
+                            if let Some(prev) = cwd_debounce.take() {
+                                prev.abort();
+                            }
+                            let cwd_spawn = cwd.clone();
+                            let sftp_h = sftp_handles_pump.clone();
+                            let tid = tab_id_pump.clone();
+                            cwd_debounce = Some(rt_pump.spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                if let Ok(handles) = sftp_h.lock() {
+                                    if let Some(h) = handles.get(&tid) {
+                                        h.list_dir(cwd_spawn);
                                     }
-                                }));
-                                pending_events.push(SessionEvent::CwdChanged(cwd));
+                                }
+                            }));
+                            ui_batch.push(SessionEvent::CwdChanged(cwd));
+                        }
+                        SessionEvent::Output(chunk) => {
+                            // Merge with the immediately preceding Output so the
+                            // whole run is one vt100 ingest + one render. Only
+                            // *adjacent* chunks merge, so byte order (and any
+                            // interleaved event) is preserved exactly.
+                            if let Some(SessionEvent::Output(prev)) = ui_batch.last_mut() {
+                                prev.push_str(&chunk);
+                            } else {
+                                ui_batch.push(SessionEvent::Output(chunk));
                             }
                         }
-                        Ok(other) => {
-                            pending_events.push(other);
-                        }
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                            disconnected = true;
-                            break;
-                        }
+                        other => ui_batch.push(other),
                     }
                 }
-                let now = std::time::Instant::now();
-                let should_flush = now.duration_since(last_flush) >= FLUSH_INTERVAL
-                    || output_buf.len() >= MAX_BUF_SIZE
-                    || !pending_events.is_empty()
-                    || disconnected;
-                if should_flush && !output_buf.is_empty() {
-                    pending_events.push(SessionEvent::Output(std::mem::take(&mut output_buf)));
+                if ui_batch.is_empty() {
+                    continue;
                 }
-                if !pending_events.is_empty() {
-                    let weak_evt = weak_inner.clone();
-                    let tid = tab_id_pump.clone();
-                    let bufs_evt = bufs_thread.clone();
-                    let st_evt = statuses_pump.clone();
-                    let lc_evt = local_pump.clone();
-                    let nh_evt = net_pump.clone();
-                    let events_to_send = std::mem::take(&mut pending_events);
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(win) = weak_evt.upgrade() {
-                            for evt in events_to_send {
-                                apply_session_event_to_window(
-                                    &win, &tid, evt, &bufs_evt, &st_evt, &lc_evt, &nh_evt,
-                                );
-                            }
+
+                let weak_evt = weak_inner.clone();
+                let tid = tab_id_pump.clone();
+                let bufs_evt = bufs_thread.clone();
+                let st_evt = statuses_pump.clone();
+                let lc_evt = local_pump.clone();
+                let nh_evt = net_pump.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(win) = weak_evt.upgrade() {
+                        for evt in ui_batch {
+                            apply_session_event_to_window(
+                                &win, &tid, evt, &bufs_evt, &st_evt, &lc_evt, &nh_evt,
+                            );
                         }
-                    });
-                    last_flush = now;
-                }
-                if disconnected {
-                    break;
-                }
-                std::thread::sleep(POLL_INTERVAL);
+                    }
+                });
             }
         });
     }
