@@ -838,41 +838,6 @@ export component TerminalView inherits Rectangle {
                 spacing: 6px;
                 alignment: start;
 
-                // Quick-command toggle (clicking again clears the selection).
-                Rectangle {
-                    width: qck-row.preferred-width + 16px;
-                    height: 24px;
-                    border-radius: Theme.radius-sm;
-                    background: qck-ta.has-hover || root.quick-open ? Theme.bg-hover : Theme.bg-elevated;
-                    qck-ta := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => {
-                            root.history-open = false;
-                            root.quick-more-open = false;
-                            if root.quick-open && root.selected-quick-group != "" {
-                                root.selected-quick-group = "";
-                            }
-                            root.quick-open = !root.quick-open;
-                        }
-                    }
-                    qck-row := HorizontalLayout {
-                        width: parent.width; height: parent.height;
-                        alignment: center;
-                        spacing: 3px;
-                        Text {
-                            text: root.selected-quick-group != "" ? root.selected-quick-group : @tr("Quick");
-                            color: root.selected-quick-group != "" ? Theme.accent : Theme.text-secondary;
-                            font-size: Theme.fs-sm;
-                            font-weight: root.selected-quick-group != "" ? 700 : 400;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            font-family: Theme.ui-font-family;
-                        }
-                        Text { text: "\u{E5CE}"; font-family: "Material Icons"; color: Theme.text-muted;
-                               font-size: Theme.fs-sm; vertical-alignment: center; }
-                    }
-                }
-
                 // Inline command buttons for the selected quick group.
                 Flickable {
                     horizontal-stretch: 1;
@@ -903,29 +868,6 @@ export component TerminalView inherits Rectangle {
                                 overflow: elide;
                             }
                         }
-                    }
-                }
-
-                // "More" overflow button — only shown when a group is selected.
-                if root.selected-quick-group != "" : Rectangle {
-                    width: 24px; height: 24px;
-                    border-radius: Theme.radius-sm;
-                    border-width: 1px;
-                    border-color: Theme.border-subtle;
-                    background: qmore-ta.has-hover || root.quick-more-open ? Theme.bg-hover : Theme.bg-elevated;
-                    qmore-ta := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => {
-                            root.quick-more-open = !root.quick-more-open;
-                        }
-                    }
-                    Text {
-                        text: "\u{E5D3}"; // more_horiz
-                        font-family: "Material Icons";
-                        color: Theme.text-muted;
-                        font-size: 12px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
                     }
                 }
             }
@@ -1140,21 +1082,15 @@ export component TerminalView inherits Rectangle {
                             height: 32px; vertical-alignment: center;
                         }
                         for q in root.quick-commands : VerticalLayout {
-                            // Group header on the first row of each group —
-                            // click to select the group and populate the quick-cmd-bar above.
+                            // Group header on the first row of each group (#55) —
+                            // click to collapse/expand the whole group.
                             if q.group-header != "" : Rectangle {
-                                height: 28px;
-                                border-radius: Theme.radius-sm;
-                                background: grp-ta.has-hover || q.group == root.selected-quick-group
-                                            ? Theme.bg-hover : transparent;
+                                height: 24px;
                                 property <length> gmx;
                                 property <length> gmy;
                                 grp-ta := TouchArea {
                                     mouse-cursor: pointer;
-                                    clicked => {
-                                        root.selected-quick-group = q.group;
-                                        root.quick-open = false;
-                                    }
+                                    clicked => { root.toggle-quick-group(q.group); }
                                     pointer-event(e) => {
                                         if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
                                             gmx = self.mouse-x; gmy = self.mouse-y; qpop-grp-menu.show();
@@ -1162,29 +1098,23 @@ export component TerminalView inherits Rectangle {
                                     }
                                 }
                                 HorizontalLayout {
-                                    padding-left: 6px; padding-right: 6px;
-                                    spacing: 6px;
+                                    padding-left: 4px; padding-top: 4px; spacing: 4px;
+                                    Text {
+                                        text: q.collapsed ? "\u{E5CC}" : "\u{E5CF}"; // chevron ▶/▼
+                                        font-family: "Material Icons";
+                                        color: Theme.text-muted; font-size: Theme.fs-sm;
+                                        vertical-alignment: center;
+                                    }
                                     Text {
                                         text: "\u{E2C7}"; // folder
                                         font-family: "Material Icons";
-                                        color: q.group == root.selected-quick-group ? Theme.accent : Theme.text-muted;
-                                        font-size: Theme.fs-sm;
+                                        color: Theme.text-muted; font-size: Theme.fs-sm;
                                         vertical-alignment: center;
                                     }
                                     Text {
-                                        text: q.group; color: Theme.text-primary; font-size: Theme.fs-sm;
-                                        font-family: Theme.ui-font-family;
-                                        font-weight: q.group == root.selected-quick-group ? 700 : 400;
-                                        vertical-alignment: center;
+                                        text: q.group; color: Theme.text-muted; font-size: Theme.fs-xs;
+                                        font-weight: 700; vertical-alignment: center;
                                         horizontal-stretch: 1; horizontal-alignment: left;
-                                        overflow: elide;
-                                    }
-                                    if q.group == root.selected-quick-group : Text {
-                                        text: "\u{E5CA}"; // check
-                                        font-family: "Material Icons";
-                                        color: Theme.accent;
-                                        font-size: Theme.fs-sm;
-                                        vertical-alignment: center;
                                     }
                                 }
                                 qpop-grp-menu := PopupWindow {
@@ -1227,7 +1157,8 @@ export component TerminalView inherits Rectangle {
                                 q-item-ta := TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => {
-                                        root.run-command(q.command, root.send-to-all,true);
+                                        root.selected-quick-group = q.group;
+                                        root.run-command(q.command, root.send-to-all, true);
                                         root.quick-open = false;
                                     }
                                     pointer-event(e) => {
