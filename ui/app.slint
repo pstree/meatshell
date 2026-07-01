@@ -506,6 +506,7 @@ export component AppWindow inherits Window {
     callback save-file();                     // Ctrl+S / Save button (edit only)
     callback close-editor();                  // X / Esc; uploads if dirty
     callback editor-recount(string);          // rebuild line numbers after an edit
+    callback editor-replace-tabs();            // replace 0x09 with 4 spaces (#144)
 
     // --- Editor find / replace (Ctrl+F) ----------------------------------
     in-out property <bool>   editor-find-visible: false;
@@ -1878,7 +1879,11 @@ export component AppWindow inherits Window {
                                     color: Theme.text-primary;
                                     font-family: Theme.ui-font-family;
                                     font-size: Theme.fs-md;
-                                    edited => { root.editor-dirty = true; root.editor-recount(root.editor-content); }
+                                    edited => {
+                                        root.editor-dirty = true;
+                                        root.editor-recount(root.editor-content);
+                                        root.editor-replace-tabs();
+                                    }
                                 }
                             }
                         }

@@ -3648,7 +3648,7 @@ fn apply_session_event_to_window(
                 win.set_editor_line_numbers(line_numbers_for(&content).into());
                 win.set_editor_path(path.into());
                 win.set_editor_name(name.into());
-                win.set_editor_content(content.into());
+                win.set_editor_content(content.replace('\t', "    ").into());
                 win.set_editor_readonly(!edit);
                 win.set_editor_dirty(false);
                 win.set_editor_find_visible(false);
@@ -5269,6 +5269,23 @@ fn wire_sftp_callbacks(
         });
     }
 
+    // Replace any tab characters with 4 spaces (Slint's TextInput can't
+    // render 0x09 — it shows as a tofu box). Called from edited so the
+    // cursor briefly sits on the tab then immediately lands on spaces.
+    {
+        let weak = window.as_weak();
+        window.on_editor_replace_tabs(move || {
+            if let Some(w) = weak.upgrade() {
+                let content = w.get_editor_content().to_string();
+                if !content.contains('\t') { return; }
+                let new = content.replace('\t', "    ");
+                let line_numbers = line_numbers_for(&new);
+                w.set_editor_content(new.into());
+                w.set_editor_line_numbers(line_numbers.into());
+            }
+        });
+    }
+
     // Built-in editor: save (Ctrl+S / button) writes the text back to the
     // remote file (#70). Read-only (view) sessions never save.
     {
@@ -5292,7 +5309,6 @@ fn wire_sftp_callbacks(
     }
     // Close the editor; in edit mode upload first if there are unsaved edits.
     {
-        let sftp_handles = sftp_handles.clone();
         let weak = window.as_weak();
         window.on_close_editor(move || {
             let Some(w) = weak.upgrade() else { return };
