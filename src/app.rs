@@ -1286,8 +1286,19 @@ pub fn run() -> Result<()> {
                 }
             };
             match event {
+                WEvent::HoveredFile(_) => {
+                    if let Some(win) = weak.upgrade() {
+                        win.set_sftp_drag_hover(true);
+                    }
+                }
+                WEvent::HoveredFileCancelled => {
+                    if let Some(win) = weak.upgrade() {
+                        win.set_sftp_drag_hover(false);
+                    }
+                }
                 WEvent::DroppedFile(path) => {
                     if let Some(win) = weak.upgrade() {
+                        win.set_sftp_drag_hover(false);
                         handle_file_drop(&win, &sh, path.to_string_lossy().to_string());
                     }
                 }
@@ -1593,7 +1604,33 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
 }
 
 #[cfg(not(windows))]
-fn handle_file_drop(_win: &AppWindow, _sftp_handles: &SftpHandles, _path: String) {}
+fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
+    let active = win.get_active_tab_id().to_string();
+    if active == "welcome" {
+        return;
+    }
+    let dir = active_sftp_path(win, &active);
+    if dir.is_empty() {
+        return;
+    }
+    let sync = win.get_sync_input() && win.get_sync_upload_enabled();
+    let other_dirs = if sync { terminal_sftp_paths(win) } else { HashMap::new() };
+    if let Ok(handles) = sftp_handles.lock() {
+        if let Some(h) = handles.get(&active) {
+            h.upload(path.clone(), dir);
+        }
+        if sync {
+            for (id, h) in handles.iter() {
+                if id == &active {
+                    continue;
+                }
+                if let Some(d) = other_dirs.get(id).filter(|d| !d.is_empty()) {
+                    h.upload(path.clone(), d.clone());
+                }
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Model helpers

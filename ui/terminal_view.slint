@@ -104,6 +104,7 @@ export component TerminalView inherits Rectangle {
     in property <string>  sftp-status: "";
     in property <bool>    sftp-loading: false;
     in property <[SftpTreeNode]> sftp-tree-nodes: [];
+    in property <bool> sftp-drag-hover: false;
 
     // Per-session now (#v0.5): the AppWindow stores these in each TerminalState
     // and writes back via the set-* callbacks, so each tab/pane keeps its own SFTP
@@ -1487,6 +1488,7 @@ export component TerminalView inherits Rectangle {
             loading:       root.sftp-loading;
             tree-nodes:    root.sftp-tree-nodes;
             selected-count: root.sftp-selected-count;
+            drag-hover: root.sftp-drag-hover;
             toggle-collapsed => {
                 if (root.sftp-collapsed) {
                     // Re-expand; the panel height was preserved while collapsed.

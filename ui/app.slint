@@ -662,6 +662,8 @@ export component AppWindow inherits Window {
     callback sftp-edit(string /* tab-id */, string /* path */);
     callback sftp-open-external(string /* tab-id */, string /* path */);
     callback sftp-edit-external(string /* tab-id */, string /* path */);
+    // OS file drag-and-drop state (#drag): set from Rust via winit events.
+    in-out property <bool> sftp-drag-hover: false;
     // SFTP context-menu extensions (#69): rename / chmod / mkdir / touch share
     // one single-input prompt dialog; copy-path goes straight to the clipboard.
     in-out property <bool> sftp-prompt-open: false;
@@ -1138,6 +1140,7 @@ export component AppWindow inherits Window {
                     sftp-loading: term.sftp-loading;
                     sftp-tree-nodes: term.sftp-tree-nodes;
                     sftp-selected-count: term.sftp-selected-count;
+                    sftp-drag-hover <=> root.sftp-drag-hover;
                     quick-commands: root.quick-commands;
                     command-history: root.command-history;
                     history-view: root.history-view;

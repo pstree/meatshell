@@ -72,6 +72,7 @@ export component SftpPanel inherits Rectangle {
     property <bool> show-modified-col: root.show-tree || (root.list-w - 36px - 120px > root.name-min);
     property <int> selected-row: -1;       // clicked/highlighted file-list row (#70)
     in property <int> selected-count;      // number of checked entries (#100)
+    in property <bool> drag-hover: false;  // OS file being dragged over the list (#drag)
     // Panel-level right-click context menu (#84). One menu for the whole list:
     // an empty `menu-target` means the click landed on whitespace, which greys
     // out the item-specific actions (download/rename/…) but keeps new/refresh.
@@ -577,6 +578,26 @@ export component SftpPanel inherits Rectangle {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // Drop zone overlay — appears when OS files are dragged over the
+                    // file list, providing visual feedback before the drop (#drag).
+                    if root.drag-hover : Rectangle {
+                        x: 0; y: 0;
+                        width: parent.width;
+                        height: parent.height;
+                        background: Theme.accent.with-alpha(0.10);
+                        border-width: 2px;
+                        border-color: Theme.accent;
+                        Text {
+                            text: @tr("Drop files here to upload");
+                            color: Theme.accent;
+                            font-size: Theme.fs-md;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: parent.width;
+                            height: parent.height;
                         }
                     }
 
