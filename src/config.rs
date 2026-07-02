@@ -56,6 +56,28 @@ pub fn data_dir() -> PathBuf {
     DATA_DIR.get_or_init(resolve_data_dir).clone()
 }
 
+/// Directory for diagnostic logs (`error.log`). Kept *separate* from the config
+/// dir so logs don't clutter user data: portable-first → a `log/` folder beside
+/// the executable (a sibling of `config/`), falling back to a `log/` subdir
+/// under the per-user data dir when the exe dir is read-only (Program Files etc.)
+/// (#log-dir).
+pub fn log_dir() -> PathBuf {
+    // Portable: <exe_dir>/log, sibling of the portable config/ folder.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let log = parent.join("log");
+            if fs::create_dir_all(&log).is_ok() && dir_is_writable(&log) {
+                return log;
+            }
+        }
+    }
+    // Read-only exe dir → put logs in their own subdir under the per-user data
+    // dir (still not mixed in with sessions.json et al.).
+    let dir = data_dir().join("log");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
 /// Pre-0.4.15 location: the per-user OS config dir
 /// (`%APPDATA%/meatshell`, `~/.config/meatshell`, …).
 fn legacy_data_dir() -> Option<PathBuf> {
@@ -239,17 +261,27 @@ fn default_parity() -> String {
 /// the user picks anything (including "无"/none, stored as ""), their choice is
 /// saved and sticks.
 fn default_wallpaper() -> String {
+    // Serde default for the `wallpaper` field: kept at the old "幻想 3048" so an
+    // *existing* config that predates the field stays on tech — `migrate_defaults`
+    // then upgrades those still-on-tech users to miku (and leaves real choices
+    // alone). Brand-new installs get miku straight from `fresh_config`.
     "builtin:tech".to_string()
 }
-/// A brand-new config (no file yet, or the old one was corrupt). Identical to
-/// `ConfigFile::default()` except it seeds the default wallpaper, which the
-/// derived `Default` (an empty string = "none") wouldn't.
+
+/// Bump when `migrate_defaults` gains a new one-time default-layout change.
+pub const DEFAULTS_REV: u32 = 1;
+
+/// A brand-new config (no file yet, or the old one was corrupt). Seeds the
+/// new-user default layout (#new-user-defaults): miku wallpaper, welcome page as
+/// a left sidebar, resource panel docked right, a 0.38 wallpaper overlay — and
+/// marks the migration done so it isn't re-applied.
 fn fresh_config() -> ConfigFile {
     ConfigFile {
         wallpaper: default_wallpaper(),
         ..ConfigFile::default()
     }
 }
+
 fn default_sidebar_width() -> f32 {
     220.0
 }
@@ -405,9 +437,11 @@ pub struct QuickCommand {
     /// Optional group/folder name. Empty = the implicit "default" group (#55).
     #[serde(default)]
     pub group: String,
-    /// Whether to append a newline (Enter) after sending the command (#55).
+    /// Whether clicking the chip sends + executes (appends Return). `false` only
+    /// drops the command into the input box to tweak first. Defaults to `true` so
+    /// existing quick commands keep running on click. (B站 suggestion)
     #[serde(default = "default_true")]
-    pub append_enter: bool,
+    pub send_enter: bool,
 }
 
 fn default_true() -> bool {
@@ -516,6 +550,11 @@ pub struct ConfigFile {
     /// Settings-panel font scale, percent (80–160). 0 = 100% default (v0.5).
     #[serde(default)]
     pub panel_font: u32,
+    /// Disable the startup "new version available" check (#184). Default false =
+    /// keep checking (preserves existing behaviour for upgrading users); turning
+    /// it on stops the GitHub releases query and the banner.
+    #[serde(default)]
+    pub update_check_disabled: bool,
 }
 
 /// Portable export file (issue #46): sessions with everything in plaintext
@@ -961,6 +1000,13 @@ impl ConfigStore {
     }
     pub fn set_welcome_collapsed(&mut self, v: bool) {
         self.cache.welcome_collapsed = v;
+    }
+    /// Whether the startup new-version check is enabled (#184).
+    pub fn update_check_enabled(&self) -> bool {
+        !self.cache.update_check_disabled
+    }
+    pub fn set_update_check_enabled(&mut self, enabled: bool) {
+        self.cache.update_check_disabled = !enabled;
     }
     pub fn wallpaper_overlay(&self) -> f32 {
         let a = self.cache.wallpaper_overlay;

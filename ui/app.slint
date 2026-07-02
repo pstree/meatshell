@@ -325,7 +325,7 @@ export component AppWindow inherits Window {
     in property <[QuickCmd]> quick-commands;
     in property <[string]> command-history;          // oldest first (newest last, #113)
     in property <[string]> history-view;             // filtered dropdown list (#101)
-    callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */, bool /* append-enter */);
+    callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */, bool /* send-enter */);
     callback copy-text(string);                 // copy a history command (#96)
     callback delete-history(int /* index */);   // remove a history entry (#96)
     callback delete-history-cmd(string /* cmd */);   // remove a history entry by command (#101)
@@ -334,15 +334,15 @@ export component AppWindow inherits Window {
     in-out property <string> qcm-name;                // manage form: name field
     in-out property <string> qcm-command;             // manage form: command field
     in-out property <string> qcm-group;               // manage form: group field (#55)
-    in-out property <bool> qcm-append-enter: true;    // manage form: append Enter toggle (#55)
+    in-out property <bool> qcm-send-enter: true;      // click sends+executes (B站)
     in-out property <int> qcm-edit-index: -1;         // -1 = add, >=0 = edit that entry (#55)
-    callback add-quick-command(string /* name */, string /* command */, string /* group */, bool /* append-enter */);
-    callback save-quick-command(int /* index */, string /* name */, string /* command */, string /* group */, bool /* append-enter */);
+    callback add-quick-command(string /* name */, string /* command */, string /* group */, bool /* send-enter */);
+    callback save-quick-command(int /* index */, string /* name */, string /* command */, string /* group */, bool /* send-enter */);
     callback delete-quick-command(int /* index */);
     callback edit-quick-command(int /* index */);
     callback duplicate-quick-command(int /* index */);
     callback move-quick-command(int /* index */, string /* group */);
-    callback toggle-append-enter(int /* index */);
+    callback toggle-send_enter(int /* index */);
     callback toggle-quick-group(string /* group */);  // collapse/expand a group (#55)
     // Quick-command group management (mirror session groups) (#55).
     in-out property <bool> qcg-open: false;           // group name dialog open
@@ -414,6 +414,8 @@ export component AppWindow inherits Window {
     // Render the welcome/session list as a left sidebar instead of a tab (v0.5).
     in-out property <bool> welcome-as-sidebar: false;
     callback set-welcome-as-sidebar(bool);         // apply + persist
+    in-out property <bool> update-check-enabled: true;   // startup new-version check (#184)
+    callback set-update-check-enabled(bool);       // apply + persist
     // Drag-resizable width of that welcome sidebar (logical px), persisted.
     in-out property <length> welcome-sidebar-width: 240px;
     callback persist-welcome-sidebar-width(float);
@@ -889,9 +891,10 @@ export component AppWindow inherits Window {
         property <length> bottom-strip-h: 0px;
 
         // Left sidebar — collapsible and drag-resizable, dockable to any edge.
-        // The animation is disabled while dragging so the splitter tracks the
-        // cursor 1:1 instead of lagging behind.
-        Sidebar {
+        // Only shown while expanded; collapsing swaps it for the ToolStrip icon
+        // bar below (mirrors the welcome sidebar), so no clipped widgets bleed
+        // through the 36px strip (#resource-collapse).
+        if !root.sidebar-collapsed : Sidebar {
             x: root.sidebar-dock == "right" ? parent.width - parent.sb-w
              : 0px;
             y: root.sidebar-dock == "bottom" ? parent.height - parent.sb-h
@@ -1161,7 +1164,7 @@ export component AppWindow inherits Window {
                     duplicate-quick-command(i) => { root.duplicate-quick-command(i); }
                     delete-quick-command(i) => { root.delete-quick-command(i); }
                     move-quick-command(i, g) => { root.move-quick-command(i, g); }
-                    toggle-append-enter(i) => { root.toggle-append-enter(i); }
+                    toggle-send_enter(i) => { root.toggle-send_enter(i); }
                     new-quick-group() => { root.qcg-orig = ""; root.qcg-name = ""; root.qcg-open = true; }
                     rename-quick-group(g) => { root.qcg-orig = g; root.qcg-name = g; root.qcg-open = true; }
                     delete-quick-group(g) => { root.delete-quick-group(g); }
@@ -2504,12 +2507,12 @@ export component AppWindow inherits Window {
                         accepted => {
                             if (root.qcm-name != "" && root.qcm-command != "") {
                                 if (root.qcm-edit-index >= 0) {
-                                    root.save-quick-command(root.qcm-edit-index, root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-append-enter);
+                                    root.save-quick-command(root.qcm-edit-index, root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-send-enter);
                                 } else {
-                                    root.add-quick-command(root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-append-enter);
+                                    root.add-quick-command(root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-send-enter);
                                 }
                                 root.qcm-edit-index = -1;
-                                root.qcm-name = ""; root.qcm-command = ""; root.qcm-group = "";
+                                root.qcm-name = ""; root.qcm-command = ""; root.qcm-group = ""; root.qcm-send-enter = true;
                             }
                         }
                     }
@@ -2518,7 +2521,7 @@ export component AppWindow inherits Window {
                         text: root.lang-en ? "Cancel" : "取消";
                         clicked => {
                             root.qcm-edit-index = -1;
-                            root.qcm-name = ""; root.qcm-command = ""; root.qcm-group = "";
+                            root.qcm-name = ""; root.qcm-command = ""; root.qcm-group = ""; root.qcm-send-enter = true;
                         }
                     }
                     Button {
@@ -2528,37 +2531,25 @@ export component AppWindow inherits Window {
                         enabled: root.qcm-name != "" && root.qcm-command != "";
                         clicked => {
                             if (root.qcm-edit-index >= 0) {
-                                root.save-quick-command(root.qcm-edit-index, root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-append-enter);
+                                root.save-quick-command(root.qcm-edit-index, root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-send-enter);
                             } else {
-                                root.add-quick-command(root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-append-enter);
+                                root.add-quick-command(root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-send-enter);
                             }
                             root.qcm-edit-index = -1;
-                            root.qcm-name = ""; root.qcm-command = ""; root.qcm-group = "";
-                            root.qcm-append-enter = true;
+                            root.qcm-name = ""; root.qcm-command = ""; root.qcm-group = ""; root.qcm-send-enter = true;
                         }
                     }
                 }
-                HorizontalLayout {
-                    spacing: 8px; padding-top: 4px; alignment: center;
-                    Rectangle {
-                        width: 18px; height: 18px; border-radius: 2px;
-                        border-width: 2px; border-color: root.qcm-append-enter ? Theme.accent : Theme.border-strong;
-                        background: root.qcm-append-enter ? Theme.accent : transparent;
-                        TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => { root.qcm-append-enter = !root.qcm-append-enter; }
-                        }
-                        Text {
-                            visible: root.qcm-append-enter;
-                            text: "\u{E5CA}"; font-family: "Material Icons"; color: #fff;
-                            font-size: 14px; horizontal-alignment: center; vertical-alignment: center;
-                        }
-                    }
-                    Text {
-                        text: @tr("Append Enter after sending"); color: Theme.text-primary; font-size: Theme.fs-sm;
-                        vertical-alignment: center; horizontal-stretch: 1; font-family: Theme.ui-font-family;
-                    }
+
+                // Whether a click sends+executes or just fills the input box to
+                // tweak first (B站 suggestion).
+                CheckBox {
+                    text: root.lang-en
+                        ? "Send + run on click (off: fill input box only)"
+                        : "点击即发送执行(关闭则只填入输入框,可修改后再发)";
+                    checked <=> root.qcm-send-enter;
                 }
+
                 // New (empty) group.
                 HorizontalLayout {
                     Rectangle { horizontal-stretch: 1; }
@@ -3653,6 +3644,7 @@ export component AppWindow inherits Window {
                     sync-upload-enabled <=> root.sync-upload-enabled;
                     download-always-ask <=> root.download-always-ask;
                     welcome-as-sidebar <=> root.welcome-as-sidebar;
+                    update-check-enabled <=> root.update-check-enabled;
                     wallpaper-overlay <=> root.wallpaper-overlay;
                     current-wallpaper: root.current-wallpaper;
                     custom-wallpaper-name: root.custom-wallpaper-name;
@@ -3668,6 +3660,7 @@ export component AppWindow inherits Window {
                     set-sync-upload-enabled(v) => { root.set-sync-upload-enabled(v); }
                     set-download-always-ask(v) => { root.set-download-always-ask(v); }
                     set-welcome-as-sidebar(v) => { root.set-welcome-as-sidebar(v); }
+                    set-update-check-enabled(v) => { root.set-update-check-enabled(v); }
                     persist-wallpaper-overlay(v) => { root.persist-wallpaper-overlay(v); }
                 }
             }

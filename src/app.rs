@@ -495,6 +495,7 @@ pub fn run() -> Result<()> {
         window.set_welcome_sidebar_width(s.welcome_sidebar_width());
         window.set_welcome_collapsed(s.welcome_collapsed());
         window.set_wallpaper_overlay(s.wallpaper_overlay());
+        window.set_update_check_enabled(s.update_check_enabled()); // #184
         if collapse_sidebar {
             window.set_sidebar_collapsed(true);
         }
@@ -515,6 +516,16 @@ pub fn run() -> Result<()> {
         window.on_set_collapse_sidebar_default(move |v| {
             let mut s = store.borrow_mut();
             s.set_collapse_sidebar_default(v);
+            let _ = s.save();
+        });
+    }
+    {
+        // Toggle the startup new-version check (#184). Takes effect next launch
+        // for the check itself; the banner just won't appear once it's off.
+        let store = store.clone();
+        window.on_set_update_check_enabled(move |v| {
+            let mut s = store.borrow_mut();
+            s.set_update_check_enabled(v);
             let _ = s.save();
         });
     }
@@ -1064,7 +1075,8 @@ pub fn run() -> Result<()> {
     // Query the GitHub releases API on a background thread; if a newer version
     // exists, flip the banner on. Best-effort: any network/parse error is
     // silently ignored and the app keeps working on the current version.
-    {
+    // Skipped entirely when the user turned the check off (#184).
+    if store.borrow().update_check_enabled() {
         let weak = window.as_weak();
         std::thread::spawn(move || {
             let body = match ureq::get(
@@ -2962,7 +2974,7 @@ fn quick_cmd_model(
                 group_header: group.clone().into(),
                 collapsed: is_collapsed,
                 orig_index: -1,
-                append_enter: true,
+                send_enter: true,
             });
         } else {
             for (i, (orig_idx, c)) in members.iter().enumerate() {
@@ -2973,7 +2985,7 @@ fn quick_cmd_model(
                     group_header: if i == 0 { group.clone().into() } else { "".into() },
                     collapsed: is_collapsed,
                     orig_index: *orig_idx as i32,
-                    append_enter: c.append_enter,
+                    send_enter: c.send_enter,
                 });
             }
         }
@@ -3318,6 +3330,13 @@ fn selected_iface(st: &TabStatus) -> (String, u64, u64) {
 /// for whichever tab is active.  Welcome tab → local machine; a session tab →
 /// that server.  The bottom network graph is always the local machine.
 /// Must run on the Slint event loop thread.
+/// The copyable IP/host from a `user@host` connection label (#192): the part
+/// after the last `@`, trimmed. Falls back to the whole string when there's no
+/// `@` (already a bare host/IP).
+fn conn_ip(host: &str) -> String {
+    host.rsplit('@').next().unwrap_or(host).trim().to_string()
+}
+
 fn refresh_sidebar(
     win: &AppWindow,
     statuses: &TabStatuses,
@@ -4990,7 +5009,8 @@ fn wire_sftp_callbacks(
             let path = path.to_string();
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab_id) {
-                    h.list_dir(path);
+                    // Refresh re-syncs the left tree too, not just the file list (#189).
+                    h.refresh_dir(path);
                 }
             }
         });
@@ -5346,6 +5366,7 @@ fn wire_sftp_callbacks(
     }
     // Close the editor; in edit mode upload first if there are unsaved edits.
     {
+        let sftp_handles = sftp_handles.clone();
         let weak = window.as_weak();
         window.on_close_editor(move || {
             let Some(w) = weak.upgrade() else { return };
@@ -5433,13 +5454,13 @@ fn wire_key_input(
         let handles_rc = handles.clone();
         let store_rc = store.clone();
         let weak = window.as_weak();
-        window.on_run_command(move |tab_id: SharedString, cmd: SharedString, to_all: bool, append_enter: bool| {
+        window.on_run_command(move |tab_id: SharedString, cmd: SharedString, to_all: bool, send_enter: bool| {
             let line = cmd.trim_end().to_string();
             if line.is_empty() {
                 return;
             }
             let mut bytes = line.clone().into_bytes();
-            if append_enter {
+            if send_enter {
                 bytes.push(b'\n');
             }
             {
@@ -5533,7 +5554,7 @@ fn wire_key_input(
         let weak = window.as_weak();
         let collapsed = collapsed_quick_groups.clone();
         window.on_add_quick_command(
-            move |name: SharedString, command: SharedString, group: SharedString, append_enter: bool| {
+            move |name: SharedString, command: SharedString, group: SharedString, send_enter: bool| {
                 let name = name.trim().to_string();
                 let command = command.to_string();
                 let group = group.trim().to_string();
@@ -5547,7 +5568,7 @@ fn wire_key_input(
                         name,
                         command,
                         group,
-                        append_enter,
+                        send_enter,
                     });
                     s.set_quick_commands(v);
                     let _ = s.save();
@@ -5606,7 +5627,7 @@ fn wire_key_input(
                 w.set_qcm_name(c.name.into());
                 w.set_qcm_command(c.command.into());
                 w.set_qcm_group(c.group.into());
-                w.set_qcm_append_enter(c.append_enter);
+                w.set_qcm_send_enter(c.send_enter);
                 w.set_qcm_edit_index(index);
                 w.set_quick_cmd_manage_open(true);
             }
@@ -5618,7 +5639,7 @@ fn wire_key_input(
         let weak = window.as_weak();
         let collapsed = collapsed_quick_groups.clone();
         window.on_save_quick_command(
-            move |index: i32, name: SharedString, command: SharedString, group: SharedString, append_enter: bool| {
+            move |index: i32, name: SharedString, command: SharedString, group: SharedString, send_enter: bool| {
                 let name = name.trim().to_string();
                 let command = command.to_string();
                 let group = group.trim().to_string();
@@ -5633,7 +5654,7 @@ fn wire_key_input(
                             name,
                             command,
                             group,
-                            append_enter,
+                            send_enter,
                         },
                     );
                     let _ = s.save();
@@ -5658,7 +5679,7 @@ fn wire_key_input(
                         name: format!("{} (copy)", c.name),
                         command: c.command,
                         group: c.group,
-                        append_enter: c.append_enter,
+                        send_enter: c.send_enter,
                     };
                     v.insert(index as usize + 1, dup);
                     s.set_quick_commands(v);
@@ -5692,17 +5713,17 @@ fn wire_key_input(
             }
         });
     }
-    // Toggle append-enter on a quick command (#55).
+    // Toggle send_enter on a quick command (#55).
     {
         let store_rc = store.clone();
         let weak = window.as_weak();
         let collapsed = collapsed_quick_groups.clone();
-        window.on_toggle_append_enter(move |index: i32| {
+        window.on_toggle_send_enter(move |index: i32| {
             {
                 let mut s = store_rc.borrow_mut();
                 let mut v = s.quick_commands().to_vec();
                 if let Some(c) = v.get_mut(index as usize) {
-                    c.append_enter = !c.append_enter;
+                    c.send_enter = !c.send_enter;
                 }
                 s.set_quick_commands(v);
                 let _ = s.save();
@@ -6752,7 +6773,13 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
         "\u{F72B}" => Some(b"\x1b[F"),   // End
         "\u{F72C}" => Some(b"\x1b[5~"),  // PageUp
         "\u{F72D}" => Some(b"\x1b[6~"),  // PageDown
-        "\u{F728}" => Some(b"\x1b[3~"),  // Delete (forward)
+        // Forward-Delete. Slint's canonical key code for the Delete key is
+        // U+007F (see i-slint-common key_codes: F728 is explicitly *not* used,
+        // it collapses to the 0x7f control code). The old F728 mapping never
+        // matched on any platform, so Delete fell through to the generic path
+        // and behaved like backspace / garbled the char instead of sending the
+        // VT "delete forward" sequence (B站 fan report).
+        "\u{007F}" | "\u{F728}" => Some(b"\x1b[3~"),  // Delete (forward)
         "\u{F704}" => Some(b"\x1bOP"),   // F1
         "\u{F705}" => Some(b"\x1bOQ"),   // F2
         "\u{F706}" => Some(b"\x1bOR"),   // F3

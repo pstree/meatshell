@@ -44,7 +44,9 @@ export struct QuickCmd {
     group-header: string,
     collapsed: bool,
     orig-index: int,
-    append-enter: bool,
+    // false → clicking only fills the input box (no trailing Return), so the
+    // command can be tweaked before sending; true → send + execute (B站 suggestion).
+    send-enter: bool,
 }
 
 // --- MenuItem --------------------------------------------------------------
@@ -150,7 +152,7 @@ export component TerminalView inherits Rectangle {
     // Keyboard-driven selection in the open history dropdown (#140): ↑/↓ move it,
     // Enter runs history-view[history-selected].
     property <int> history-selected: 0;
-    callback run-command(string /* cmd */, bool /* to-all */, bool /* append-enter */);
+    callback run-command(string /* cmd */, bool /* to-all */, bool /* send-enter */);
     callback manage-quick-commands(string /* selected group */);  // open the add/edit/delete dialog
     callback toggle-quick-group(string /* group */);  // collapse/expand a group (#55)
     // Right-click management on the popup, mirroring the welcome session list (#55).
@@ -158,7 +160,7 @@ export component TerminalView inherits Rectangle {
     callback duplicate-quick-command(int /* index */);
     callback delete-quick-command(int /* index */);
     callback move-quick-command(int /* index */, string /* group */);
-    callback toggle-append-enter(int /* index */);
+    callback toggle-send-enter(int /* index */);
     callback new-quick-group();
     callback rename-quick-group(string /* group */);
     callback delete-quick-group(string /* group */);
@@ -857,7 +859,7 @@ export component TerminalView inherits Rectangle {
                             background: qbtn-ta.has-hover ? Theme.accent : Theme.bg-elevated;
                             qbtn-ta := TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { root.run-command(q.command, root.send-to-all, q.append-enter); }
+                                clicked => { root.run-command(q.command, root.send-to-all, q.send_enter); }
                             }
                             qbtn-text := Text {
                                 text: q.name;
@@ -930,7 +932,7 @@ export component TerminalView inherits Rectangle {
                         single-line: true;
                         // Enter sends; ↑/↓ recall history.
                         accepted => {
-                            root.run-command(self.text, root.send-to-all,true);
+                            root.run-command(self.text, root.send-to-all, true);
                             self.text = "";
                             root.history-cursor = -1;
                         }
