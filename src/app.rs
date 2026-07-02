@@ -6833,7 +6833,25 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
     // Linux/macOS builds directly as the same C0 bytes (0x10..0x18) but with
     // ctrl=true (handled by the Ctrl branch just below), so we must NOT swallow
     // those. A lone modifier never carries ctrl=true except bare Ctrl/CtrlR
-    // themselves, which are harmless to pass through as today.
+    // themselves, which are NOT harmless (issue #???): a bare Ctrl press produces
+    // key=0x10..0x18 with ctrl=true → Case A below sends the raw C0 byte →
+    // bash/readline interprets it as Ctrl+P→Ctrl+X (e.g. Ctrl+W = delete word).
+    //
+    // The Slint-side key-pressed handler now guards 0x10..0x18 before calling
+    // send-key, so this Rust guard is a secondary safety net.  On Windows the C0
+    // bytes 0x10..0x18 always come from bare modifiers (real Ctrl+letter uses
+    // letter encoding), so the guard can accept ALL modifier codes regardless of
+    // ctrl.  On non-Windows we keep `!ctrl` to preserve real Ctrl+P..Ctrl+X.
+    #[cfg(windows)]
+    {
+        if let Some(c) = key.chars().next() {
+            let cp = c as u32;
+            if key.chars().count() == 1 && (0x10..=0x18).contains(&cp) {
+                return vec![];
+            }
+        }
+    }
+    #[cfg(not(windows))]
     if !ctrl {
         if let Some(c) = key.chars().next() {
             let cp = c as u32;
