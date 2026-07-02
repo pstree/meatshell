@@ -663,8 +663,7 @@ export component TerminalView inherits Rectangle {
                     // so ^C/^X work in nano/vim (#158).
                     // ── Find: ⌘F / Ctrl+F (mirrors right-click → Find) ──
                     if (event.modifiers.control && !event.modifiers.shift
-                            && (event.text == "f" || event.text == "F"
-                                || event.text == "\u{0006}")) {
+                            && (event.text == "f" || event.text == "F")) {
                         root.find-active = true;
                         accept
                     // ── Jump to command-history search: ⌘⇧R / Ctrl+Shift+R (#140) ──
