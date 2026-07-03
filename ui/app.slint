@@ -1902,9 +1902,19 @@ export component AppWindow inherits Window {
                                     wrap: no-wrap;
                                 }
 
-                                // Track cursor position for custom cursor rendering
+                                // Track cursor position and blink state for custom cursor rendering
                                 private property <length> ed-cursor-x: 0px;
                                 private property <length> ed-cursor-y: 0px;
+                                private property <bool> ed-cursor-visible: true;
+
+                                // Timer for cursor blinking
+                                ed-cursor-blink-timer := Timer {
+                                    interval: 500ms;
+                                    running: edit-input.has-focus && !root.editor-readonly;
+                                    triggered => {
+                                        ed-cursor-visible = !ed-cursor-visible;
+                                    }
+                                }
 
                                 edit-input := TextInput {
                                     x: 8px;
@@ -1939,10 +1949,11 @@ export component AppWindow inherits Window {
                                     width: 2px;
                                     height: edit-input.font-size * 1.2;
                                     background: Theme.text-primary;
+                                    opacity: ed-cursor-visible ? 1 : 0;
                                     animate x { duration: 50ms; }
                                     animate y { duration: 50ms; }
-                                }
-                            }
+                                    animate opacity { duration: 100ms; }
+                                }                            }
                         }
                     }
                 }
