@@ -1902,6 +1902,10 @@ export component AppWindow inherits Window {
                                     wrap: no-wrap;
                                 }
 
+                                // Track cursor position for custom cursor rendering
+                                private property <length> ed-cursor-x: 0px;
+                                private property <length> ed-cursor-y: 0px;
+
                                 edit-input := TextInput {
                                     x: 8px;
                                     y: 8px;
@@ -1921,6 +1925,22 @@ export component AppWindow inherits Window {
                                         root.editor-recount(root.editor-content);
                                         root.editor-replace-tabs();
                                     }
+                                    cursor-position-changed(pos) => {
+                                        ed-cursor-x = pos.x;
+                                        ed-cursor-y = pos.y;
+                                    }
+                                }
+
+                                // Custom cursor (since TextInput's color is nearly transparent)
+                                Rectangle {
+                                    visible: edit-input.has-focus && !root.editor-readonly;
+                                    x: edit-input.x + ed-cursor-x;
+                                    y: edit-input.y + ed-cursor-y;
+                                    width: 2px;
+                                    height: edit-input.font-size * 1.2;
+                                    background: Theme.text-primary;
+                                    animate x { duration: 50ms; }
+                                    animate y { duration: 50ms; }
                                 }
                             }
                         }
