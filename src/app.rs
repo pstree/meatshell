@@ -3701,10 +3701,12 @@ fn apply_session_event_to_window(
         } => {
             if error.is_empty() {
                 // Open the built-in viewer/editor (#70).
-                win.set_editor_line_numbers(line_numbers_for(&content).into());
+                let editor_content = content.replace('\t', "    ");
+                win.set_editor_line_numbers(line_numbers_for(&editor_content).into());
                 win.set_editor_path(path.into());
                 win.set_editor_name(name.into());
-                win.set_editor_content(content.replace('\t', "    ").into());
+                win.set_editor_content(editor_content.clone().into());
+                update_editor_text_layers(&win, &editor_content);
                 win.set_editor_readonly(!edit);
                 win.set_editor_dirty(false);
                 win.set_editor_find_visible(false);
@@ -5322,6 +5324,7 @@ fn wire_sftp_callbacks(
         window.on_editor_recount(move |text: SharedString| {
             if let Some(w) = weak.upgrade() {
                 w.set_editor_line_numbers(line_numbers_for(text.as_str()).into());
+                update_editor_text_layers(&w, text.as_str());
             }
         });
     }
@@ -5337,8 +5340,9 @@ fn wire_sftp_callbacks(
                 if !content.contains('\t') { return; }
                 let new = content.replace('\t', "    ");
                 let line_numbers = line_numbers_for(&new);
-                w.set_editor_content(new.into());
+                w.set_editor_content(new.clone().into());
                 w.set_editor_line_numbers(line_numbers.into());
+                update_editor_text_layers(&w, &new);
             }
         });
     }
@@ -5425,9 +5429,11 @@ fn wire_sftp_callbacks(
             }
             w.set_editor_content(new_content.into());
             w.set_editor_dirty(true);
+            let current_content = w.get_editor_content();
             w.set_editor_line_numbers(
-                line_numbers_for(w.get_editor_content().as_str()).into(),
+                line_numbers_for(current_content.as_str()).into(),
             );
+            update_editor_text_layers(&w, current_content.as_str());
             // After replace-all all intended occurrences are gone.  Clear the
             // selection so the user doesn't see a spurious highlight on any
             // incidental matches inside the replacement text.
@@ -6550,6 +6556,25 @@ fn redact_key(key: &str) -> String {
 /// when true the four arrow keys must use SS3 sequences (`\x1bOA`…) instead
 /// of the default CSI sequences (`\x1b[A`…).  Full-screen apps like nano and
 /// vim set this mode on startup.
+fn update_editor_text_layers(win: &AppWindow, content: &str) {
+    let mut comment_lines = Vec::new();
+    let mut normal_lines = Vec::new();
+
+    for line in content.split('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            comment_lines.push(line);
+            normal_lines.push("");
+        } else {
+            comment_lines.push("");
+            normal_lines.push(line);
+        }
+    }
+
+    win.set_editor_comment_text(comment_lines.join("\n").into());
+    win.set_editor_normal_text(normal_lines.join("\n").into());
+}
+
 /// Build the editor's line-number gutter text: "1\n2\n…\nN", one number per line
 /// of `content`, matching its (newline-separated) line count (#81).
 fn line_numbers_for(content: &str) -> String {

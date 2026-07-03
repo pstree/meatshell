@@ -505,6 +505,10 @@ export component AppWindow inherits Window {
     in-out property <bool> editor-readonly;   // view = true, edit = false
     in-out property <bool> editor-dirty: false; // edited since load
     in-out property <string> editor-line-numbers; // newline-joined "1..N" from Rust (#81)
+    in-out property <string> editor-comment-text: "";
+    in-out property <string> editor-normal-text: "";
+    in-out property <length> editor-caret-x: 0;
+    in-out property <length> editor-caret-y: 0;
     callback save-file();                     // Ctrl+S / Save button (edit only)
     callback close-editor();                  // X / Esc; uploads if dirty
     callback editor-recount(string);          // rebuild line numbers after an edit
@@ -1540,6 +1544,12 @@ export component AppWindow inherits Window {
             scroll-event(event) => { accept }
         }
         edit-fs := FocusScope {
+            property <bool> editor-cursor-blink: true;
+            Timer {
+                interval: 500ms;
+                running: edit-input.has-focus && Theme.window-focused;
+                triggered => { edit-fs.editor-cursor-blink = !edit-fs.editor-cursor-blink; }
+            }
             // Ctrl+S saves, Ctrl+F toggles find/replace, F3 steps through
             // matches, Esc closes the find panel (or the editor if the panel
             // is already hidden). These bubble up from the focused TextInput
@@ -1873,6 +1883,33 @@ export component AppWindow inherits Window {
                             ed-scroll := ScrollView {
                                 viewport-width: max(self.visible-width, edit-input.preferred-width + 16px);
                                 viewport-height: max(self.visible-height, edit-input.preferred-height + 16px);
+
+                                // Comment text layer (rendered behind the text input)
+                                Text {
+                                    x: edit-input.x;
+                                    y: edit-input.y;
+                                    width: edit-input.width;
+                                    height: edit-input.height;
+                                    text: root.editor-comment-text;
+                                    color: Theme.success;
+                                    font-family: Theme.ui-font-family;
+                                    font-size: Theme.fs-md;
+                                    wrap: no-wrap;
+                                }
+
+                                // Normal text layer (rendered behind the text input)
+                                Text {
+                                    x: edit-input.x;
+                                    y: edit-input.y;
+                                    width: edit-input.width;
+                                    height: edit-input.height;
+                                    text: root.editor-normal-text;
+                                    color: Theme.text-primary;
+                                    font-family: Theme.ui-font-family;
+                                    font-size: Theme.fs-md;
+                                    wrap: no-wrap;
+                                }
+
                                 edit-input := TextInput {
                                     x: 8px;
                                     y: 8px;
@@ -1882,7 +1919,9 @@ export component AppWindow inherits Window {
                                     read-only: root.editor-readonly;
                                     single-line: false;
                                     wrap: no-wrap;
-                                    color: Theme.text-primary;
+                                    color: Theme.text-primary.with-alpha(0.01);
+                                    selection-background-color: Theme.accent.with-alpha(0.3);
+                                    selection-foreground-color: Theme.text-primary;
                                     font-family: Theme.ui-font-family;
                                     font-size: Theme.fs-md;
                                     edited => {
@@ -1890,6 +1929,20 @@ export component AppWindow inherits Window {
                                         root.editor-recount(root.editor-content);
                                         root.editor-replace-tabs();
                                     }
+                                    cursor-position-changed(pos) => {
+                                        root.editor-caret-x = pos.x;
+                                        root.editor-caret-y = pos.y;
+                                        edit-fs.editor-cursor-blink = true;
+                                    }
+                                }
+
+                                // Custom caret layer (drawn on top of TextInput)
+                                if edit-input.has-focus && !root.editor-readonly && edit-fs.editor-cursor-blink : Rectangle {
+                                    x: edit-input.x + root.editor-caret-x;
+                                    y: edit-input.y + root.editor-caret-y;
+                                    width: 1.5px;
+                                    height: Theme.fs-md * 1.2;
+                                    background: Theme.accent;
                                 }
                             }
                         }
