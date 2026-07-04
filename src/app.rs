@@ -1612,6 +1612,7 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
                 }
             }
         }
+        win.set_download_open(true);
     }
 }
 
@@ -1641,6 +1642,7 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
                 }
             }
         }
+        win.set_download_open(true);
     }
 }
 
