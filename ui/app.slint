@@ -562,11 +562,17 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-auth: "password";
     in-out property <string> dialog-password;
     in-out property <string> dialog-key-path;
+    in-out property <string> dialog-key-inline;
+    in-out property <bool> dialog-key-inline-mode: false;
     in-out property <string> dialog-proxy-type: "none";  // "none" | "socks5" | "http"
     in-out property <string> dialog-proxy-hostport;
     in-out property <string> dialog-group;
     // Existing group names (from Rust) for the dialog's group dropdown (#179).
     in property <[string]> session-groups;
+    // SSH jump host picker (#211): parallel label/id lists + selected index.
+    in property <[string]> jump-choices;
+    in property <[string]> jump-ids;
+    in-out property <int> dialog-jump-index: 0;
     in-out property <string> dialog-kind: "ssh";
     in-out property <string> dialog-serial-port;
     in-out property <string> dialog-baud: "115200";
@@ -662,12 +668,12 @@ export component AppWindow inherits Window {
     callback sftp-toggle-select(string /* tab-id */, int /* row */);   // (#100)
     callback sftp-download-selected(string /* tab-id */);              // (#100)
     callback sftp-delete-selected(string /* tab-id */);               // (#100)
+    callback sftp-copy-to-target(string /* tab-id */, string /* remote-path */, string /* target-tab-id */);
+    callback sftp-copy-selected-to-target(string /* tab-id */, string /* target-tab-id */);
     callback sftp-view(string /* tab-id */, string /* path */);
     callback sftp-edit(string /* tab-id */, string /* path */);
     callback sftp-open-external(string /* tab-id */, string /* path */);
     callback sftp-edit-external(string /* tab-id */, string /* path */);
-    // OS file drag-and-drop state (#drag): set from Rust via winit events.
-    in-out property <bool> sftp-drag-hover: false;
     // SFTP context-menu extensions (#69): rename / chmod / mkdir / touch share
     // one single-input prompt dialog; copy-path goes straight to the clipboard.
     in-out property <bool> sftp-prompt-open: false;
@@ -1144,8 +1150,8 @@ export component AppWindow inherits Window {
                     sftp-status: term.sftp-status;
                     sftp-loading: term.sftp-loading;
                     sftp-tree-nodes: term.sftp-tree-nodes;
+                    sftp-transfer-targets: root.tabs;
                     sftp-selected-count: term.sftp-selected-count;
-                    sftp-drag-hover <=> root.sftp-drag-hover;
                     quick-commands: root.quick-commands;
                     command-history: root.command-history;
                     history-view: root.history-view;
@@ -3320,10 +3326,15 @@ export component AppWindow inherits Window {
         draft-auth <=> root.dialog-auth;
         draft-password <=> root.dialog-password;
         draft-key-path <=> root.dialog-key-path;
+        draft-key-inline <=> root.dialog-key-inline;
+        draft-key-inline-mode <=> root.dialog-key-inline-mode;
         draft-proxy-type <=> root.dialog-proxy-type;
         draft-proxy-hostport <=> root.dialog-proxy-hostport;
         draft-group <=> root.dialog-group;
         session-groups: root.session-groups;
+        jump-choices: root.jump-choices;
+        jump-ids: root.jump-ids;
+        draft-jump-index <=> root.dialog-jump-index;
         draft-kind <=> root.dialog-kind;
         draft-serial-port <=> root.dialog-serial-port;
         draft-baud <=> root.dialog-baud;

@@ -35,10 +35,21 @@ component SingleTab inherits Rectangle {
     max-width: 160px;          // 新增：防止长名称把 tab 撑得过宽
     horizontal-stretch: 0;    // 新增：不参与 TabBar 的等分拉伸，保持自然宽度
     border-radius: Theme.radius-sm;
+    border-width: active ? 1px : 0px;
+    border-color: active ? Theme.tab-active-border : transparent;
     background: dragging ? Theme.bg-active
-        : (active ? Theme.bg-panel
+        : (active ? Theme.tab-active-bg
         : (touch.has-hover ? Theme.bg-hover : transparent));
     animate background { duration: 120ms; }
+
+    if active : Rectangle {
+        x: 8px;
+        y: 0px;
+        width: parent.width - 16px;
+        height: 2px;
+        border-radius: 1px;
+        background: Theme.accent;
+    }
 
     // Declared FIRST so the HorizontalLayout's children (close button) are at
     // a higher z-order and receive their own click events.
@@ -93,8 +104,9 @@ component SingleTab inherits Rectangle {
     }
 
     HorizontalLayout {
+        width: parent.width - (info.kind != "welcome" ? 28px : 0px);
         padding-left: 10px;
-        padding-right: 6px;
+        padding-right: 4px;
         spacing: 8px;
         alignment: start;
 
@@ -116,13 +128,15 @@ component SingleTab inherits Rectangle {
             horizontal-stretch: 1;
         }
 
-        // Only show close button for non-welcome tabs
-        if info.kind != "welcome" : IconButton {
-            glyph: "×";
-            size: 20px;
-            y: (parent.height - self.height) / 2;
-            clicked => { root.closed(); }
-        }
+    }
+
+    // Keep close pinned to the far right even when the title is very short.
+    if info.kind != "welcome" : IconButton {
+        glyph: "×";
+        size: 20px;
+        x: parent.width - self.width - 6px;
+        y: (parent.height - self.height) / 2;
+        clicked => { root.closed(); }
     }
 }
 
@@ -156,6 +170,8 @@ component TabMenuItem inherits Rectangle {
 export component TabBar inherits Rectangle {
     in property <[TabInfo]> tabs;
     in property <string> active-id;
+    in property <bool> show-new-tab: true;
+    in property <bool> can-merge-pane: false;
     // Keep this much clear on the right so tabs don't slide under the app's
     // top-right toolbar icons, which are positioned over the tab row (#122).
     in property <length> reserve-right: 0px;
@@ -168,6 +184,7 @@ export component TabBar inherits Rectangle {
     callback tab-split(string /* tab-id */, string /* dir */);
     // Open another connection to the same session as `tab-id` (#v0.5).
     callback tab-duplicate(string /* tab-id */);
+    callback merge-pane();
     // Drag-to-split (#v0.5): cursor moved / dropped while dragging `tab-id`, in
     // absolute (window) coordinates.
     callback tab-drag-move(string /* tab-id */, length /* abs-x */, length /* abs-y */);
@@ -216,7 +233,7 @@ export component TabBar inherits Rectangle {
                     drag-moved(ax, ay) => { root.tab-drag-move(tab.id, ax, ay); }
                     drag-dropped(ax, ay) => { root.tab-drag-drop(tab.id, ax, ay); }
                 }
-                IconButton {
+                if root.show-new-tab : IconButton {
                     glyph: "+";
                     size: 28px;
                     y: (parent.height - self.height) / 2;
@@ -261,7 +278,7 @@ export component TabBar inherits Rectangle {
         x: root.menu-x;
         y: root.menu-y;
         width: 140px;
-        height: 5 * 29px + 12px;
+        height: 6 * 29px + 13px;
         Rectangle {
             background: Theme.bg-panel;
             border-radius: Theme.radius-sm;
@@ -287,6 +304,11 @@ export component TabBar inherits Rectangle {
                     label: @tr("Split down");
                     enabled: root.tabs.length > 1;
                     clicked => { root.tab-split(root.menu-target, "down"); }
+                }
+                TabMenuItem {
+                    label: @tr("Merge panes");
+                    enabled: root.can-merge-pane;
+                    clicked => { root.merge-pane(); }
                 }
                 Rectangle { height: 1px; background: Theme.border-subtle; }
                 TabMenuItem {

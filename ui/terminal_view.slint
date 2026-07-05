@@ -1,5 +1,6 @@
 import { Theme } from "theme.slint";
 import { SftpPanel, SftpEntry, SftpTreeNode } from "sftp_panel.slint";
+import { TabInfo } from "tabs.slint";
 import { DockExpandButton, ToolStrip } from "widgets.slint";
 
 // Embed the terminal fonts here too so the cell-probe Text below measures
@@ -106,7 +107,7 @@ export component TerminalView inherits Rectangle {
     in property <string>  sftp-status: "";
     in property <bool>    sftp-loading: false;
     in property <[SftpTreeNode]> sftp-tree-nodes: [];
-    in property <bool> sftp-drag-hover: false;
+    in property <[TabInfo]> sftp-transfer-targets: [];
 
     // Per-session now (#v0.5): the AppWindow stores these in each TerminalState
     // and writes back via the set-* callbacks, so each tab/pane keeps its own SFTP
@@ -181,6 +182,8 @@ export component TerminalView inherits Rectangle {
     callback sftp-toggle-select(int);               // toggle a row's checkbox (#100)
     callback sftp-download-selected();              // download checked entries (#100)
     callback sftp-delete-selected();                // delete checked entries (#100)
+    callback sftp-copy-to-target(string, string);
+    callback sftp-copy-selected-to-target(string);
     callback sftp-view(string);
     callback sftp-edit(string);
     callback sftp-open-external(string);
@@ -1498,13 +1501,14 @@ export component TerminalView inherits Rectangle {
                 root.sftp-panel-dragging = false;
             }
             collapsed:     root.sftp-collapsed;
+            current-tab-id: root.tab-id;
             current-path:  root.sftp-path;
             entries:       root.sftp-entries;
             status:        root.sftp-status;
             loading:       root.sftp-loading;
             tree-nodes:    root.sftp-tree-nodes;
+            transfer-targets: root.sftp-transfer-targets;
             selected-count: root.sftp-selected-count;
-            drag-hover: root.sftp-drag-hover;
             toggle-collapsed => {
                 if (root.sftp-collapsed) {
                     // Re-expand; the panel height was preserved while collapsed.
@@ -1525,6 +1529,8 @@ export component TerminalView inherits Rectangle {
             toggle-select(i)    => { root.sftp-toggle-select(i); }
             download-selected() => { root.sftp-download-selected(); }
             delete-selected()   => { root.sftp-delete-selected(); }
+            copy-to-target(path, target) => { root.sftp-copy-to-target(path, target); }
+            copy-selected-to-target(target) => { root.sftp-copy-selected-to-target(target); }
             view(path)          => { root.sftp-view(path); }
             edit(path)          => { root.sftp-edit(path); }
             open-external(path) => { root.sftp-open-external(path); }

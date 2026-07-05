@@ -482,6 +482,18 @@ pub fn run() -> Result<()> {
         let s = store.borrow();
         let collapse_sidebar = s.collapse_sidebar_default();
         let collapse_sftp = s.collapse_sftp_default();
+        let sidebar_dock = s.sidebar_dock();
+        let welcome_as_sidebar = s.welcome_as_sidebar();
+        let welcome_sidebar_dock = s.welcome_sidebar_dock();
+        let mut sidebar_collapsed = s.sidebar_collapsed().unwrap_or(collapse_sidebar);
+        let welcome_collapsed = s.welcome_collapsed().unwrap_or(false);
+        if welcome_as_sidebar
+            && sidebar_dock == welcome_sidebar_dock
+            && !sidebar_collapsed
+            && !welcome_collapsed
+        {
+            sidebar_collapsed = true;
+        }
         window.set_collapse_sidebar_default(collapse_sidebar);
         window.set_collapse_sftp_default(collapse_sftp);
         // Restore the persisted panel docking layout (#dock).
@@ -493,7 +505,7 @@ pub fn run() -> Result<()> {
         window.set_sftp_dock(s.sftp_dock().into());
         window.set_welcome_as_sidebar(s.welcome_as_sidebar());
         window.set_welcome_sidebar_width(s.welcome_sidebar_width());
-        window.set_welcome_collapsed(s.welcome_collapsed());
+        window.set_welcome_collapsed(welcome_collapsed);
         window.set_wallpaper_overlay(s.wallpaper_overlay());
         window.set_update_check_enabled(s.update_check_enabled()); // #184
         if collapse_sidebar {
@@ -1189,6 +1201,7 @@ pub fn run() -> Result<()> {
             local_net_hist: local_net_hist.clone(),
             last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
+            store: store.clone(),
         },
     );
 
@@ -1298,19 +1311,8 @@ pub fn run() -> Result<()> {
                 }
             };
             match event {
-                WEvent::HoveredFile(_) => {
-                    if let Some(win) = weak.upgrade() {
-                        win.set_sftp_drag_hover(true);
-                    }
-                }
-                WEvent::HoveredFileCancelled => {
-                    if let Some(win) = weak.upgrade() {
-                        win.set_sftp_drag_hover(false);
-                    }
-                }
                 WEvent::DroppedFile(path) => {
                     if let Some(win) = weak.upgrade() {
-                        win.set_sftp_drag_hover(false);
                         handle_file_drop(&win, &sh, path.to_string_lossy().to_string());
                     }
                 }
@@ -1721,6 +1723,46 @@ fn session_groups_model(store: &ConfigStore) -> ModelRc<SharedString> {
     )))
 }
 
+/// Build the jump-host picker's parallel label/id lists for the session dialog
+/// (#211). Index 0 is always the "no jump host" entry (empty id); the rest are
+/// the saved SSH sessions except `exclude_id` (a session can't jump through
+/// itself). Returns `(labels, ids, selected_index)` where `selected_index`
+/// points at `current_jump_id` (0 if unset / dangling).
+fn jump_candidates(
+    store: &ConfigStore,
+    exclude_id: &str,
+    current_jump_id: &str,
+) -> (ModelRc<SharedString>, ModelRc<SharedString>, i32) {
+    let mut labels: Vec<SharedString> =
+        vec![t("无（直接连接）", "None (direct)").into()];
+    let mut ids: Vec<SharedString> = vec!["".into()];
+    let mut selected: i32 = 0;
+    for s in store.sessions() {
+        if s.kind != SessionKind::Ssh || s.id == exclude_id {
+            continue;
+        }
+        let label = if s.name.trim().is_empty() {
+            if s.user.trim().is_empty() {
+                s.host.clone()
+            } else {
+                format!("{}@{}", s.user, s.host)
+            }
+        } else {
+            format!("{} ({}@{})", s.name, s.user, s.host)
+        };
+        if s.id == current_jump_id {
+            selected = ids.len() as i32;
+        }
+        labels.push(label.into());
+        ids.push(s.id.clone().into());
+    }
+    (
+        ModelRc::from(Rc::new(VecModel::from(labels))),
+        ModelRc::from(Rc::new(VecModel::from(ids))),
+        selected,
+    )
+}
+
 fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
     // Group sessions by their `group` (named groups alphabetically, ungrouped
     // last), then by name within each group, and tag the first row of every
@@ -1857,6 +1899,8 @@ fn wire_session_callbacks(
             w.set_dialog_auth("password".into());
             w.set_dialog_password("".into());
             w.set_dialog_key_path("".into());
+            w.set_dialog_key_inline("".into());
+            w.set_dialog_key_inline_mode(false);
             w.set_dialog_proxy_type("none".into());
             w.set_dialog_proxy_hostport("".into());
             w.set_dialog_group("".into());
@@ -2048,9 +2092,15 @@ fn wire_session_callbacks(
                 // leave it blank; a blank field on save keeps the existing one.
                 w.set_dialog_password("".into());
                 w.set_dialog_key_path(session.private_key_path.clone().into());
+
                 let (proxy_type, proxy_hostport) = split_proxy(&session.proxy);
                 w.set_dialog_proxy_type(proxy_type.into());
                 w.set_dialog_proxy_hostport(proxy_hostport.into());
+                let (jump_labels, jump_ids, jump_idx) =
+                    jump_candidates(&store, &session.id, &session.jump_session_id);
+                w.set_jump_choices(jump_labels);
+                w.set_jump_ids(jump_ids);
+                w.set_dialog_jump_index(jump_idx);
                 w.set_dialog_group(session.group.clone().into());
                 w.set_dialog_kind(session.kind.as_str().into());
                 w.set_dialog_serial_port(session.serial_port.clone().into());
@@ -2239,6 +2289,24 @@ fn wire_session_callbacks(
             } else {
                 Secret::new(draft.password.to_string())
             };
+            let private_key_inline = if draft.private_key_inline_mode {
+                if draft.private_key_inline.is_empty() {
+                    store
+                        .borrow()
+                        .get(&id)
+                        .map(|s| s.private_key_inline.clone())
+                        .unwrap_or_default()
+                } else {
+                    Secret::new(draft.private_key_inline.to_string())
+                }
+            } else {
+                Secret::default()
+            };
+            let private_key_path = if draft.private_key_inline_mode {
+                String::new()
+            } else {
+                draft.private_key_path.to_string().replace('\\', "/")
+            };
             let kind = crate::config::SessionKind::from_str(&draft.kind.to_string());
             // Auto-name: serial → port label; otherwise user@host, or just the
             // host when no username was given (#110).
@@ -2272,7 +2340,8 @@ fn wire_session_callbacks(
                 auth: AuthMethod::from_str(&draft.auth.to_string()),
                 password,
                 // Store the key path with forward slashes uniformly.
-                private_key_path: draft.private_key_path.to_string().replace('\\', "/"),
+                private_key_path,
+                private_key_inline,
                 proxy: draft.proxy.to_string(),
                 last_used: None,
                 group: draft.group.to_string(),
@@ -2289,6 +2358,8 @@ fn wire_session_callbacks(
                 flow_control: draft.flow_control.to_string(),
                 forwards: edit_forwards.borrow().clone(),
                 disable_shell_integration: draft.disable_shell_integration,
+                note: draft.note.to_string(),
+                jump_session_id: draft.jump_session_id.to_string(),
             };
             {
                 let mut s = store.borrow_mut();
@@ -2538,6 +2609,7 @@ fn wire_session_callbacks(
                 local_net_hist: local_net_hist.clone(),
                 last_term_size: last_term_size.clone(),
                 sftp_follow_cd: sftp_follow_cd.clone(),
+                store: store.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -2592,6 +2664,21 @@ struct ConnectCtx {
     last_term_size: Arc<Mutex<(u32, u32)>>,
     /// Interface setting: SFTP panel follows the terminal's cd (OSC 7).
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    /// Config store, so a session's jump host (#211) can be resolved by id at
+    /// connect time on the UI thread.
+    store: Rc<RefCell<ConfigStore>>,
+}
+
+/// Resolve a session's configured SSH jump host to the saved session it points
+/// at, ignoring a missing / dangling / self reference (#211).
+fn resolve_jump(store: &Rc<RefCell<ConfigStore>>, session: &Session) -> Option<Session> {
+    if session.kind != SessionKind::Ssh || session.jump_session_id.trim().is_empty() {
+        return None;
+    }
+    if session.jump_session_id == session.id {
+        return None;
+    }
+    store.borrow().get(&session.jump_session_id).cloned()
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -6511,6 +6598,242 @@ fn wire_key_input(
     }
 }
 
+fn webdav_url(base: &str, remote_path: &str) -> Result<String> {
+    let base = base.trim().trim_end_matches('/');
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        anyhow::bail!(
+            "{}",
+            t(
+                "WebDAV 地址必须以 http:// 或 https:// 开头",
+                "WebDAV URL must start with http:// or https://"
+            )
+        );
+    }
+    if base.starts_with("http://") && webdav_url_uses_port(base, 5006) {
+        anyhow::bail!(
+            "{}",
+            t(
+                "飞牛 WebDAV 的 5006 通常是 HTTPS 端口，请改用 https://...:5006；如果要用 HTTP，请改用 5005 端口",
+                "FnOS WebDAV port 5006 is usually HTTPS; use https://...:5006, or use port 5005 for HTTP"
+            )
+        );
+    }
+    if base.starts_with("https://") && webdav_url_uses_port(base, 5005) {
+        anyhow::bail!(
+            "{}",
+            t(
+                "飞牛 WebDAV 的 5005 通常是 HTTP 端口，请改用 http://...:5005；如果要用 HTTPS，请改用 5006 端口",
+                "FnOS WebDAV port 5005 is usually HTTP; use http://...:5005, or use port 5006 for HTTPS"
+            )
+        );
+    }
+    if base.ends_with(".json") {
+        return Ok(base.to_string());
+    }
+    let remote = remote_path.trim().trim_start_matches('/');
+    if (webdav_url_uses_port(base, 5005) || webdav_url_uses_port(base, 5006))
+        && !webdav_url_has_path(base)
+        && !remote.contains('/')
+    {
+        anyhow::bail!(
+            "{}",
+            t(
+                "飞牛 WebDAV 需要写入某个共享目录，不能直接写到根路径；请把 WebDAV 地址改成 https://IP:5006/all/，或把远端文件改成 all/meatshell-connections.json",
+                "FnOS WebDAV needs a writable shared folder, not the server root; use https://IP:5006/all/ or set the remote file to all/meatshell-connections.json"
+            )
+        );
+    }
+    if remote.is_empty() {
+        anyhow::bail!("{}", t("远端文件不能为空", "remote file cannot be empty"));
+    }
+    Ok(format!("{base}/{remote}"))
+}
+
+fn webdav_url_uses_port(base: &str, port: u16) -> bool {
+    let Some(authority) = base.split("://").nth(1) else {
+        return false;
+    };
+    let host_port = authority.split('/').next().unwrap_or(authority);
+    host_port
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        == Some(port)
+}
+
+fn webdav_url_has_path(base: &str) -> bool {
+    let Some(authority) = base.split("://").nth(1) else {
+        return false;
+    };
+    authority
+        .split_once('/')
+        .is_some_and(|(_, path)| !path.is_empty())
+}
+
+fn webdav_auth_header(username: &str, password: &str) -> Option<String> {
+    if username.is_empty() && password.is_empty() {
+        return None;
+    }
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    Some(format!(
+        "Basic {}",
+        STANDARD.encode(format!("{username}:{password}"))
+    ))
+}
+
+#[derive(Debug)]
+struct WebDavAcceptAnyCertVerifier;
+
+impl ureq::rustls::client::danger::ServerCertVerifier for WebDavAcceptAnyCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &ureq::rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[ureq::rustls::pki_types::CertificateDer<'_>],
+        _server_name: &ureq::rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: ureq::rustls::pki_types::UnixTime,
+    ) -> std::result::Result<ureq::rustls::client::danger::ServerCertVerified, ureq::rustls::Error>
+    {
+        Ok(ureq::rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &ureq::rustls::pki_types::CertificateDer<'_>,
+        _dss: &ureq::rustls::DigitallySignedStruct,
+    ) -> std::result::Result<
+        ureq::rustls::client::danger::HandshakeSignatureValid,
+        ureq::rustls::Error,
+    > {
+        Ok(ureq::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &ureq::rustls::pki_types::CertificateDer<'_>,
+        _dss: &ureq::rustls::DigitallySignedStruct,
+    ) -> std::result::Result<
+        ureq::rustls::client::danger::HandshakeSignatureValid,
+        ureq::rustls::Error,
+    > {
+        Ok(ureq::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<ureq::rustls::SignatureScheme> {
+        use ureq::rustls::SignatureScheme;
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
+}
+
+fn webdav_agent(accept_invalid_certs: bool) -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(20));
+    if accept_invalid_certs {
+        let tls_config = ureq::rustls::ClientConfig::builder_with_provider(
+            ureq::rustls::crypto::ring::default_provider().into(),
+        )
+        .with_protocol_versions(&[&ureq::rustls::version::TLS12, &ureq::rustls::version::TLS13])
+        .expect("rustls ring provider supports TLS 1.2 and TLS 1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(WebDavAcceptAnyCertVerifier))
+        .with_no_client_auth();
+        builder = builder.tls_config(Arc::new(tls_config));
+    }
+    builder.build()
+}
+
+fn webdav_error(e: ureq::Error) -> anyhow::Error {
+    if let ureq::Error::Status(status, response) = e {
+        let url = response.get_url().to_string();
+        let body = response.into_string().unwrap_or_default();
+        let body = body.trim();
+        let detail = if body.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", body.chars().take(240).collect::<String>())
+        };
+        if status == 400 {
+            return anyhow::anyhow!(
+                "{}: {url}: status code 400{detail}",
+                t(
+                    "请求被 WebDAV 服务拒绝，请检查地址协议/端口是否匹配，以及远端文件所在目录是否已开启 WebDAV 协议访问",
+                    "WebDAV rejected the request; check the URL scheme/port and whether the remote folder allows WebDAV access"
+                )
+            );
+        }
+        if status == 405 {
+            return anyhow::anyhow!(
+                "{}: {url}: status code 405{detail}",
+                t(
+                    "当前 WebDAV 路径不允许上传；飞牛请写入已开启协议访问的共享目录，例如 WebDAV 地址填 https://IP:5006/all/，或远端文件填 all/meatshell-connections.json",
+                    "The current WebDAV path does not allow upload; for FnOS, write into a shared folder such as https://IP:5006/all/ or set remote file to all/meatshell-connections.json"
+                )
+            );
+        }
+        return anyhow::anyhow!("{url}: status code {status}{detail}");
+    }
+    let msg = e.to_string();
+    if msg.contains("UnknownIssuer") || msg.contains("invalid peer certificate") {
+        anyhow::anyhow!(
+            "{} ({msg})",
+            t(
+                "HTTPS 证书不受信任；如果这是可信 NAS/局域网 WebDAV，请在设置里开启“信任自签名/内网证书”",
+                "HTTPS certificate is not trusted; enable \"Trust self-signed / intranet certs\" for a trusted NAS/LAN WebDAV"
+            )
+        )
+    } else {
+        anyhow::anyhow!("{msg}")
+    }
+}
+
+fn webdav_put_json(
+    base_url: &str,
+    remote_path: &str,
+    username: &str,
+    password: &str,
+    accept_invalid_certs: bool,
+    json: String,
+) -> Result<()> {
+    let url = webdav_url(base_url, remote_path)?;
+    let agent = webdav_agent(accept_invalid_certs);
+    let mut req = agent.put(&url).set("Content-Type", "application/json");
+    let auth = webdav_auth_header(username, password);
+    if let Some(auth) = auth.as_deref() {
+        req = req.set("Authorization", auth);
+    }
+    req.send_string(&json).map(|_| ()).map_err(webdav_error)
+}
+
+fn webdav_get_json(
+    base_url: &str,
+    remote_path: &str,
+    username: &str,
+    password: &str,
+    accept_invalid_certs: bool,
+) -> Result<String> {
+    let url = webdav_url(base_url, remote_path)?;
+    let agent = webdav_agent(accept_invalid_certs);
+    let mut req = agent.get(&url);
+    let auth = webdav_auth_header(username, password);
+    if let Some(auth) = auth.as_deref() {
+        req = req.set("Authorization", auth);
+    }
+    req.call()
+        .map_err(webdav_error)?
+        .into_string()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 /// Mutate the `TerminalState` whose id matches `tab_id` in the live model.
 /// Must run on the Slint event loop thread.
 fn set_terminal_row(win: &AppWindow, tab_id: &str, mutator: impl Fn(&mut TerminalState)) {
@@ -8093,5 +8416,29 @@ mod selection_tests {
         assert_eq!(m2.len(), 1);
         assert_eq!(m2[0].col, 0);
         assert_eq!(m2[0].len, 4, "two wide glyphs span four grid cells");
+    }
+
+    #[test]
+    fn inverse_default_colours_paint_a_visible_background() {
+        let (fg, bg) = vt_span_colors(
+            vt100::Color::Default,
+            vt100::Color::Default,
+            false,
+            true,
+            true,
+        );
+        assert_eq!(fg.as_argb_encoded(), 0xff0e0f13);
+        assert_eq!(bg.as_argb_encoded(), 0xffd4d4d4);
+
+        let mut parser = vt100::Parser::new(3, 30, 0);
+        parser.process(b"abc \x1b[7m20260705\x1b[27m end");
+        let (_plain, runs) = build_row(parser.screen(), 0, 30);
+        let hit = runs
+            .iter()
+            .find(|span| span.text.contains("20260705"))
+            .expect("reverse-video search hit should be a separate span");
+        assert!(hit.inverse);
+        assert!(matches!(hit.fg, vt100::Color::Default));
+        assert!(matches!(hit.bg, vt100::Color::Default));
     }
 }
