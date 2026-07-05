@@ -44,6 +44,20 @@ chmod +x install-linux.sh && ./install-linux.sh
 > Requires glibc ≥ 2.35 (Ubuntu 22.04+ / Debian 12+). On Wayland you may need to
 > log out/in once after installing the icon.
 
+Building from source with `cargo run` on Linux Mint / Ubuntu / Debian requires
+the Slint/winit/rfd system development packages:
+
+```bash
+sudo apt update
+sudo apt install -y --no-install-recommends \
+  build-essential pkg-config cmake \
+  libfontconfig1-dev libfreetype6-dev \
+  libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+  libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+  libgl1-mesa-dev libegl1-mesa-dev libgtk-3-dev \
+  libudev-dev
+```
+
 ### macOS
 
 The download is a `.zip` containing the `meatshell.app` bundle:

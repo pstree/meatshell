@@ -1,6 +1,6 @@
 [package]
 name = "meatshell"
-version = "0.5.1"
+version = "0.5.4"
 edition = "2021"
 authors = ["meatshell contributors"]
 description = "A lightweight FinalShell-style SSH/terminal client written in Rust + Slint"
@@ -110,4 +110,8 @@ strip = "symbols"
 panic = "abort"
 
 [profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.dev.package."*"]
 opt-level = 1

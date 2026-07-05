@@ -3,6 +3,62 @@
 All notable changes are documented here. 本文件记录所有重要变更。
 中英对照（English first, 中文在后）.
 
+## [0.5.4] - 2026-07-04
+
+### 新增 / Added
+
+- **SSH 跳板机（堡垒机）支持 (#211)。** 会话可指定另一个已保存的 SSH 会话作为跳板机（类似 OpenSSH 的 ProxyJump）：先连上跳板并认证，在其上开一条 direct-tcpip 通道到目标机，再完成目标机的 SSH 握手。终端与 SFTP 两条连接都经跳板走，跳板连接在整个会话期间保活、会话关闭时一并断开。跳板复用被引用会话自身的主机/账号/密钥/keyboard-interactive 认证，未存凭据时沿用原有登录弹窗；自动忽略指向自己或已删除会话的无效引用；当前仅支持单级跳板。会话对话框「高级」区（仅 SSH）新增「跳板机（可选）」下拉。
+
+### 修复 / Fixed
+
+- **修复多会话大量输出导致界面卡死 (#209)。** 将 VT100 解析移出 UI 线程、按约 30fps 节流渲染、合并输出块并改用按标签页独立的缓冲锁，某台服务器解压大量文件时不再拖垮其它会话与整个界面。
+- **修复欢迎页会话面板首次建会话时高度跳变 (#214)。** 快速连接卡片现在始终撑满剩余高度、空状态占位区随之拉伸，建会话前后面板高度保持一致、不再跳动。
+
+---
+
+### Added
+
+- **SSH jump host (bastion) support (#211).** A session can tunnel through another saved SSH session as a jump host (like OpenSSH's ProxyJump): connect and authenticate to the jump, open a direct-tcpip channel to the target, and run the target's SSH handshake over it. Both the shell and SFTP connections go through the jump, which is kept alive for the whole session and torn down when it closes. The jump reuses the referenced session's own host/user/key/keyboard-interactive auth, falling back to the usual login prompt when no credentials are stored; dangling or self references are ignored; single hop only for now. The session dialog's Advanced section (SSH only) gains an optional "Jump host" dropdown.
+
+### Fixed
+
+- **Fix UI freeze on heavy output across multiple sessions (#209).** VT100 parsing moved off the UI thread, rendering throttled to ~30fps, output chunks coalesced, and per-tab buffer locks adopted, so unzipping many files on one server no longer stalls other sessions or the whole UI.
+- **Stop the welcome session panel height jump on the first session (#214).** The quick-connect card now always fills the remaining height and the empty-state placeholder stretches to match, keeping the panel height stable before and after adding a session.
+
+
+## [0.5.3] - 2026-07-04
+
+### 新增 / Added
+
+- **欢迎页侧栏支持四向停靠与持久化。** “欢迎页为侧栏”开启后，快速连接面板现在可以拖到左/右/上/下任一侧，并记住停靠位置、宽度和收起状态。
+- **资源面板收起状态持久化。** 资源面板的展开/收起会按最后一次用户操作恢复；只有老配置里没有该状态时，才回退读取“设置 - 界面 - 侧栏”的默认收起设置。
+- **同边收起图标栏合并与外侧停靠。** 快速连接和资源面板在同一侧时，只允许一个面板展开；两个都收起时图标位于同一列/同一行；一个展开一个收起时，收起图标栏始终贴在该侧最外侧。
+- **资源面板新增内部浅色内容底。** 资源面板现在和快速连接一样有 inset 的圆角浅色/磨砂内容底，视觉层级更统一。
+- **开发构建提速配置。** dev profile 下本 crate 取消优化、依赖保持轻度优化，并在 Windows MSVC 下使用 `rust-lld.exe`，提升日常增量 build/check 速度。
+
+### 修复 / Fixed
+
+- **修复欢迎页为侧栏时 tab 栏仍显示“+”的问题。** 开启欢迎页侧栏后，tab 栏不再显示新建欢迎页入口，避免无法切回欢迎页的误导。
+- **修复启动时同边双面板同时展开的兜底问题。** 如果配置恢复后快速连接和资源面板同边且都处于展开状态，启动时会自动收起资源面板，保持“一侧只展开一个面板”。
+- **修复不同停靠方向下收起箭头位置和图标不一致。** 收起按钮按停靠方向放到合适一侧，并统一使用 Material Icons 箭头。
+
+---
+
+### Added
+
+- **Four-edge docking and persistence for the welcome sidebar.** When “Welcome page as sidebar” is enabled, the quick-connect panel can now dock to the left, right, top, or bottom, and remembers its dock edge, size, and collapsed state.
+- **Persistent resource-panel collapse state.** The resource panel now restores the user’s last expanded/collapsed state; older configs without this state still fall back to the Interface sidebar default.
+- **Merged outer collapse strips for same-edge panels.** When quick connect and the resource panel share an edge, only one panel expands at a time; collapsed icons share one column/row, and a collapsed strip stays on the outer edge when the other panel is expanded.
+- **Inset light content surface for the resource panel.** The resource panel now matches quick connect with an inset rounded frosted content surface.
+- **Faster development builds.** The dev profile now leaves the local crate unoptimized, keeps dependencies lightly optimized, and uses `rust-lld.exe` on Windows MSVC for faster incremental build/check cycles.
+
+### Fixed
+
+- **Hide the tab “+” button when the welcome page is a sidebar.** This avoids a misleading new-welcome-tab entry when the welcome page already lives in the sidebar.
+- **Prevent same-edge double-expanded panels on startup.** If restored config would expand both quick connect and the resource panel on the same edge, the resource panel is collapsed at startup.
+- **Normalize collapse arrow placement and icons across dock edges.** Collapse buttons now use Material Icons and move according to the current dock edge.
+
+
 ## [0.5.1] - 2026-07-01
 
 ### Added / 新增

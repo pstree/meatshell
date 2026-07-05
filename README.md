@@ -40,6 +40,19 @@ chmod +x install-linux.sh && ./install-linux.sh
 
 > 需要 glibc ≥ 2.35（Ubuntu 22.04+ / Debian 12+）。Wayland 下首次装完图标可能要注销重登一次。
 
+从源码 `cargo run`（Linux Mint / Ubuntu / Debian）需要先安装 Slint/winit/rfd 等用到的系统开发包：
+
+```bash
+sudo apt update
+sudo apt install -y --no-install-recommends \
+  build-essential pkg-config cmake \
+  libfontconfig1-dev libfreetype6-dev \
+  libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+  libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+  libgl1-mesa-dev libegl1-mesa-dev libgtk-3-dev \
+  libudev-dev
+```
+
 ### macOS
 
 下载得到的是 `.zip`，里面是 `meatshell.app` 应用程序包：
