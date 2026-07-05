@@ -5575,6 +5575,7 @@ fn wire_key_input(
                 if name.is_empty() || command.trim().is_empty() {
                     return;
                 }
+                let group = if group.eq_ignore_ascii_case("default") { String::new() } else { group };
                 {
                     let mut s = store_rc.borrow_mut();
                     let mut v = s.quick_commands().to_vec();
@@ -5660,6 +5661,7 @@ fn wire_key_input(
                 if name.is_empty() || command.trim().is_empty() {
                     return;
                 }
+                let group = if group.eq_ignore_ascii_case("default") { String::new() } else { group };
                 {
                     let mut s = store_rc.borrow_mut();
                     s.update_quick_command(
