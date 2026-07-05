@@ -3703,7 +3703,13 @@ fn apply_session_event_to_window(
         } => {
             if error.is_empty() {
                 // Open the built-in viewer/editor (#70).
-                let editor_content = content.replace('\t', "    ");
+                // Normalise line endings to `\n` (#81): Slint's TextInput treats
+                // `\r` and `\n` as separate breaks, so a CRLF (or lone CR) file
+                // renders double-spaced against the gutter's line count.
+                let editor_content = content
+                    .replace('\t', "    ")
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n");
                 win.set_editor_line_numbers(line_numbers_for(&editor_content).into());
                 win.set_editor_path(path.into());
                 win.set_editor_name(name.into());

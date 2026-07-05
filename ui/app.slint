@@ -1864,6 +1864,12 @@ export component AppWindow inherits Window {
                                     x: 0;
                                     y: ed-scroll.viewport-y + 8px;
                                     width: parent.width - 6px;
+                                    // Match the editor text's full content height so every
+                                    // line number exists to scroll into view. Without this
+                                    // the Text is clamped to the visible area and the lower
+                                    // numbers never appear as you scroll down (#81).
+                                    height: edit-input.preferred-height;
+                                    vertical-alignment: top;
                                     text: root.editor-line-numbers;
                                     horizontal-alignment: right;
                                     font-family: Theme.ui-font-family;
