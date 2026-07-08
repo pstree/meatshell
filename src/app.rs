@@ -2355,7 +2355,11 @@ fn wire_session_callbacks(
                         name: h.alias,
                         host: h.hostname,
                         port: h.port,
-                        user: if h.user.is_empty() { "root".into() } else { h.user },
+                        user: if h.user.is_empty() {
+                            "root".into()
+                        } else {
+                            h.user
+                        },
                         auth,
                         private_key_path: h.identity_file,
                         ..Session::new_empty()
@@ -3092,11 +3096,15 @@ fn resolve_jump(store: &Rc<RefCell<ConfigStore>>, session: &Session) -> Option<S
 fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     let has_sftp = session.kind == SessionKind::Ssh;
     let (initial_cols, initial_rows) = *ctx.last_term_size.lock().unwrap();
+    // Resolve the optional SSH jump host now (on the UI thread, where the store
+    // lives) so the owned Session can be handed to the worker threads (#211).
+    let jump = resolve_jump(&ctx.store, &session);
     let (handle, rx) = match session.kind {
         SessionKind::Ssh => spawn_session(
             ctx.runtime.handle(),
             tab_id.to_string(),
             session.clone(),
+            jump.clone(),
             initial_cols,
             initial_rows,
         ),
@@ -3633,11 +3641,17 @@ fn collect_sftp_selected(terminals: &VecModel<TerminalState>, tab_id: &str) -> V
 /// Uncheck every SFTP entry for a tab and reset its selected-count (#100).
 fn clear_sftp_selection(terminals: &VecModel<TerminalState>, tab_id: &str) {
     for ti in 0..terminals.row_count() {
-        let Some(row) = terminals.row_data(ti) else { continue };
+        let Some(row) = terminals.row_data(ti) else {
+            continue;
+        };
         if row.id.as_str() != tab_id {
             continue;
         }
-        if let Some(em) = row.sftp_entries.as_any().downcast_ref::<VecModel<SftpEntry>>() {
+        if let Some(em) = row
+            .sftp_entries
+            .as_any()
+            .downcast_ref::<VecModel<SftpEntry>>()
+        {
             for ei in 0..em.row_count() {
                 if let Some(mut e) = em.row_data(ei) {
                     if e.selected {
@@ -4595,7 +4609,8 @@ fn resolve_front_hostkey(win: &AppWindow, accept: bool) {
             // only fails the current attempt; the next connect prompts again.
             if accept {
                 HOSTKEY_DECIDED.with(|d| {
-                    d.borrow_mut().insert(format!("{}:{}", p.host, p.port), true);
+                    d.borrow_mut()
+                        .insert(format!("{}:{}", p.host, p.port), true);
                 });
             }
             for r in &p.responders {
@@ -6843,12 +6858,9 @@ fn wire_key_input(
             }
             if let Some(win) = weak.upgrade() {
                 set_terminal_row(&win, &tid, |row| {
-                    row.spans =
-                        ModelRc::from(Rc::new(VecModel::<TermSpan>::default()));
-                    row.find_matches =
-                        ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
-                    row.selection =
-                        ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
+                    row.spans = ModelRc::from(Rc::new(VecModel::<TermSpan>::default()));
+                    row.find_matches = ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
+                    row.selection = ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
                     row.cursor_row = 0;
                     row.cursor_col = 0;
                     row.rows_used = 0;
@@ -7659,29 +7671,29 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
         "\u{F701}" => Some(if app_cursor { b"\x1bOB" } else { b"\x1b[B" }), // Down
         "\u{F702}" => Some(if app_cursor { b"\x1bOD" } else { b"\x1b[D" }), // Left
         "\u{F703}" => Some(if app_cursor { b"\x1bOC" } else { b"\x1b[C" }), // Right
-        "\u{F729}" => Some(b"\x1b[H"),   // Home
-        "\u{F72B}" => Some(b"\x1b[F"),   // End
-        "\u{F72C}" => Some(b"\x1b[5~"),  // PageUp
-        "\u{F72D}" => Some(b"\x1b[6~"),  // PageDown
+        "\u{F729}" => Some(b"\x1b[H"),                                      // Home
+        "\u{F72B}" => Some(b"\x1b[F"),                                      // End
+        "\u{F72C}" => Some(b"\x1b[5~"),                                     // PageUp
+        "\u{F72D}" => Some(b"\x1b[6~"),                                     // PageDown
         // Forward-Delete. Slint's canonical key code for the Delete key is
         // U+007F (see i-slint-common key_codes: F728 is explicitly *not* used,
         // it collapses to the 0x7f control code). The old F728 mapping never
         // matched on any platform, so Delete fell through to the generic path
         // and behaved like backspace / garbled the char instead of sending the
         // VT "delete forward" sequence (B站 fan report).
-        "\u{007F}" | "\u{F728}" => Some(b"\x1b[3~"),  // Delete (forward)
-        "\u{F704}" => Some(b"\x1bOP"),   // F1
-        "\u{F705}" => Some(b"\x1bOQ"),   // F2
-        "\u{F706}" => Some(b"\x1bOR"),   // F3
-        "\u{F707}" => Some(b"\x1bOS"),   // F4
-        "\u{F708}" => Some(b"\x1b[15~"), // F5
-        "\u{F709}" => Some(b"\x1b[17~"), // F6
-        "\u{F70A}" => Some(b"\x1b[18~"), // F7
-        "\u{F70B}" => Some(b"\x1b[19~"), // F8
-        "\u{F70C}" => Some(b"\x1b[20~"), // F9
-        "\u{F70D}" => Some(b"\x1b[21~"), // F10
-        "\u{F70E}" => Some(b"\x1b[23~"), // F11
-        "\u{F70F}" => Some(b"\x1b[24~"), // F12
+        "\u{007F}" | "\u{F728}" => Some(b"\x1b[3~"), // Delete (forward)
+        "\u{F704}" => Some(b"\x1bOP"),               // F1
+        "\u{F705}" => Some(b"\x1bOQ"),               // F2
+        "\u{F706}" => Some(b"\x1bOR"),               // F3
+        "\u{F707}" => Some(b"\x1bOS"),               // F4
+        "\u{F708}" => Some(b"\x1b[15~"),             // F5
+        "\u{F709}" => Some(b"\x1b[17~"),             // F6
+        "\u{F70A}" => Some(b"\x1b[18~"),             // F7
+        "\u{F70B}" => Some(b"\x1b[19~"),             // F8
+        "\u{F70C}" => Some(b"\x1b[20~"),             // F9
+        "\u{F70D}" => Some(b"\x1b[21~"),             // F10
+        "\u{F70E}" => Some(b"\x1b[23~"),             // F11
+        "\u{F70F}" => Some(b"\x1b[24~"),             // F12
         _ => None,
     };
     if let Some(seq) = special {
@@ -8335,9 +8347,9 @@ impl TermBuffer {
         // btop configured with `alt-screen = false`).
         // We look for \033[H (cursor-home) and \033[2J / \033[J (erase display)
         // as indicators that the program is doing a full-screen refresh.
-        let has_cursor_home   = bytes.windows(3).any(|w| w == b"\x1b[H");
-        let has_erase_display = bytes.windows(4).any(|w| w == b"\x1b[2J")
-                             || bytes.windows(3).any(|w| w == b"\x1b[J");
+        let has_cursor_home = bytes.windows(3).any(|w| w == b"\x1b[H");
+        let has_erase_display =
+            bytes.windows(4).any(|w| w == b"\x1b[2J") || bytes.windows(3).any(|w| w == b"\x1b[J");
         let is_fullscreen_refresh = has_cursor_home && has_erase_display;
 
         self.parser.process(bytes);
