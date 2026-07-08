@@ -21,6 +21,11 @@ mod wallpaper;
 mod zmodem;
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("meatshell {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // macOS renderer is left at Slint's default (femtovg) and is NOT forced.
     //
     // History: 0.4.10 force-set SLINT_BACKEND=winit-skia to work around femtovg's
