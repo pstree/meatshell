@@ -75,7 +75,30 @@ enum CsiState {
     Csi,
 }
 
+/// Max UI renders per second for a tab under sustained output (#209).
+const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
 type TermBuffers = Arc<Mutex<HashMap<String, TermBuffer>>>;
+
+/// Coalesces render requests so a firehose of output schedules at most one UI
+/// flush at a time per tab, throttled to ~30 fps (#209).
+struct TabRenderGate {
+    scheduled: AtomicBool,
+    pending: AtomicBool,
+    last_render: Mutex<std::time::Instant>,
+}
+
+impl TabRenderGate {
+    fn new() -> Self {
+        Self {
+            scheduled: AtomicBool::new(false),
+            pending: AtomicBool::new(false),
+            last_render: Mutex::new(std::time::Instant::now() - RENDER_MIN_INTERVAL),
+        }
+    }
+}
+
+type RenderGates = Arc<Mutex<HashMap<String, Arc<TabRenderGate>>>>;
 
 use anyhow::{Context, Result};
 use i_slint_backend_winit::WinitWindowAccessor;
@@ -86,10 +109,17 @@ use crate::config::{AuthMethod, ConfigStore, Secret, Session, SessionKind};
 use crate::i18n::t;
 use crate::sftp::{spawn_sftp, SftpHandle};
 use crate::ssh::{
-    format_mtime, format_size, spawn_session, ProcInfo, SessionCommand, SessionEvent,
-    SessionHandle,
+    format_mtime, format_size, spawn_session, ProcInfo, SessionCommand, SessionEvent, SessionHandle,
 };
 use crate::system::{format_bytes_per_sec, format_mem, SystemSampler, SystemSnapshot};
+
+fn tab_title_len(title: &str) -> i32 {
+    title
+        .chars()
+        .map(|ch| if ch.is_ascii() { 1usize } else { 2usize })
+        .sum::<usize>()
+        .min(i32::MAX as usize) as i32
+}
 
 type SftpHandles = Arc<Mutex<HashMap<String, SftpHandle>>>;
 /// Per-tab flag: once the user explicitly navigates via the SFTP tree or
@@ -108,7 +138,7 @@ struct TabStatus {
     host: String,       // "root@192.168.100.2"
     session_id: String, // saved-session id, used to reconnect in place (#79)
     state: u8,          // 0 = connecting, 1 = connected, 2 = disconnected
-    cpu: f32,     // 0.0..1.0
+    cpu: f32,           // 0.0..1.0
     mem_used_kib: u64,
     mem_total_kib: u64,
     swap_used_kib: u64,
@@ -130,6 +160,111 @@ type LocalSnap = Arc<Mutex<SystemSnapshot>>;
 
 // Slint generates types into this scope.
 slint::include_modules!();
+
+/// Tab ids currently shown in a pane (`term.id == pane.active-id` in Slint).
+fn visible_tab_ids(win: &AppWindow) -> HashSet<String> {
+    use slint::Model as _;
+    let mut out = HashSet::new();
+    let panes = win.get_panes();
+    if let Some(pm) = panes.as_any().downcast_ref::<VecModel<PaneInfo>>() {
+        for i in 0..pm.row_count() {
+            if let Some(pane) = pm.row_data(i) {
+                out.insert(pane.active_id.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn request_tab_render(
+    weak: slint::Weak<AppWindow>,
+    tab_id: &str,
+    bufs: &TermBuffers,
+    gates: &RenderGates,
+) {
+    let gate = {
+        let m = gates.lock().unwrap();
+        m.get(tab_id).cloned()
+    };
+    let Some(gate) = gate else { return };
+    gate.pending.store(true, Ordering::Release);
+    if gate.scheduled.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let weak2 = weak.clone();
+    let tid = tab_id.to_string();
+    let bufs2 = bufs.clone();
+    let gates2 = gates.clone();
+    // Always bounce through the event loop from pump / worker threads.
+    // Never call invoke_from_event_loop from inside a UI callback — that
+    // deadlocks Slint (opening a second tab then froze the whole app).
+    let _ = slint::invoke_from_event_loop(move || {
+        run_coalesced_tab_render(&weak2, &tid, &bufs2, &gates2);
+    });
+}
+
+/// UI-thread entry: honour the throttle, then render. Timer must be created
+/// here — not on pump threads (#209).
+fn run_coalesced_tab_render(
+    weak: &slint::Weak<AppWindow>,
+    tab_id: &str,
+    bufs: &TermBuffers,
+    gates: &RenderGates,
+) {
+    let gate = {
+        let m = gates.lock().unwrap();
+        m.get(tab_id).cloned()
+    };
+    let Some(gate) = gate else { return };
+
+    let delay = {
+        let last = *gate.last_render.lock().unwrap();
+        RENDER_MIN_INTERVAL.saturating_sub(last.elapsed())
+    };
+
+    let weak2 = weak.clone();
+    let tid = tab_id.to_string();
+    let bufs2 = bufs.clone();
+    let gates2 = gates.clone();
+
+    if delay.is_zero() {
+        do_tab_render_flush(&weak2, &tid, &bufs2, &gates2);
+    } else {
+        slint::Timer::single_shot(delay, move || {
+            do_tab_render_flush(&weak2, &tid, &bufs2, &gates2);
+        });
+    }
+}
+
+/// UI-thread only: push the vt100 screen into Slint, then reschedule if more
+/// output arrived while we were rendering (#209).
+fn do_tab_render_flush(
+    weak: &slint::Weak<AppWindow>,
+    tab_id: &str,
+    bufs: &TermBuffers,
+    gates: &RenderGates,
+) {
+    let gate = {
+        let m = gates.lock().unwrap();
+        m.get(tab_id).cloned()
+    };
+    let Some(gate) = gate else { return };
+    gate.scheduled.store(false, Ordering::Release);
+
+    if let Some(win) = weak.upgrade() {
+        if visible_tab_ids(&win).contains(tab_id) {
+            rebuild_tab_display(&win, bufs, tab_id);
+            *gate.last_render.lock().unwrap() = std::time::Instant::now();
+        }
+    }
+
+    if gate.pending.swap(false, Ordering::AcqRel) {
+        if !gate.scheduled.swap(true, Ordering::AcqRel) {
+            run_coalesced_tab_render(weak, tab_id, bufs, gates);
+        }
+    }
+}
 
 /// Number of samples kept for the sparkline.
 const NET_HISTORY_LEN: usize = 60;
@@ -154,11 +289,17 @@ const NET_HISTORY_LEN: usize = 60;
 fn set_window_icon(window: &AppWindow) {
     use i_slint_backend_winit::winit::window::Icon;
     const ICON_PNG: &[u8] = include_bytes!("../assets/icon@512.png");
-    let Ok(img) = image::load_from_memory(ICON_PNG) else { return };
+    let Ok(img) = image::load_from_memory(ICON_PNG) else {
+        return;
+    };
     let rgba = img.into_rgba8();
     let (w, h) = rgba.dimensions();
-    let Ok(icon) = Icon::from_rgba(rgba.into_raw(), w, h) else { return };
-    window.window().with_winit_window(|ww| ww.set_window_icon(Some(icon)));
+    let Ok(icon) = Icon::from_rgba(rgba.into_raw(), w, h) else {
+        return;
+    };
+    window
+        .window()
+        .with_winit_window(|ww| ww.set_window_icon(Some(icon)));
 }
 
 /// On Windows 11, give the frameless window the native rounded corners (#166) and
@@ -220,6 +361,78 @@ fn apply_window_chrome(window: &slint::Window) {
 #[cfg(not(windows))]
 fn apply_window_chrome(_window: &slint::Window) {}
 
+fn clamp_window_size_to_monitor(window: &slint::Window, preferred: Option<(f32, f32)>) -> Option<(f32, f32)> {
+    use i_slint_backend_winit::winit::dpi::{LogicalPosition, LogicalSize};
+
+    window.with_winit_window(|ww| {
+        let scale = ww.scale_factor().max(0.01);
+        let monitor = ww.current_monitor()?;
+        let monitor_size = monitor.size();
+        let monitor_pos = monitor.position();
+        let max_w = (monitor_size.width as f64 / scale - 16.0).max(1.0) as f32;
+        let max_h = (monitor_size.height as f64 / scale - 16.0).max(1.0) as f32;
+        let min_w = 960.0_f32.min(max_w);
+        let min_h = 600.0_f32.min(max_h);
+        let current = ww.inner_size();
+        let current_w = (current.width as f64 / scale) as f32;
+        let current_h = (current.height as f64 / scale) as f32;
+        let (want_w, want_h) = preferred.unwrap_or((current_w, current_h));
+        let target_w = want_w.clamp(min_w, max_w);
+        let target_h = want_h.clamp(min_h, max_h);
+
+        if (target_w - current_w).abs() > 0.5
+            || (target_h - current_h).abs() > 0.5
+            || preferred.is_some()
+        {
+            let _ = ww.request_inner_size(LogicalSize::new(target_w as f64, target_h as f64));
+        }
+
+        if (target_w - want_w).abs() > 0.5 || (target_h - want_h).abs() > 0.5 {
+            let mon_w = monitor_size.width as f64 / scale;
+            let mon_h = monitor_size.height as f64 / scale;
+            let mon_x = monitor_pos.x as f64 / scale;
+            let mon_y = monitor_pos.y as f64 / scale;
+            ww.set_outer_position(LogicalPosition::new(
+                mon_x + (mon_w - target_w as f64).max(0.0) / 2.0,
+                mon_y + (mon_h - target_h as f64).max(0.0) / 2.0,
+            ));
+        }
+
+        Some((target_w, target_h))
+    })?
+}
+
+#[cfg(target_os = "linux")]
+fn schedule_slint_pointer_ungrab<T>(weak: slint::Weak<T>)
+where
+    T: slint::ComponentHandle + 'static,
+{
+    // Linux window managers/compositors may consume the release event after a
+    // system move/resize starts. If Slint keeps its press grab, the whole app
+    // can remain stuck in move/resize cursor mode. A few deferred synthetic
+    // releases cover Cinnamon/Mutter/KWin timing differences.
+    for delay_ms in [0_u64, 16, 80, 200] {
+        let weak2 = weak.clone();
+        slint::Timer::single_shot(std::time::Duration::from_millis(delay_ms), move || {
+            if let Some(w) = weak2.upgrade() {
+                let win = w.window();
+                win.dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                    position: slint::LogicalPosition::new(-1.0, -1.0),
+                    button: slint::platform::PointerEventButton::Left,
+                });
+                win.dispatch_event(slint::platform::WindowEvent::PointerExited);
+            }
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn schedule_slint_pointer_ungrab<T>(_weak: slint::Weak<T>)
+where
+    T: slint::ComponentHandle + 'static,
+{
+}
+
 /// macOS-only: install a custom winit backend that makes the native title bar
 /// transparent and lets the window content render *under* it (fullSizeContentView).
 /// The title bar then picks up the app's dark theme / wallpaper (`Theme.window-base`)
@@ -253,7 +466,9 @@ fn setup_macos_platform() {
                 tracing::warn!("winit backend already set; immersive macOS titlebar disabled");
             }
         }
-        Err(e) => tracing::warn!("winit backend build failed ({e}); immersive macOS titlebar disabled"),
+        Err(e) => {
+            tracing::warn!("winit backend build failed ({e}); immersive macOS titlebar disabled")
+        }
     }
 }
 
@@ -287,6 +502,7 @@ pub fn run() -> Result<()> {
     // Per-tab vt100 parsers + history logs (Arc<Mutex> so they can be cloned
     // into the thread that pumps session events into invoke_from_event_loop).
     let bufs: TermBuffers = Arc::new(Mutex::new(HashMap::new()));
+    let render_gates: RenderGates = Arc::new(Mutex::new(HashMap::new()));
 
     // Last-known terminal pixel dimensions, updated by every terminal-resize
     // callback.  Shared so on_connect_session can pass a sensible initial PTY
@@ -440,7 +656,9 @@ pub fn run() -> Result<()> {
     // window is never fully blank even when the system font DB is unreadable.
     window.set_ui_font_family(resolve_ui_font_family());
     // Populate the Interface font picker with installed monospace families.
-    window.set_term_fonts(ModelRc::from(Rc::new(VecModel::from(system_monospace_fonts()))));
+    window.set_term_fonts(ModelRc::from(Rc::new(VecModel::from(
+        system_monospace_fonts(),
+    ))));
 
     // Command bar (#55): seed quick commands + history from the config. Groups
     // start collapsed by default (#55).
@@ -1243,16 +1461,15 @@ pub fn run() -> Result<()> {
     if store.borrow().update_check_enabled() {
         let weak = window.as_weak();
         std::thread::spawn(move || {
-            let body = match ureq::get(
-                "https://api.github.com/repos/jeff141/meatshell/releases/latest",
-            )
-            .set("User-Agent", "meatshell-update-check")
-            .timeout(std::time::Duration::from_secs(8))
-            .call()
-            {
-                Ok(resp) => resp.into_string().unwrap_or_default(),
-                Err(_) => return,
-            };
+            let body =
+                match ureq::get("https://api.github.com/repos/jeff141/meatshell/releases/latest")
+                    .set("User-Agent", "meatshell-update-check")
+                    .timeout(std::time::Duration::from_secs(8))
+                    .call()
+                {
+                    Ok(resp) => resp.into_string().unwrap_or_default(),
+                    Err(_) => return,
+                };
             let json: serde_json::Value = match serde_json::from_str(&body) {
                 Ok(v) => v,
                 Err(_) => return,
@@ -1297,23 +1514,53 @@ pub fn run() -> Result<()> {
     {
         let libs: Vec<SharedString> = [
             t("Slint — 图形界面框架 (GUI)", "Slint — GUI framework"),
-            t("russh / russh-keys — SSH 协议实现", "russh / russh-keys — SSH protocol"),
-            t("russh-sftp — SFTP 文件传输", "russh-sftp — SFTP file transfer"),
+            t(
+                "russh / russh-keys — SSH 协议实现",
+                "russh / russh-keys — SSH protocol",
+            ),
+            t(
+                "russh-sftp — SFTP 文件传输",
+                "russh-sftp — SFTP file transfer",
+            ),
             t("ssh-key — SSH 密钥解析", "ssh-key — SSH key parsing"),
             t("tokio — 异步运行时", "tokio — async runtime"),
-            t("vt100 — 终端 (VT100/xterm) 解析", "vt100 — terminal (VT100/xterm) parser"),
-            t("sysinfo — 本机资源采集", "sysinfo — local resource sampling"),
-            t("serde / serde_json — 配置序列化", "serde / serde_json — config serialization"),
+            t(
+                "vt100 — 终端 (VT100/xterm) 解析",
+                "vt100 — terminal (VT100/xterm) parser",
+            ),
+            t(
+                "sysinfo — 本机资源采集",
+                "sysinfo — local resource sampling",
+            ),
+            t(
+                "serde / serde_json — 配置序列化",
+                "serde / serde_json — config serialization",
+            ),
             t("arboard — 系统剪贴板", "arboard — system clipboard"),
             t("rfd — 原生文件对话框", "rfd — native file dialogs"),
-            t("directories — 配置目录定位", "directories — config dir lookup"),
+            t(
+                "directories — 配置目录定位",
+                "directories — config dir lookup",
+            ),
             t("chrono — 日期时间处理", "chrono — date/time handling"),
             t("uuid — 唯一标识符", "uuid — unique identifiers"),
-            t("anyhow / thiserror — 错误处理", "anyhow / thiserror — error handling"),
-            t("tracing / tracing-subscriber — 日志", "tracing / tracing-subscriber — logging"),
-            t("futures / async-trait — 异步辅助", "futures / async-trait — async helpers"),
+            t(
+                "anyhow / thiserror — 错误处理",
+                "anyhow / thiserror — error handling",
+            ),
+            t(
+                "tracing / tracing-subscriber — 日志",
+                "tracing / tracing-subscriber — logging",
+            ),
+            t(
+                "futures / async-trait — 异步辅助",
+                "futures / async-trait — async helpers",
+            ),
             t("rand — 随机数", "rand — randomness"),
-            t("winresource — Windows 图标/资源嵌入", "winresource — Windows icon/resource embedding"),
+            t(
+                "winresource — Windows 图标/资源嵌入",
+                "winresource — Windows icon/resource embedding",
+            ),
         ]
         .iter()
         .map(|s| (*s).into())
@@ -1714,10 +1961,7 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
     let w = win.window();
     let scale = w.scale_factor().max(0.01);
     let size = w.size(); // physical
-    let Some(inner) = w
-        .with_winit_window(|ww| ww.inner_position().ok())
-        .flatten()
-    else {
+    let Some(inner) = w.with_winit_window(|ww| ww.inner_position().ok()).flatten() else {
         return;
     };
     let Some((cx, cy)) = cursor_pos() else {
@@ -1735,10 +1979,7 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
     let zone_left = 381.0_f32;
     let zone_top = h_logical - h_sftp + 51.0;
     let zone_bottom = h_logical - 18.0;
-    if client_x < zone_left
-        || client_x > w_logical
-        || client_y < zone_top
-        || client_y > zone_bottom
+    if client_x < zone_left || client_x > w_logical || client_y < zone_top || client_y > zone_bottom
     {
         return; // dropped outside the file list — ignore
     }
@@ -1751,9 +1992,14 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
     // every other online session — each into *its own* current SFTP dir. This
     // matches the upload button's behaviour (drag-and-drop is a separate path).
     let sync = win.get_sync_input() && win.get_sync_upload_enabled();
-    let other_dirs = if sync { terminal_sftp_paths(win) } else { HashMap::new() };
+    let other_dirs = if sync {
+        terminal_sftp_paths(win)
+    } else {
+        HashMap::new()
+    };
     if let Ok(handles) = sftp_handles.lock() {
         if let Some(h) = handles.get(&active) {
+            win.set_download_open(true);
             h.upload(path.clone(), dir);
         }
         if sync {
@@ -1766,7 +2012,6 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
                 }
             }
         }
-        win.set_download_open(true);
     }
 }
 
@@ -1827,7 +2072,11 @@ fn parse_batch_import(text: &str) -> Vec<Session> {
             .and_then(|p| p.parse::<u16>().ok())
             .filter(|&p| p > 0)
             .unwrap_or(22);
-        let user = parts.get(2).copied().filter(|s| !s.is_empty()).unwrap_or("root");
+        let user = parts
+            .get(2)
+            .copied()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("root");
         let password = parts.get(3).copied().unwrap_or("");
         let name = parts
             .get(4)
@@ -1871,7 +2120,10 @@ fn session_groups_model(store: &ConfigStore) -> ModelRc<SharedString> {
     named.sort_by_key(|g| g.to_lowercase());
     named.dedup();
     ModelRc::from(Rc::new(VecModel::from(
-        named.into_iter().map(SharedString::from).collect::<Vec<_>>(),
+        named
+            .into_iter()
+            .map(SharedString::from)
+            .collect::<Vec<_>>(),
     )))
 }
 
@@ -2960,9 +3212,15 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                             // Merge with the immediately preceding Output so the
                             // whole run is one vt100 ingest + one render. Only
                             // *adjacent* chunks merge, so byte order (and any
-                            // interleaved event) is preserved exactly.
+                            // interleaved event) is preserved exactly. Cap the
+                            // merged size so one batch can't monopolize the UI
+                            // thread for hundreds of ms (#209).
                             if let Some(SessionEvent::Output(prev)) = ui_batch.last_mut() {
-                                prev.push_str(&chunk);
+                                if prev.len() + chunk.len() <= OUTPUT_MERGE_BYTE_CAP {
+                                    prev.push_str(&chunk);
+                                } else {
+                                    ui_batch.push(SessionEvent::Output(chunk));
+                                }
                             } else {
                                 ui_batch.push(SessionEvent::Output(chunk));
                             }
@@ -3348,11 +3606,17 @@ fn forward_model(forwards: &[crate::config::PortForward]) -> ModelRc<PortFwd> {
 fn collect_sftp_selected(terminals: &VecModel<TerminalState>, tab_id: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for ti in 0..terminals.row_count() {
-        let Some(row) = terminals.row_data(ti) else { continue };
+        let Some(row) = terminals.row_data(ti) else {
+            continue;
+        };
         if row.id.as_str() != tab_id {
             continue;
         }
-        if let Some(em) = row.sftp_entries.as_any().downcast_ref::<VecModel<SftpEntry>>() {
+        if let Some(em) = row
+            .sftp_entries
+            .as_any()
+            .downcast_ref::<VecModel<SftpEntry>>()
+        {
             for ei in 0..em.row_count() {
                 if let Some(e) = em.row_data(ei) {
                     if e.selected {
@@ -3932,7 +4196,9 @@ fn apply_session_event_to_window(
                 local_net_hist,
             );
             update_tab(&|t| t.connected = false);
-            update_terminal(&|t| t.status = format!("{} — {reason}", crate::i18n::t("已断开", "Disconnected")).into());
+            update_terminal(&|t| {
+                t.status = format!("{} — {reason}", crate::i18n::t("已断开", "Disconnected")).into()
+            });
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.state = 2;
             }
@@ -4701,11 +4967,11 @@ fn refresh_panes(
     }
 }
 
-/// Hit-test a drag point (pane-area coords) to a target pane + edge zone, plus
-/// the highlight rect the dropped tab's new pane would occupy. Zone is one of
-/// "left"/"right"/"up"/"down"/"center"; `None` when the point is outside every
-/// pane. The 30% edge bands trigger a split; the middle drops into the pane's
-/// tab group.
+/// Hit-test a drag point (pane-area coords) to a target pane + drop zone, plus
+/// the highlight rect the dropped tab would affect. Zone is one of
+/// "tabstrip"/"left"/"right"/"up"/"down"/"center"; `None` when the point is
+/// outside every pane. The 30% edge bands trigger a split; the tab strip and
+/// middle drop into the pane's tab group.
 fn drag_target(
     layout: &crate::panes::Layout,
     content: (f32, f32),
@@ -4719,10 +4985,10 @@ fn drag_target(
     let p = panes
         .iter()
         .find(|p| x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h)?;
-    // Still on the tab strip — that's reorder territory, no split/move highlight.
     let body_top = p.y + STRIP;
     if y < body_top {
-        return None;
+        let ix = x.clamp(p.x + 3.0, p.x + p.w - 3.0) - 3.0;
+        return Some((p.id, "tabstrip", (ix, p.y + 4.0, 6.0, STRIP - 8.0)));
     }
     let bw = p.w.max(1.0);
     let bh = (p.h - STRIP).max(1.0);
@@ -4918,7 +5184,11 @@ fn wire_tab_callbacks(
         window.on_pane_new_tab(move |pane_id: i32| {
             // In welcome-as-sidebar mode there is no welcome tab — the session list
             // lives in the left panel, so "+" has nothing to open.
-            if weak.upgrade().map(|w| w.get_welcome_as_sidebar()).unwrap_or(false) {
+            if weak
+                .upgrade()
+                .map(|w| w.get_welcome_as_sidebar())
+                .unwrap_or(false)
+            {
                 return;
             }
             {
@@ -5081,7 +5351,8 @@ fn wire_tab_callbacks(
     }
 
     // Drop: split the target pane toward the dropped-on edge (peeling the tab
-    // into the new pane), or drop into another pane's tab group from the middle.
+    // into the new pane), or drop into another pane's tab group from the middle
+    // / tab strip (IDEA-style merge by dragging onto the tab row).
     {
         let weak = window.as_weak();
         let layout = layout.clone();
@@ -5107,6 +5378,11 @@ fn wire_tab_callbacks(
                     }
                     "down" => {
                         lay.split(pane, crate::panes::Dir::Vertical, &tab_id, false);
+                    }
+                    "tabstrip" => {
+                        if src != Some(pane) {
+                            lay.move_tab(&tab_id, pane);
+                        }
                     }
                     _ => {
                         if src != Some(pane) {
@@ -5397,7 +5673,11 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
                 if row.id.as_str() != tab_id.as_str() {
                     continue;
                 }
-                if let Some(em) = row.sftp_entries.as_any().downcast_ref::<VecModel<SftpEntry>>() {
+                if let Some(em) = row
+                    .sftp_entries
+                    .as_any()
+                    .downcast_ref::<VecModel<SftpEntry>>()
+                {
                     let i = idx as usize;
                     if let Some(mut e) = em.row_data(i) {
                         e.selected = !e.selected;
@@ -5471,7 +5751,11 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
                                 if single {
                                     h.download(paths[0].clone(), dir.clone());
                                 } else {
-                                    h.download_archive(remote_dir.clone(), names.clone(), dir.clone());
+                                    h.download_archive(
+                                        remote_dir.clone(),
+                                        names.clone(),
+                                        dir.clone(),
+                                    );
                                 }
                             }
                         }
@@ -5977,14 +6261,17 @@ fn wire_key_input(
         let weak = window.as_weak();
         let collapsed = collapsed_quick_groups.clone();
         window.on_save_quick_command(
-            move |index: i32, name: SharedString, command: SharedString, group: SharedString, send_enter: bool| {
+            move |index: i32,
+                  name: SharedString,
+                  command: SharedString,
+                  group: SharedString,
+                  send_enter: bool| {
                 let name = name.trim().to_string();
                 let command = command.to_string();
                 let group = group.trim().to_string();
                 if name.is_empty() || command.trim().is_empty() {
                     return;
                 }
-                let group = if group.eq_ignore_ascii_case("default") { String::new() } else { group };
                 {
                     let mut s = store_rc.borrow_mut();
                     s.update_quick_command(
@@ -7436,25 +7723,7 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
     // Linux/macOS builds directly as the same C0 bytes (0x10..0x18) but with
     // ctrl=true (handled by the Ctrl branch just below), so we must NOT swallow
     // those. A lone modifier never carries ctrl=true except bare Ctrl/CtrlR
-    // themselves, which are NOT harmless (issue #???): a bare Ctrl press produces
-    // key=0x10..0x18 with ctrl=true → Case A below sends the raw C0 byte →
-    // bash/readline interprets it as Ctrl+P→Ctrl+X (e.g. Ctrl+W = delete word).
-    //
-    // The Slint-side key-pressed handler now guards 0x10..0x18 before calling
-    // send-key, so this Rust guard is a secondary safety net.  On Windows the C0
-    // bytes 0x10..0x18 always come from bare modifiers (real Ctrl+letter uses
-    // letter encoding), so the guard can accept ALL modifier codes regardless of
-    // ctrl.  On non-Windows we keep `!ctrl` to preserve real Ctrl+P..Ctrl+X.
-    #[cfg(windows)]
-    {
-        if let Some(c) = key.chars().next() {
-            let cp = c as u32;
-            if key.chars().count() == 1 && (0x10..=0x18).contains(&cp) {
-                return vec![];
-            }
-        }
-    }
-    #[cfg(not(windows))]
+    // themselves, which are harmless to pass through as today.
     if !ctrl {
         if let Some(c) = key.chars().next() {
             let cp = c as u32;
@@ -8400,7 +8669,11 @@ fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
         return (0.0, 0.0, l);
     }
     let d = max - min;
-    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
     let h = if (max - r).abs() < 1e-6 {
         (g - b) / d + if g < b { 6.0 } else { 0.0 }
     } else if (max - g).abs() < 1e-6 {
