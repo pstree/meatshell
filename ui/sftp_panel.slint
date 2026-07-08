@@ -69,7 +69,11 @@ export component SftpPanel inherits Rectangle {
     // When narrow, drop Size then Modified the moment keeping them would squeeze
     // the Name column below `name-min` (names start eliding to "…"). Reserved
     // widths: checkbox+padding+spacing 36px, Size col 76px, Modified 120px.
-    property <length> list-w: root.show-tree ? root.width - 161px : root.width;
+    property <length> tree-w: 160px;
+    property <bool> tree-resizing: false;
+    property <length> tree-resize-base-w: 160px;
+    property <length> tree-resize-grab-x: 0px;
+    property <length> list-w: root.show-tree ? root.width - root.tree-w - 7px : root.width;
     property <length> name-min: 180px;     // narrower than this → start dropping columns
     property <bool> show-size-col: root.show-tree || (root.list-w - 36px - 76px - 120px > root.name-min);
     property <bool> show-modified-col: root.show-tree || (root.list-w - 36px - 120px > root.name-min);
@@ -353,7 +357,7 @@ export component SftpPanel inherits Rectangle {
 
             // ── Left: directory tree (hidden when the panel is narrow) ──────
             if root.show-tree : VerticalLayout {
-                width: 160px;
+                width: root.tree-w;
                 spacing: 0;
 
                 // Tree header
@@ -428,7 +432,41 @@ export component SftpPanel inherits Rectangle {
             }
 
             // Vertical separator (only when the tree is shown)
-            if root.show-tree : Rectangle { width: 1px; background: Theme.border-subtle; }
+            if root.show-tree : Rectangle {
+                width: 7px;
+                background: transparent;
+
+                Rectangle {
+                    x: (parent.width - self.width) / 2;
+                    width: 1px;
+                    height: parent.height;
+                    background: tree-split-ta.has-hover || root.tree-resizing
+                        ? Theme.accent
+                        : Theme.border-subtle;
+                }
+
+                tree-split-ta := TouchArea {
+                    mouse-cursor: ew-resize;
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down) {
+                            root.tree-resizing = true;
+                            root.tree-resize-base-w = root.tree-w;
+                            root.tree-resize-grab-x = self.absolute-position.x + self.mouse-x;
+                        } else if (ev.kind == PointerEventKind.up) {
+                            root.tree-resizing = false;
+                        }
+                    }
+                    moved => {
+                        if (root.tree-resizing) {
+                            root.tree-w = clamp(
+                                root.tree-resize-base-w
+                                    + (self.absolute-position.x + self.mouse-x - root.tree-resize-grab-x),
+                                96px,
+                                360px);
+                        }
+                    }
+                }
+            }
 
             // ── Right: file listing ─────────────────────────────────────────
             VerticalLayout {

@@ -219,6 +219,11 @@ export component TerminalView inherits Rectangle {
     // 0 = none, -1 = above top (scroll to older), +1 = below bottom (newer).
     property <int> autoscroll-dir: 0;
     property <length> vis-y: 0px;   // scratch: cursor Y within the visible viewport
+    // Magic Mouse / trackpads deliver many small smooth-scroll deltas instead
+    // of one large wheel notch. Accumulate them until they add up to a terminal
+    // scroll step so vertical swipes work consistently with classic wheels.
+    property <length> wheel-accum-y: 0px;
+    property <length> wheel-step-y: 40px;
     // Defer ime-input.focus() to the next event-loop tick so AccessKit tree
     // construction (on new TerminalView instantiation) finishes before focus
     // changes — avoids RefCell re-entry panic in WinitWindowAdapter (#AccessKit).
@@ -509,18 +514,28 @@ export component TerminalView inherits Rectangle {
                                 }
                             }
                             scroll-event(ev) => {
-                                // Positive delta-y = wheel up.
-                                if (root.is-alt-screen) {
-                                    // Alt-screen app (tmux/less/vim): forward the wheel
-                                    // so the program scrolls instead of nothing (#170).
-                                    root.terminal-wheel(
-                                        ev.delta-y > 0 ? 1 : -1,
-                                        floor(self.mouse-x / root.cell-w),
-                                        floor(self.mouse-y / root.cell-h));
-                                } else {
-                                    // Normal screen: scroll our own scrollback history
-                                    // (~3 lines per notch).
-                                    root.terminal-scroll(ev.delta-y > 0 ? 3 : -3);
+                                // Positive delta-y = wheel/swipe up. Smooth input
+                                // (Magic Mouse / trackpad) arrives as small deltas,
+                                // so accumulate until it reaches one wheel step.
+                                root.wheel-accum-y += ev.delta-y;
+                                if (root.wheel-accum-y >= root.wheel-step-y
+                                        || root.wheel-accum-y <= -root.wheel-step-y) {
+                                    if (root.is-alt-screen) {
+                                        // Alt-screen app (tmux/less/vim): forward the
+                                        // wheel so the program scrolls instead of
+                                        // nothing (#170).
+                                        root.terminal-wheel(
+                                            root.wheel-accum-y > 0px ? 1 : -1,
+                                            floor(self.mouse-x / root.cell-w),
+                                            floor(self.mouse-y / root.cell-h));
+                                    } else {
+                                        // Normal screen: scroll our own scrollback
+                                        // history (~3 lines per notch).
+                                        root.terminal-scroll(root.wheel-accum-y > 0px ? 3 : -3);
+                                    }
+                                    root.wheel-accum-y = root.wheel-accum-y > 0px
+                                        ? root.wheel-accum-y - root.wheel-step-y
+                                        : root.wheel-accum-y + root.wheel-step-y;
                                 }
                                 accept
                             }

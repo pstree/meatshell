@@ -1343,7 +1343,9 @@ impl ConfigStore {
 
     // ── Session groups / folders (#41) ────────────────────────────────────
 
-    /// Explicit groups (empty folders included). "default" is implicit.
+    /// Explicit groups (empty folders included). The built-in "default" group is
+    /// implicit until renamed; then its formerly ungrouped sessions move into
+    /// the new explicit group.
     pub fn groups(&self) -> &[String] {
         &self.cache.groups
     }
@@ -1371,10 +1373,30 @@ impl ConfigStore {
         }
     }
 
-    /// Rename a group, moving its sessions along. No-op for blank / "default".
+    /// Rename a group, moving its sessions along. The implicit "default" group
+    /// means ungrouped sessions; renaming it materializes the target group.
     pub fn rename_group(&mut self, old: &str, new: String) {
         let n = new.trim().to_string();
-        if n.is_empty() || n.eq_ignore_ascii_case("default") || n == old {
+        if n.is_empty() || n == old {
+            return;
+        }
+        if old.eq_ignore_ascii_case("default") {
+            if n.eq_ignore_ascii_case("default") {
+                return;
+            }
+            for s in &mut self.cache.sessions {
+                if s.group.is_empty() {
+                    s.group = n.clone();
+                }
+            }
+            if !self.cache.groups.iter().any(|g| g == &n) {
+                self.cache.groups.push(n);
+            }
+            self.cache.groups.sort();
+            self.cache.groups.dedup();
+            return;
+        }
+        if n.eq_ignore_ascii_case("default") {
             return;
         }
         for g in &mut self.cache.groups {
@@ -1621,6 +1643,24 @@ mod tests {
             user: "root".into(),
             ..Session::new_empty()
         }
+    }
+
+    #[test]
+    fn renames_implicit_default_group_into_explicit_group() {
+        let mut store = temp_store();
+        store.cache.sessions = vec![
+            sample_session("ungrouped"),
+            Session {
+                group: "ops".into(),
+                ..sample_session("grouped")
+            },
+        ];
+
+        store.rename_group("default", "prod".into());
+
+        assert_eq!(store.cache.sessions[0].group, "prod");
+        assert_eq!(store.cache.sessions[1].group, "ops");
+        assert_eq!(store.groups(), &["prod".to_string()]);
     }
 
     #[test]
