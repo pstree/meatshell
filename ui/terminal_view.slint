@@ -614,22 +614,10 @@ export component TerminalView inherits Rectangle {
                     }
                 }
 
-                // Bottom focus-recovery / middle-click-paste strip
-                Rectangle {
-                    height: 16px;
-                    background: Theme.term-bg;
-                    TouchArea {
-                        mouse-cursor: text;
-                        clicked => { ime-input.focus(); }
-                        pointer-event(ev) => {
-                            if (ev.button == PointerEventButton.middle
-                                    && ev.kind == PointerEventKind.up) {
-                                root.paste-from-clipboard();
-                                ime-input.focus();
-                            }
-                        }
-                    }
-                }
+                // Bottom focus-recovery / middle-click-paste strip (removed:
+                // the same handlers already live on body-touch inside the terminal
+                // grid above, so this strip only created a visible black bar below
+                // the terminal content without adding any real functionality).
             }
 
             // --- Hidden TextInput — keyboard + Chinese IME capture -----------
