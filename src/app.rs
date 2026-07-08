@@ -2821,17 +2821,99 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                     continue;
                 }
 
-                let weak_evt = weak_inner.clone();
+                // Pre-process Output events on the pump thread —
+                // vt100 parsing + render happen HERE, not on the UI thread.
+                // When `cat /var/log/syslog` dumps 20 MB of output, this keeps
+                // the UI responsive for mouse/keyboard events (#171 regression).
                 let tid = tab_id_pump.clone();
+                let mut prebuilt_outputs: Vec<PreBuiltOutput> = Vec::new();
+                let mut other_events: Vec<SessionEvent> = Vec::new();
+                for evt in ui_batch {
+                    match evt {
+                        SessionEvent::Output(chunk) => {
+                            if let Ok(mut map) = bufs_thread.lock() {
+                                if let Some(buf) = map.get_mut(&tid) {
+                                    buf.ingest(chunk.as_bytes());
+                                    let cols = buf.parser.screen().size().1;
+                                    let b = buf.render();
+                                    let matches =
+                                        compute_find_matches(&buf.displayed_text, &buf.find_query);
+                                    let sel = buf.selection_rects_visible(cols);
+                                    prebuilt_outputs.push(PreBuiltOutput {
+                                        spans: b.spans,
+                                        cursor_row: b.cursor_row,
+                                        cursor_col: b.cursor_col,
+                                        rows_used: b.rows_used,
+                                        is_alt: b.is_alt,
+                                        scroll_max: b.scroll_max,
+                                        scroll_offset: b.scroll_offset,
+                                        matches,
+                                        sel,
+                                    });
+                                }
+                            }
+                        }
+                        other => other_events.push(other),
+                    }
+                }
+
+                let weak_evt = weak_inner.clone();
+                let tid2 = tid.clone();
                 let bufs_evt = bufs_thread.clone();
                 let st_evt = statuses_pump.clone();
                 let lc_evt = local_pump.clone();
                 let nh_evt = net_pump.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(win) = weak_evt.upgrade() {
-                        for evt in ui_batch {
+                        let terminals_rc = win.get_terminals();
+                        let terminals = terminals_rc
+                            .as_any()
+                            .downcast_ref::<VecModel<TerminalState>>()
+                            .expect("terminals model must be a VecModel");
+                        // Apply pre-computed output: only VecModel wrappers +
+                        // set_row_data — no vt100 parsing on the UI thread (#171).
+                        for built in prebuilt_outputs {
+                            let spans_model: ModelRc<TermSpan> =
+                                ModelRc::from(std::rc::Rc::new(VecModel::from(built.spans)));
+                            let matches_model: ModelRc<TermMatch> =
+                                ModelRc::from(std::rc::Rc::new(VecModel::from(built.matches)));
+                            let sel_model: ModelRc<TermMatch> =
+                                ModelRc::from(std::rc::Rc::new(VecModel::from(built.sel)));
+                            let (cur_row, cur_col, rows_used, is_alt) = (
+                                built.cursor_row,
+                                built.cursor_col,
+                                built.rows_used,
+                                built.is_alt,
+                            );
+                            let (smax, soff) = (built.scroll_max, built.scroll_offset);
+                            for i in 0..terminals.row_count() {
+                                if let Some(mut row) = terminals.row_data(i) {
+                                    if row.id.as_str() == tid2.as_str() {
+                                        row.spans = spans_model.clone();
+                                        row.cursor_row = cur_row;
+                                        row.cursor_col = cur_col;
+                                        row.rows_used = rows_used;
+                                        row.is_alt_screen = is_alt;
+                                        row.find_matches = matches_model.clone();
+                                        row.selection = sel_model.clone();
+                                        row.scroll_max = smax;
+                                        row.scroll_offset = soff;
+                                        terminals.set_row_data(i, row);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Non-Output events still go through the normal path.
+                        for evt in other_events {
                             apply_session_event_to_window(
-                                &win, &tid, evt, &bufs_evt, &st_evt, &lc_evt, &nh_evt,
+                                &win,
+                                &tid2,
+                                evt,
+                                &bufs_evt,
+                                &st_evt,
+                                &lc_evt,
+                                &nh_evt,
                             );
                         }
                     }
@@ -7329,6 +7411,21 @@ struct BuiltScreen {
     /// offset (0 = live bottom), for the terminal scrollbar (#103).
     scroll_max: i32,
     scroll_offset: i32,
+}
+
+/// Pre-computed output that bypasses vt100 processing on the UI thread.
+/// The pump thread calls ingest + render, then sends only the results
+/// through invoke_from_event_loop — Slint only has to rebuild VecModels.
+struct PreBuiltOutput {
+    spans: Vec<TermSpan>,
+    cursor_row: i32,
+    cursor_col: i32,
+    rows_used: i32,
+    is_alt: bool,
+    scroll_max: i32,
+    scroll_offset: i32,
+    matches: Vec<TermMatch>,
+    sel: Vec<TermMatch>,
 }
 
 /// One coloured run within a line (its grid row is assigned at render time).
