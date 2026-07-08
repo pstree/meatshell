@@ -710,7 +710,9 @@ pub fn run() -> Result<()> {
         window.set_sftp_dock(s.sftp_dock().into());
         window.set_welcome_as_sidebar(s.welcome_as_sidebar());
         window.set_welcome_sidebar_width(s.welcome_sidebar_width());
+        window.set_welcome_sidebar_dock(welcome_sidebar_dock.into());
         window.set_welcome_collapsed(welcome_collapsed);
+        window.set_sidebar_collapsed(sidebar_collapsed);
         window.set_wallpaper_overlay(s.wallpaper_overlay());
         window.set_update_check_enabled(s.update_check_enabled()); // #184
         if collapse_sidebar {
@@ -5399,6 +5401,33 @@ fn wire_tab_callbacks(
         );
     }
 
+    // Merge a split pane back into another pane. The source pane's tabs are
+    // appended to the first remaining pane, then the emptied source collapses.
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_merge(move |pane_id: i32| {
+            {
+                let mut lay = layout.borrow_mut();
+                lay.merge_leaf_into_other(pane_id as u64);
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+
     // Drag-to-split: while a tab is dragged over the pane area, highlight the
     // drop zone the cursor is in (an edge band → split, the middle → move).
     {
@@ -5860,6 +5889,68 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
 
     // Context menu → 查看 (read-only) / 编辑 (editable). Both load the file's
     // text into the built-in editor instead of an external app (#70).
+    // SFTP remote-to-remote copy (#203): stage through a local temp directory,
+    // then upload into the target session's current SFTP directory.
+    {
+        let sftp_handles = sftp_handles.clone();
+        let weak = window.as_weak();
+        window.on_sftp_copy_to_target(
+            move |tab_id: SharedString, remote_path: SharedString, target_id: SharedString| {
+                let Some(w) = weak.upgrade() else { return };
+                let paths = vec![remote_path.to_string()];
+                let dirs = terminal_sftp_paths(&w);
+                let target_dir = dirs
+                    .get(target_id.as_str())
+                    .cloned()
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or_else(|| "/".to_string());
+                if let Ok(handles) = sftp_handles.lock() {
+                    let Some(src) = handles.get(tab_id.as_str()) else {
+                        return;
+                    };
+                    let Some(dst) = handles.get(target_id.as_str()) else {
+                        return;
+                    };
+                    src.copy_to(paths, dst.commands.clone(), target_dir);
+                    w.set_download_open(true);
+                }
+            },
+        );
+    }
+    {
+        let sftp_handles = sftp_handles.clone();
+        let weak = window.as_weak();
+        window.on_sftp_copy_selected_to_target(
+            move |tab_id: SharedString, target_id: SharedString| {
+                let Some(w) = weak.upgrade() else { return };
+                let terminals = w.get_terminals();
+                let Some(tm) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() else {
+                    return;
+                };
+                let paths = collect_sftp_selected(tm, tab_id.as_str());
+                if paths.is_empty() {
+                    return;
+                }
+                let dirs = terminal_sftp_paths(&w);
+                let target_dir = dirs
+                    .get(target_id.as_str())
+                    .cloned()
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or_else(|| "/".to_string());
+                if let Ok(handles) = sftp_handles.lock() {
+                    let Some(src) = handles.get(tab_id.as_str()) else {
+                        return;
+                    };
+                    let Some(dst) = handles.get(target_id.as_str()) else {
+                        return;
+                    };
+                    src.copy_to(paths, dst.commands.clone(), target_dir);
+                    w.set_download_open(true);
+                }
+                clear_sftp_selection(tm, tab_id.as_str());
+            },
+        );
+    }
     {
         let sftp_handles = sftp_handles.clone();
         window.on_sftp_view(move |tab_id: SharedString, path: SharedString| {
@@ -6140,34 +6231,36 @@ fn wire_key_input(
         let handles_rc = handles.clone();
         let store_rc = store.clone();
         let weak = window.as_weak();
-        window.on_run_command(move |tab_id: SharedString, cmd: SharedString, to_all: bool, send_enter: bool| {
-            let line = cmd.trim_end().to_string();
-            if line.is_empty() {
-                return;
-            }
-            let mut bytes = line.clone().into_bytes();
-            if send_enter {
-                bytes.push(b'\n');
-            }
-            {
-                let h = handles_rc.borrow();
-                if to_all {
-                    for handle in h.values() {
-                        handle.send_raw(bytes.clone());
-                    }
-                } else if let Some(handle) = h.get(tab_id.as_str()) {
-                    handle.send_raw(bytes);
+        window.on_run_command(
+            move |tab_id: SharedString, cmd: SharedString, to_all: bool, send_enter: bool| {
+                let line = cmd.trim_end().to_string();
+                if line.is_empty() {
+                    return;
                 }
-            }
-            {
-                let mut s = store_rc.borrow_mut();
-                s.push_command_history(line);
-                let _ = s.save();
-            }
-            if let Some(w) = weak.upgrade() {
-                w.set_command_history(history_model(&store_rc.borrow()));
-            }
-        });
+                let mut bytes = line.clone().into_bytes();
+                if send_enter {
+                    bytes.push(b'\n');
+                }
+                {
+                    let h = handles_rc.borrow();
+                    if to_all {
+                        for handle in h.values() {
+                            handle.send_raw(bytes.clone());
+                        }
+                    } else if let Some(handle) = h.get(tab_id.as_str()) {
+                        handle.send_raw(bytes);
+                    }
+                }
+                {
+                    let mut s = store_rc.borrow_mut();
+                    s.push_command_history(line);
+                    let _ = s.save();
+                }
+                if let Some(w) = weak.upgrade() {
+                    w.set_command_history(history_model(&store_rc.borrow()));
+                }
+            },
+        );
     }
     // Copy a history command to the clipboard (#96).
     {
@@ -6816,8 +6909,7 @@ fn wire_key_input(
                 slint::TimerMode::SingleShot,
                 std::time::Duration::from_millis(150),
                 move || {
-                    let settled: Vec<(String, (u32, u32))> =
-                        pending.borrow_mut().drain().collect();
+                    let settled: Vec<(String, (u32, u32))> = pending.borrow_mut().drain().collect();
                     for (tab, (cols, rows)) in settled {
                         tracing::debug!("terminal_resize tab={} cols={} rows={}", tab, cols, rows);
                         apply_terminal_resize(&handles, &bufs, &last, &tab, cols, rows);
@@ -7699,12 +7791,18 @@ fn split_proxy(url: &str) -> (String, String) {
     let lower = s.to_ascii_lowercase();
     for p in ["http://", "https://"] {
         if lower.starts_with(p) {
-            return ("http".to_string(), s[p.len()..].trim_end_matches('/').to_string());
+            return (
+                "http".to_string(),
+                s[p.len()..].trim_end_matches('/').to_string(),
+            );
         }
     }
     for p in ["socks5h://", "socks5://", "socks://"] {
         if lower.starts_with(p) {
-            return ("socks5".to_string(), s[p.len()..].trim_end_matches('/').to_string());
+            return (
+                "socks5".to_string(),
+                s[p.len()..].trim_end_matches('/').to_string(),
+            );
         }
     }
     ("socks5".to_string(), s.trim_end_matches('/').to_string())
