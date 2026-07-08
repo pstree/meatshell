@@ -246,7 +246,7 @@ export component TabBar inherits Rectangle {
         Rectangle { width: root.reserve-right; }
     }
 
-    // Scroll arrows — absolute overlays (NOT layout items) so toggling them can't
+    // Scroll arrows are absolute overlays so toggling them can't
     // change the layout that `tab-overflow` reads (avoids a binding loop). Shown
     // only on overflow, masking the edge tab beneath them (#122).
     if root.tab-overflow : Rectangle {
@@ -255,7 +255,7 @@ export component TabBar inherits Rectangle {
         width: 26px; height: 26px;
         background: Theme.bg-panel-alt;
         IconButton {
-            glyph: "‹"; size: 24px;
+            glyph: "<"; size: 24px;
             clicked => { flick.viewport-x = min(0px, flick.viewport-x + 120px); }
         }
     }
@@ -265,7 +265,7 @@ export component TabBar inherits Rectangle {
         width: 26px; height: 26px;
         background: Theme.bg-panel-alt;
         IconButton {
-            glyph: "›"; size: 24px;
+            glyph: ">"; size: 24px;
             clicked => {
                 flick.viewport-x = max(flick.width - flick.viewport-width, flick.viewport-x - 120px);
             }
@@ -273,7 +273,7 @@ export component TabBar inherits Rectangle {
     }
 
     // Right-click context menu (v0.5): split this pane by peeling the clicked tab
-    // into a new pane. Splitting needs ≥2 tabs so the source pane survives.
+    // into a new pane. Splitting needs at least two tabs so the source pane survives.
     tab-menu := PopupWindow {
         x: root.menu-x;
         y: root.menu-y;

@@ -2163,9 +2163,10 @@ fn wire_session_callbacks(
                 let mut s = store.borrow_mut();
                 for sess in parsed {
                     // Skip a host/user/port we already have.
-                    let dup = s.sessions().iter().any(|x| {
-                        x.host == sess.host && x.user == sess.user && x.port == sess.port
-                    });
+                    let dup = s
+                        .sessions()
+                        .iter()
+                        .any(|x| x.host == sess.host && x.user == sess.user && x.port == sess.port);
                     if dup {
                         continue;
                     }

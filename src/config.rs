@@ -166,6 +166,54 @@ fn migrate_legacy(legacy: &Path, portable: &Path) {
     }
 }
 
+fn sessions_file_has_connections(path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<ConfigFile>(&raw)
+        .map(|cfg| !cfg.sessions.is_empty())
+        .unwrap_or(false)
+}
+
+fn restore_user_backup_if_needed(primary_dir: &Path, backup_dir: &Path) {
+    if primary_dir == backup_dir {
+        return;
+    }
+    let primary_sessions = primary_dir.join("sessions.json");
+    let backup_sessions = backup_dir.join("sessions.json");
+    if sessions_file_has_connections(&primary_sessions)
+        || !sessions_file_has_connections(&backup_sessions)
+    {
+        return;
+    }
+    let _ = fs::create_dir_all(primary_dir);
+    for name in ["sessions.json", "secret.key", "known_hosts"] {
+        let src = backup_dir.join(name);
+        let dst = primary_dir.join(name);
+        if src.exists() {
+            match fs::copy(&src, &dst) {
+                Ok(_) => {
+                    #[cfg(unix)]
+                    if name == "secret.key" {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o600));
+                    }
+                    tracing::info!(
+                        "restored {name} from user config backup {}",
+                        backup_dir.display()
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    "failed to restore {} from {} to {}: {e}",
+                    name,
+                    src.display(),
+                    dst.display()
+                ),
+            }
+        }
+    }
+}
+
 /// A secret string (e.g. a session password) whose heap buffer is zeroed when
 /// it is dropped, so plaintext credentials don't survive in freed memory and
 /// turn up in core dumps, a debugger, or `/proc/<pid>/mem`.  `Clone` makes an
@@ -265,8 +313,8 @@ fn default_parity() -> String {
 fn default_wallpaper() -> String {
     // Serde default for the `wallpaper` field: kept at the old "幻想 3048" so an
     // *existing* config that predates the field stays on tech — `migrate_defaults`
-    // then upgrades those still-on-tech users to miku (and leaves real choices
-    // alone). Brand-new installs get miku straight from `fresh_config`.
+    // then advances default-following users through the migration chain. Brand-new
+    // installs get the current default straight from `fresh_config`.
     "builtin:tech".to_string()
 }
 
@@ -277,7 +325,7 @@ const DEFAULT_WALLPAPER_TRANSPARENCY: f32 = 0.38;
 const DEFAULT_WALLPAPER_OVERLAY: f32 = 1.0 - DEFAULT_WALLPAPER_TRANSPARENCY;
 
 /// A brand-new config (no file yet, or the old one was corrupt). Seeds the
-/// new-user default layout (#new-user-defaults): miku wallpaper, welcome page as
+/// new-user default layout (#new-user-defaults): ms wallpaper, welcome page as
 /// a left sidebar, resource panel docked right, 38% wallpaper transparency, and
 /// marks the migration done so it isn't re-applied.
 fn fresh_config() -> ConfigFile {
@@ -304,7 +352,7 @@ fn migrate_defaults(cfg: &mut ConfigFile) -> bool {
         // Old default wallpaper → miku. A custom path, "none" (""), or any other
         // built-in means the user chose it, so leave it.
         if cfg.wallpaper == "builtin:tech" {
-            cfg.wallpaper = "builtin:dark".to_string();
+            cfg.wallpaper = "builtin:miku".to_string();
         }
         // Overlay still unset (0 = "use the 0.86 default") -> v0.5 default.
         if cfg.wallpaper_overlay <= 0.0 {
@@ -663,6 +711,7 @@ struct ExportFile {
 
 pub struct ConfigStore {
     path: PathBuf,
+    backup_dir: Option<PathBuf>,
     cache: ConfigFile,
     /// ChaCha20-Poly1305 key loaded from (or freshly generated into)
     /// `secret.key` in the same directory as `sessions.json`.
@@ -779,6 +828,11 @@ impl ConfigStore {
         fs::create_dir_all(&config_dir)
             .with_context(|| format!("failed to create config dir {}", config_dir.display()))?;
 
+        let backup_dir = legacy_data_dir().filter(|dir| dir != &config_dir);
+        if let Some(ref backup) = backup_dir {
+            restore_user_backup_if_needed(&config_dir, backup);
+        }
+
         let key = Self::load_or_create_key(&config_dir)?;
 
         let mut migrated = false;
@@ -824,7 +878,12 @@ impl ConfigStore {
             fresh_config()
         };
 
-        let store = Self { path, cache, key };
+        let store = Self {
+            path,
+            backup_dir,
+            cache,
+            key,
+        };
         // Persist the migration so it runs exactly once (and so a later opt-out —
         // e.g. turning the welcome sidebar back off — isn't reverted next launch).
         if migrated {
@@ -1374,7 +1433,57 @@ impl ConfigStore {
         }
         fs::rename(&tmp, &self.path)
             .with_context(|| format!("failed to finalise {}", self.path.display()))?;
+        self.sync_backup(&raw);
         Ok(())
+    }
+
+    fn sync_backup(&self, raw: &str) {
+        let Some(backup_dir) = &self.backup_dir else {
+            return;
+        };
+        if let Err(e) = fs::create_dir_all(backup_dir) {
+            tracing::warn!(
+                "failed to create user config backup dir {}: {e}",
+                backup_dir.display()
+            );
+            return;
+        }
+
+        let backup_sessions = backup_dir.join("sessions.json");
+        let tmp = backup_sessions.with_extension("json.tmp");
+        if let Err(e) = fs::write(&tmp, raw) {
+            tracing::warn!("failed to write {}: {e}", tmp.display());
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
+        if let Err(e) = fs::rename(&tmp, &backup_sessions) {
+            tracing::warn!("failed to finalise {}: {e}", backup_sessions.display());
+        }
+
+        if let Some(config_dir) = self.path.parent() {
+            for name in ["secret.key", "known_hosts"] {
+                let src = config_dir.join(name);
+                let dst = backup_dir.join(name);
+                if src.exists() {
+                    if let Err(e) = fs::copy(&src, &dst) {
+                        tracing::warn!(
+                            "failed to sync {} to user config backup {}: {e}",
+                            src.display(),
+                            dst.display()
+                        );
+                    }
+                    #[cfg(unix)]
+                    if name == "secret.key" {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
+        }
     }
 
     // ── Portable export / import (issue #46) ──────────────────────────────
@@ -1498,9 +1607,69 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ms-test-{}.json", Uuid::new_v4()));
         ConfigStore {
             path,
+            backup_dir: None,
             cache: ConfigFile::default(),
             key: [7u8; 32],
         }
+    }
+
+    fn sample_session(name: &str) -> Session {
+        Session {
+            name: name.into(),
+            host: "192.168.100.2".into(),
+            port: 22,
+            user: "root".into(),
+            ..Session::new_empty()
+        }
+    }
+
+    #[test]
+    fn restores_and_syncs_user_config_backup() {
+        let base = std::env::temp_dir().join(format!("ms-backup-{}", Uuid::new_v4()));
+        let primary = base.join("portable");
+        let backup = base.join("user");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&backup).unwrap();
+
+        let backup_cfg = ConfigFile {
+            sessions: vec![sample_session("saved")],
+            ..ConfigFile::default()
+        };
+        std::fs::write(
+            backup.join("sessions.json"),
+            serde_json::to_string_pretty(&backup_cfg).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(backup.join("secret.key"), [9u8; 32]).unwrap();
+
+        restore_user_backup_if_needed(&primary, &backup);
+        assert!(sessions_file_has_connections(
+            &primary.join("sessions.json")
+        ));
+        assert_eq!(
+            std::fs::read(primary.join("secret.key")).unwrap(),
+            [9u8; 32]
+        );
+
+        let store = ConfigStore {
+            path: primary.join("sessions.json"),
+            backup_dir: Some(backup.clone()),
+            cache: ConfigFile {
+                sessions: vec![sample_session("new")],
+                ..ConfigFile::default()
+            },
+            key: [7u8; 32],
+        };
+        std::fs::write(primary.join("secret.key"), [7u8; 32]).unwrap();
+        store.save().unwrap();
+
+        let raw = std::fs::read_to_string(backup.join("sessions.json")).unwrap();
+        let cfg: ConfigFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(cfg.sessions.len(), 1);
+        assert_eq!(cfg.sessions[0].name, "new");
+        assert_eq!(std::fs::read(backup.join("secret.key")).unwrap(), [7u8; 32]);
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1516,6 +1685,14 @@ mod tests {
         // A custom choice is preserved.
         let cfg: ConfigFile = serde_json::from_str(r#"{"wallpaper":"builtin:light"}"#).unwrap();
         assert_eq!(cfg.wallpaper, "builtin:light");
+
+        let mut cfg = ConfigFile {
+            wallpaper: "builtin:miku".to_string(),
+            defaults_rev: DEFAULTS_REV,
+            ..ConfigFile::default()
+        };
+        assert!(!migrate_defaults(&mut cfg));
+        assert_eq!(cfg.wallpaper, "builtin:miku");
     }
 
     #[test]
