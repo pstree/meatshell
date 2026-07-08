@@ -1,7 +1,91 @@
 # Changelog / 更新日志
 
 All notable changes are documented here. 本文件记录所有重要变更。
-中英对照（English first, 中文在后）.
+中英对照（中文在前，English after）.
+
+## [0.5.7] - 2026-07-08
+
+### 新增 / Added
+
+- **新增默认壁纸 MS (#231)。** 新用户首次启动默认使用 `assets/ms.jpg` 作为壁纸；已有用户配置不会被迁移或覆盖，保留原本的壁纸选择。
+
+### 改进 / Changed
+
+- **优化标签页标题显示与复制 (#228)。** 标签页宽度会按标题显示宽度动态调整，中文等非 ASCII 字符按双宽估算，长标题会适当缩小字号以减少截断；移除悬浮提示以避免影响顶部拖动交互，单击标签页可复制完整标题。
+- **优化壁纸设置面板滚动。** 内置壁纸列表过宽时会在设置面板内横向滚动，避免缩放或窗口较窄时壁纸选项溢出。
+- **欢迎页作为侧栏时隐藏空会话提示。** 开启“欢迎页为侧栏”后，不再在主区域显示“从左侧选择一个会话开始”，避免提示遮挡壁纸和主界面。
+
+### 修复 / Fixed
+
+- **修复版本号与发布校验问题 (#226, #229, #236)。** 命令行支持 `--version` / `-V`，发布脚本与工作流会校验 Cargo 版本、锁文件版本和产物版本，避免再次发布版本号不一致的构建。
+- **修复程序目录配置被卸载删除后连接丢失的问题。** 启动时如果程序目录配置没有连接，会从用户目录配置副本恢复 `sessions.json`、`secret.key` 和 `known_hosts`；后续保存会同步写入程序目录和用户目录两份配置，降低更新/卸载误删风险。
+- **修复串口历史输出搜索不到的问题 (#233)。** 当前可见行没有命中时会继续搜索 scrollback 历史，找到匹配后自动滚动到对应位置并重绘高亮。
+- **修复 Windows 无边框窗口恢复后超出屏幕的问题 (#234)。** 启动与保存布局时按当前显示器尺寸钳制窗口大小，并读取 native 最大化状态，避免 Win11 下恢复到大于屏幕的窗口尺寸。
+
+---
+
+### Added
+
+- **Add MS as the default wallpaper (#231).** New users now start with `assets/ms.jpg` as the default wallpaper; existing user configurations are not migrated or overwritten.
+
+### Changed
+
+- **Improve tab title display and copy (#228).** Tab widths now adapt to the title's display width, counting Chinese and other non-ASCII characters as double width, and long titles use a smaller font to reduce truncation. Hover tooltips were removed to avoid interfering with top-bar drag interactions, while clicking a tab copies the full title.
+- **Improve scrolling in wallpaper settings.** Built-in wallpaper choices now scroll horizontally inside the settings panel instead of overflowing on smaller or scaled windows.
+- **Hide the empty-session prompt when the welcome page is docked as a sidebar.** The main pane no longer shows "Select a session from the left to start" when the welcome sidebar is already visible.
+
+### Fixed
+
+- **Fix version and release validation issues (#226, #229, #236).** The CLI supports `--version` / `-V`, and release scripts/workflows validate Cargo versions, lockfile versions, and built artifact versions to prevent mismatched releases.
+- **Recover connections when the program-directory config was removed during uninstall/update.** If the program config has no connections, startup restores `sessions.json`, `secret.key`, and `known_hosts` from the user config backup; future saves write both the program directory and user directory copies.
+- **Fix searching serial scrollback history (#233).** When no visible row matches, search continues through scrollback history, scrolls to the first match, and redraws highlights.
+- **Clamp restored frameless windows to the current monitor on Windows (#234).** Startup and layout saving now clamp window size to the visible monitor and read the native maximized state, preventing Win11 restores from exceeding the screen.
+
+## [0.5.6] - 2026-07-06
+
+### 修复 / Fixed
+
+- **修复分屏终端在右侧资源面板展开时被错误压缩到 10 列。** 显式绑定分屏内容区尺寸，并仅在终端视图拥有真实布局尺寸后才上报 resize，避免右侧资源面板展开时的瞬时 0 宽布局被折算成 10 列，导致右侧终端内容异常换行。
+
+---
+
+### Fixed
+
+- **Avoid transient 10-column terminal resize in split panes.** Explicitly size the split-pane content area and only report terminal resize events after the terminal view has a real layout size. This prevents right resource panel changes from turning a transient zero-width layout into a 10-column terminal resize.
+
+## [0.5.5] - 2026-07-05
+
+### 新增 / Added
+
+- **支持分屏合并 (#216)。** 标签页右键菜单新增「Merge panes」，可将当前分屏的所有标签合并到其它 pane，并自动折叠空分屏。
+- **支持拖到标签栏合并分屏。** 像 IDEA 一样，将某个分屏里的标签拖到另一个分屏的标签栏后释放，即可把标签移入目标标签组；源分屏移空后会自动合并回单窗口。
+
+### 改进 / Changed
+
+- **优化当前标签页识别度 (#200)。** 暗色模式下当前标签页使用更明确的层级底色；开启壁纸时会从壁纸取色，让标签栏更沉浸。
+- **标签页关闭按钮固定在右侧。** 短标签名不再把关闭按钮挤到中间，所有标签的关闭入口位置保持一致。
+- **关闭确认弹窗按钮接入主题色。** 关闭应用确认弹窗不再使用系统默认蓝色按钮，主按钮会跟随主题和壁纸取色。
+
+### 修复 / Fixed
+
+- **修复 less 搜索高亮不可见 (#217)。** 正确处理默认前景/背景色下的 reverse-video 反色序列，使 `less` 中 `/` 或 `?` 搜索命中能够正常显示高亮。
+
+---
+
+### Added
+
+- **Split-pane merging (#216).** The tab context menu now includes "Merge panes", moving all tabs from the current split pane into another pane and collapsing the emptied pane automatically.
+- **Drag-to-tab-strip pane merge.** Like IDEA, dragging a tab from one split pane onto another pane's tab strip moves it into that tab group; if the source pane becomes empty, it collapses back into a single window.
+
+### Changed
+
+- **Improve active-tab visibility (#200).** Dark mode now gives the active tab a clearer surface level, while wallpaper mode derives the active-tab colour from the wallpaper for a more immersive look.
+- **Pin tab close buttons to the right edge.** Short tab names no longer pull the close button toward the middle, keeping the close affordance aligned across tabs.
+- **Theme the close-confirmation buttons.** The app-close confirmation dialog now uses themed buttons instead of the platform-default blue button, so the primary action follows the current theme and wallpaper accent.
+
+### Fixed
+
+- **Fix invisible `less` search highlights (#217).** Reverse-video sequences with default foreground/background colours now render a visible background, so `/` and `?` matches in `less` are highlighted correctly.
 
 ## [0.5.4] - 2026-07-04
 

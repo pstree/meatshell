@@ -641,7 +641,7 @@ pub struct ConfigFile {
     pub update_check_disabled: bool,
     /// One-time default-layout migration marker (#new-user-defaults). 0 = config
     /// predates the migration. `migrate_defaults` bumps it to `DEFAULTS_REV` after
-    /// pushing the new look (miku wallpaper / welcome-as-sidebar / right-docked
+    /// pushing the new look (default wallpaper / welcome-as-sidebar / right-docked
     /// resource panel / wallpaper overlay) to users still sitting on old defaults.
     #[serde(default)]
     pub defaults_rev: u32,

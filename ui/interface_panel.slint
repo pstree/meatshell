@@ -204,7 +204,7 @@ export component InterfacePanel inherits Rectangle {
     property <bool> wp-is-custom:
         root.current-wallpaper != "" && root.current-wallpaper != "builtin:light"
         && root.current-wallpaper != "builtin:dark" && root.current-wallpaper != "builtin:tech"
-        && root.current-wallpaper != "builtin:miku";
+        && root.current-wallpaper != "builtin:miku" && root.current-wallpaper != "builtin:ms";
 
     callback set-term-font(string);
     callback set-term-font-size(int);

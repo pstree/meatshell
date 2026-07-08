@@ -274,6 +274,7 @@ export component AppWindow inherits Window {
     callback win-drag();          // start an OS window-move
     callback win-resize(int);     // start an OS resize; arg = direction code
     in-out property <bool> sidebar-collapsed: false; // left panel hidden
+    callback set-sidebar-collapsed(bool);       // apply + persist
     // User-draggable size of the resource sidebar. width is used when docked
     // left/right, height when docked top/bottom. Seeded / persisted via the
     // persist-* callbacks (fired on drag end).
@@ -419,6 +420,12 @@ export component AppWindow inherits Window {
     // Drag-resizable width of that welcome sidebar (logical px), persisted.
     in-out property <length> welcome-sidebar-width: 240px;
     callback persist-welcome-sidebar-width(float);
+    in-out property <string> welcome-sidebar-dock: "left";
+    property <bool> welcome-sidebar-horizontal:
+        root.welcome-sidebar-dock == "left" || root.welcome-sidebar-dock == "right";
+    property <length> welcome-sidebar-taken:
+        root.welcome-collapsed ? 36px : root.welcome-sidebar-width;
+    callback persist-welcome-sidebar-dock(string);
     // Welcome sidebar collapsed to the edge icon strip (IDEA-style), persisted.
     in-out property <bool> welcome-collapsed: false;
     callback set-welcome-collapsed(bool);          // apply + persist
@@ -481,6 +488,17 @@ export component AppWindow inherits Window {
     // Mirror SFTP uploads to other sessions while sync-input is on (#sync).
     in-out property <bool> sync-upload-enabled: false;
     callback set-sync-upload-enabled(bool);
+    // WebDAV config sync (#185): manual upload/download of portable session JSON.
+    in-out property <bool> webdav-enabled: false;
+    in-out property <string> webdav-url;
+    in-out property <string> webdav-username;
+    in-out property <string> webdav-password;
+    in-out property <string> webdav-remote-path;
+    in-out property <bool> webdav-accept-invalid-certs: false;
+    in-out property <string> webdav-status;
+    callback save-webdav-settings(bool, string, string, string, string, bool);
+    callback webdav-upload();
+    callback webdav-download();
     in-out property <length> sftp-panel-height: 220px; // shared; lets Rust locate the drop zone
     in-out property <length> sftp-panel-width: 380px;  // SFTP extent when docked left/right
     in-out property <string> sftp-dock: "bottom";      // SFTP dock edge, shared across tabs
@@ -800,9 +818,20 @@ export component AppWindow inherits Window {
         // right in `rest`.
         // Collapsed-only (M5): the icon strip shows only while collapsed; the
         // panel itself (welcome-w) only while expanded — one or the other.
+        property <bool> sidebar-strip-outside:
+            root.welcome-as-sidebar && !root.welcome-collapsed
+            && root.sidebar-collapsed && root.sidebar-dock == root.welcome-sidebar-dock;
+        property <length> sidebar-outside-strip: dock-area.sidebar-strip-outside ? 36px : 0px;
+        property <length> welcome-strip: (root.welcome-as-sidebar && root.welcome-collapsed) ? 36px : 0px;
+        property <length> welcome-size: (root.welcome-as-sidebar && !root.welcome-collapsed) ? root.welcome-sidebar-width : 0px;
+        property <length> welcome-taken: welcome-strip + welcome-size + sidebar-outside-strip;
+        property <bool> welcome-horizontal: root.welcome-sidebar-horizontal;
         property <length> strip-w: (root.welcome-as-sidebar && root.welcome-collapsed) ? 36px : 0px;
         property <length> welcome-w: (root.welcome-as-sidebar && !root.welcome-collapsed) ? root.welcome-sidebar-width : 0px;
         property <bool> welcome-sidebar-dragging;
+        property <bool> combine-collapsed-tools:
+            root.welcome-as-sidebar && root.welcome-collapsed
+            && root.sidebar-collapsed && root.sidebar-dock == root.welcome-sidebar-dock;
 
         // Collapsed welcome → a thin left icon strip (click the icon to re-open).
         if root.welcome-as-sidebar && root.welcome-collapsed : ToolStrip {

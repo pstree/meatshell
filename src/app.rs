@@ -7,8 +7,9 @@
 //!   * Route Slint callbacks to the right domain module.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Per-terminal state: vt100 parser drives all rendering for both normal
@@ -58,6 +59,10 @@ struct TermBuffer {
 
 /// How much of the byte stream we retain per tab for resize-reflow (#169).
 const RAW_CAP: usize = 2 * 1024 * 1024;
+
+/// Max bytes merged into one Output event before starting a fresh chunk (#209).
+/// Keeps a single UI callback from spending hundreds of ms in vt100 ingest.
+const OUTPUT_MERGE_BYTE_CAP: usize = 64 * 1024;
 
 /// Minimal CSI-final-byte rewriter state (persists across read chunks).
 #[derive(Clone, Copy, PartialEq)]
@@ -551,9 +556,25 @@ pub fn run() -> Result<()> {
     }
     {
         let store = store.clone();
+        window.on_set_sidebar_collapsed(move |v| {
+            let mut s = store.borrow_mut();
+            s.set_sidebar_collapsed(v);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
         window.on_persist_welcome_sidebar_width(move |w| {
             let mut s = store.borrow_mut();
             s.set_welcome_sidebar_width(w);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
+        window.on_persist_welcome_sidebar_dock(move |dock| {
+            let mut s = store.borrow_mut();
+            s.set_welcome_sidebar_dock(dock.to_string());
             let _ = s.save();
         });
     }
@@ -594,6 +615,85 @@ pub fn run() -> Result<()> {
         });
     }
 
+    // WebDAV config sync (#185): manual upload/download of the portable session
+    // export JSON. It is intentionally not automatic on startup.
+    {
+        let s = store.borrow();
+        window.set_webdav_enabled(s.webdav_enabled());
+        window.set_webdav_url(s.webdav_url().into());
+        window.set_webdav_username(s.webdav_username().into());
+        window.set_webdav_password(s.webdav_password().into());
+        window.set_webdav_remote_path(s.webdav_remote_path().into());
+        window.set_webdav_accept_invalid_certs(s.webdav_accept_invalid_certs());
+        window.set_webdav_status(String::new().into());
+    }
+    {
+        let store = store.clone();
+        window.on_save_webdav_settings(
+            move |enabled: bool,
+                  url: SharedString,
+                  username: SharedString,
+                  password: SharedString,
+                  remote_path: SharedString,
+                  accept_invalid_certs: bool| {
+                let mut s = store.borrow_mut();
+                s.set_webdav_settings(
+                    enabled,
+                    url.to_string(),
+                    username.to_string(),
+                    password.to_string(),
+                    remote_path.to_string(),
+                    accept_invalid_certs,
+                );
+                let _ = s.save();
+            },
+        );
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_webdav_upload(move || {
+            let Some(w) = weak.upgrade() else { return };
+            let enabled = w.get_webdav_enabled();
+            let url = w.get_webdav_url().to_string();
+            let username = w.get_webdav_username().to_string();
+            let password = w.get_webdav_password().to_string();
+            let remote_path = w.get_webdav_remote_path().to_string();
+            let accept_invalid_certs = w.get_webdav_accept_invalid_certs();
+            {
+                let mut s = store.borrow_mut();
+                s.set_webdav_settings(
+                    enabled,
+                    url.clone(),
+                    username.clone(),
+                    password.clone(),
+                    remote_path.clone(),
+                    accept_invalid_certs,
+                );
+                let _ = s.save();
+            }
+            if !enabled {
+                w.set_webdav_status(t("请先启用 WebDAV 同步", "enable WebDAV sync first").into());
+                return;
+            }
+            let res = store.borrow().export_json().and_then(|(json, count)| {
+                webdav_put_json(
+                    &url,
+                    &remote_path,
+                    &username,
+                    &password,
+                    accept_invalid_certs,
+                    json,
+                )
+                .map(|_| count)
+            });
+            let msg = match res {
+                Ok(n) => format!("{} {}", t("已上传连接", "uploaded connections"), n),
+                Err(e) => format!("{}: {}", t("上传失败", "upload failed"), e),
+            };
+            w.set_webdav_status(msg.into());
+        });
+    }
     // Interface settings: apply + persist the terminal font family / size.
     {
         let weak = window.as_weak();
@@ -703,6 +803,58 @@ pub fn run() -> Result<()> {
     let sessions_model: Rc<VecModel<SessionInfo>> = Rc::new(VecModel::default());
     window.set_sessions(ModelRc::from(sessions_model.clone()));
     sync_sessions_to_model(&store.borrow(), &sessions_model);
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let sessions_model = sessions_model.clone();
+        window.on_webdav_download(move || {
+            let Some(w) = weak.upgrade() else { return };
+            let enabled = w.get_webdav_enabled();
+            let url = w.get_webdav_url().to_string();
+            let username = w.get_webdav_username().to_string();
+            let password = w.get_webdav_password().to_string();
+            let remote_path = w.get_webdav_remote_path().to_string();
+            let accept_invalid_certs = w.get_webdav_accept_invalid_certs();
+            {
+                let mut s = store.borrow_mut();
+                s.set_webdav_settings(
+                    enabled,
+                    url.clone(),
+                    username.clone(),
+                    password.clone(),
+                    remote_path.clone(),
+                    accept_invalid_certs,
+                );
+                let _ = s.save();
+            }
+            if !enabled {
+                w.set_webdav_status(t("请先启用 WebDAV 同步", "enable WebDAV sync first").into());
+                return;
+            }
+            let res = webdav_get_json(
+                &url,
+                &remote_path,
+                &username,
+                &password,
+                accept_invalid_certs,
+            )
+            .and_then(|json| store.borrow_mut().import_json(&json));
+            let msg = match res {
+                Ok((added, skipped)) => {
+                    sync_sessions_to_model(&store.borrow(), &sessions_model);
+                    format!(
+                        "{} {}, {} {}",
+                        t("已导入", "imported"),
+                        added,
+                        t("跳过", "skipped"),
+                        skipped
+                    )
+                }
+                Err(e) => format!("{}: {}", t("下载失败", "download failed"), e),
+            };
+            w.set_webdav_status(msg.into());
+        });
+    }
 
     let tabs_model: Rc<VecModel<TabInfo>> = Rc::new(VecModel::default());
     tabs_model.push(TabInfo {
@@ -3683,7 +3835,9 @@ fn apply_session_event_to_window(
         let panes = win.get_panes();
         if let Some(pm) = panes.as_any().downcast_ref::<VecModel<PaneInfo>>() {
             for pi in 0..pm.row_count() {
-                let Some(pane) = pm.row_data(pi) else { continue };
+                let Some(pane) = pm.row_data(pi) else {
+                    continue;
+                };
                 let Some(tm) = pane.tabs.as_any().downcast_ref::<VecModel<TabInfo>>() else {
                     continue;
                 };
@@ -3843,9 +3997,7 @@ fn apply_session_event_to_window(
                     selected: false,
                 })
                 .collect();
-            let model = ModelRc::from(
-                std::rc::Rc::new(VecModel::from(slint_entries)),
-            );
+            let model = ModelRc::from(std::rc::Rc::new(VecModel::from(slint_entries)));
             update_terminal(&|t| {
                 t.sftp_path = path.clone().into();
                 t.sftp_entries = model.clone();
@@ -3934,7 +4086,13 @@ fn apply_session_event_to_window(
         } => {
             let detail = match state {
                 // On error, show the actual message when we have one.
-                2 => if msg.is_empty() { t("失败", "Failed").to_string() } else { msg },
+                2 => {
+                    if msg.is_empty() {
+                        t("失败", "Failed").to_string()
+                    } else {
+                        msg
+                    }
+                }
                 1 => t("已完成", "Done").to_string(),
                 // Remote-side prep (e.g. tar packing) before bytes start flowing (#100).
                 3 => t("文件准备中", "Preparing...").to_string(),
@@ -4975,11 +5133,7 @@ fn wire_tab_callbacks(
 // SFTP callbacks
 // ---------------------------------------------------------------------------
 
-fn wire_sftp_callbacks(
-    window: &AppWindow,
-    sftp_handles: SftpHandles,
-    sftp_last_cwd: SftpLastCwd,
-) {
+fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_cwd: SftpLastCwd) {
     // Navigate to a remote path (or ".." to go up one level).
     {
         let sftp_handles = sftp_handles.clone();
@@ -5422,11 +5576,8 @@ fn wire_sftp_callbacks(
                 };
                 match kind.as_str() {
                     "rename" => {
-                        let to = format!(
-                            "{}/{}",
-                            parent_path(&target).trim_end_matches('/'),
-                            value
-                        );
+                        let to =
+                            format!("{}/{}", parent_path(&target).trim_end_matches('/'), value);
                         h.rename(target, to);
                     }
                     "mkdir" => {
@@ -5737,14 +5888,16 @@ fn wire_key_input(
         let weak = window.as_weak();
         let collapsed = collapsed_quick_groups.clone();
         window.on_add_quick_command(
-            move |name: SharedString, command: SharedString, group: SharedString, send_enter: bool| {
+            move |name: SharedString,
+                  command: SharedString,
+                  group: SharedString,
+                  send_enter: bool| {
                 let name = name.trim().to_string();
                 let command = command.to_string();
                 let group = group.trim().to_string();
                 if name.is_empty() || command.trim().is_empty() {
                     return;
                 }
-                let group = if group.eq_ignore_ascii_case("default") { String::new() } else { group };
                 {
                     let mut s = store_rc.borrow_mut();
                     let mut v = s.quick_commands().to_vec();
@@ -5883,7 +6036,11 @@ fn wire_key_input(
         let collapsed = collapsed_quick_groups.clone();
         window.on_move_quick_command(move |index: i32, group: SharedString| {
             let target = group.to_string();
-            let target = if target == "default" { String::new() } else { target };
+            let target = if target == "default" {
+                String::new()
+            } else {
+                target
+            };
             {
                 let mut s = store_rc.borrow_mut();
                 let mut v = s.quick_commands().to_vec();
@@ -5974,8 +6131,7 @@ fn wire_key_input(
         let sync_input = sync_input.clone();
         // Shared timestamp: the last time the Shift key alone was pressed
         // (key="", shift=true).  Used by the time-based Backspace filter below.
-        let last_shift_time: Arc<Mutex<Option<std::time::Instant>>> =
-            Arc::new(Mutex::new(None));
+        let last_shift_time: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
         window.on_send_key(move |tab_id: SharedString, key: SharedString, ctrl: bool, alt: bool, shift: bool| {
             // ── Enter on a disconnected tab → reconnect in place (#79) ──────
             // FinalShell-style: the tab shows "连接已断开,按 Enter 重新连接";
@@ -7105,7 +7261,11 @@ fn resolve_ui_font_family() -> slint::SharedString {
             style: Style::Normal,
         };
         if db.query(&q).is_some() {
-            tracing::debug!(faces = face_count, font = name, "ui-font: using system CJK font");
+            tracing::debug!(
+                faces = face_count,
+                font = name,
+                "ui-font: using system CJK font"
+            );
             return (*name).into();
         }
     }
@@ -7123,8 +7283,10 @@ fn resolve_ui_font_family() -> slint::SharedString {
         tracing::warn!(faces = face_count, available = ?sample,
             "ui-font: no preferred CJK font resolved; listing available families");
     }
-    tracing::warn!(faces = face_count,
-        "ui-font: falling back to embedded 'Meatshell Mono' (system fonts unusable, #129)");
+    tracing::warn!(
+        faces = face_count,
+        "ui-font: falling back to embedded 'Meatshell Mono' (system fonts unusable, #129)"
+    );
     "Meatshell Mono".into()
 }
 
@@ -7320,8 +7482,8 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
             if key.chars().count() == 1 {
                 let upper = c.to_ascii_uppercase() as u8;
                 let ctrl_char: Option<u8> = match upper {
-                    b'A'..=b'Z' => Some(upper - b'A' + 1),      // Ctrl+A=\x01 … Ctrl+Z=\x1A
-                    b'[' => Some(0x1b),                           // Ctrl+[ = ESC
+                    b'A'..=b'Z' => Some(upper - b'A' + 1), // Ctrl+A=\x01 … Ctrl+Z=\x1A
+                    b'[' => Some(0x1b),                    // Ctrl+[ = ESC
                     b'\\' => Some(0x1c),
                     b']' => Some(0x1d),
                     b'^' => Some(0x1e),
@@ -7982,7 +8144,11 @@ impl TermBuffer {
                 displayed.push(plain.trim_end().to_string());
             }
             self.displayed_text = displayed;
-            let rows_used = if is_alt { rows as i32 } else { last_content + 1 };
+            let rows_used = if is_alt {
+                rows as i32
+            } else {
+                last_content + 1
+            };
             return BuiltScreen {
                 spans,
                 cursor_row: cur_row as i32,
@@ -8066,7 +8232,7 @@ fn contains_cjk(s: &str) -> bool {
             | 0x4E00..=0x9FFF     // CJK unified ideographs
             | 0xF900..=0xFAFF     // CJK compatibility ideographs
             | 0xFF00..=0xFFEF     // fullwidth / halfwidth forms (，！？：；)
-            | 0x20000..=0x2FA1F)  // CJK ext B–F + compat supplement
+            | 0x20000..=0x2FA1F) // CJK ext B–F + compat supplement
     })
 }
 
@@ -8150,11 +8316,19 @@ const ANSI16_LIGHT_BG: [(u8, u8, u8); 16] = [
 fn vt_color_to_slint(color: vt100::Color, bold: bool, is_dark: bool) -> slint::Color {
     let (r, g, b) = match color {
         vt100::Color::Default => {
-            if is_dark { (0xd4, 0xd4, 0xd4) } else { (0x2d, 0x2d, 0x2f) }
+            if is_dark {
+                (0xd4, 0xd4, 0xd4)
+            } else {
+                (0x2d, 0x2d, 0x2f)
+            }
         }
         vt100::Color::Idx(i) => idx_to_rgb(i, bold, is_dark),
         vt100::Color::Rgb(r, g, b) => {
-            if is_dark { (r, g, b) } else { darken_light_fg(r, g, b) }
+            if is_dark {
+                (r, g, b)
+            } else {
+                darken_light_fg(r, g, b)
+            }
         }
     };
     slint::Color::from_rgb_u8(r, g, b)
@@ -8241,14 +8415,28 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
         let v = (l * 255.0).round() as u8;
         return (v, v, v);
     }
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
     let p = 2.0 * l - q;
     let hue = |mut t: f32| -> f32 {
-        if t < 0.0 { t += 1.0; }
-        if t > 1.0 { t -= 1.0; }
-        if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
-        if t < 0.5 { return q; }
-        if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+        if t < 0.0 {
+            t += 1.0;
+        }
+        if t > 1.0 {
+            t -= 1.0;
+        }
+        if t < 1.0 / 6.0 {
+            return p + (q - p) * 6.0 * t;
+        }
+        if t < 0.5 {
+            return q;
+        }
+        if t < 2.0 / 3.0 {
+            return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+        }
         p
     };
     (
@@ -8267,7 +8455,11 @@ fn idx_to_rgb(i: u8, bold: bool, is_dark: bool) -> (u8, u8, u8) {
         16..=231 => {
             let n = i - 16;
             let to = |v: u8| -> u8 {
-                if v == 0 { 0 } else { 55 + v * 40 }
+                if v == 0 {
+                    0
+                } else {
+                    55 + v * 40
+                }
             };
             (to(n / 36), to((n % 36) / 6), to(n % 6))
         }
@@ -8310,7 +8502,10 @@ mod key_tests {
     fn bare_alt_is_not_forwarded() {
         // Slint sends Alt-alone as key=0x12 with alt=true. It must produce no
         // bytes — otherwise it becomes ESC+0x12 and clears the input (issue #43).
-        assert_eq!(key_to_pty_bytes("\u{0012}", false, true, false), Vec::<u8>::new());
+        assert_eq!(
+            key_to_pty_bytes("\u{0012}", false, true, false),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
@@ -8446,7 +8641,13 @@ mod selection_tests {
         // scrolled to the top or sitting at the live bottom — this is the whole
         // point of the fix (a top-to-bottom selection survives auto-scrolling).
         let sel = |off| {
-            let mut b = make_buf(5, 20, &["HIST0", "HIST1", "HIST2"], &["LIVE0", "LIVE1"], off);
+            let mut b = make_buf(
+                5,
+                20,
+                &["HIST0", "HIST1", "HIST2"],
+                &["LIVE0", "LIVE1"],
+                off,
+            );
             b.sel_anchor = Some((0, 0));
             b.sel_focus = Some((4, 19));
             b.extract_selection_text()
@@ -8462,7 +8663,11 @@ mod selection_tests {
         top.sel_anchor = Some((0, 2));
         top.sel_focus = Some((2, 4));
         let rects = top.selection_rects_visible(20);
-        assert_eq!(rects.len(), 3, "rows 0,1,2 (the 3 history lines) highlighted");
+        assert_eq!(
+            rects.len(),
+            3,
+            "rows 0,1,2 (the 3 history lines) highlighted"
+        );
         assert_eq!(rects[0].row, 0);
         assert_eq!(rects[2].row, 2);
 
