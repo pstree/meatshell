@@ -219,6 +219,10 @@ export component TerminalView inherits Rectangle {
     // 0 = none, -1 = above top (scroll to older), +1 = below bottom (newer).
     property <int> autoscroll-dir: 0;
     property <length> vis-y: 0px;   // scratch: cursor Y within the visible viewport
+    // Defer ime-input.focus() to the next event-loop tick so AccessKit tree
+    // construction (on new TerminalView instantiation) finishes before focus
+    // changes — avoids RefCell re-entry panic in WinitWindowAdapter (#AccessKit).
+    property <bool> focus-pending: false;
 
     background: Theme.term-bg;
     forward-focus: ime-input;
@@ -269,10 +273,12 @@ export component TerminalView inherits Rectangle {
     // columns reflows the vt100 screen and destroys the scrollback, so when you
     // switch back the output is gone.  Guarding on `visible` keeps each hidden
     // session frozen at its real size; `changed visible` re-syncs on return.
-    changed term-cols => { if (root.visible) { root.terminal-resize(root.term-cols, root.term-rows); } }
-    changed term-rows => { if (root.visible) { root.terminal-resize(root.term-cols, root.term-rows); } }
+    property <bool> has-real-size: root.width >= 80px && key-capture.height >= 80px;
+    changed term-cols => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
+    changed term-rows => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
+    changed has-real-size => { if (root.visible && root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
 
-    init => { root.terminal-resize(root.term-cols, root.term-rows); }
+    init => { if (root.has-real-size) { root.terminal-resize(root.term-cols, root.term-rows); } }
 
     changed spans => {
         // Bash: keep the latest output pinned to the bottom.
@@ -304,9 +310,22 @@ export component TerminalView inherits Rectangle {
     }
     changed visible => {
         if (self.visible) {
-            ime-input.focus();
+            root.focus-pending = true;
             // Re-sync the PTY size on return (it was frozen while hidden).
-            root.terminal-resize(root.term-cols, root.term-rows);
+            if (root.has-real-size) {
+                root.terminal-resize(root.term-cols, root.term-rows);
+            }
+        }
+    }
+
+    focus-defer-timer := Timer {
+        interval: 0ms;
+        running: root.focus-pending;
+        triggered => {
+            if (root.focus-pending) {
+                ime-input.focus();
+                root.focus-pending = false;
+            }
         }
     }
 
@@ -374,7 +393,7 @@ export component TerminalView inherits Rectangle {
             forward-focus: ime-input;
             property <bool> cursor-blink: true;
 
-            init => { ime-input.focus(); }
+            init => { root.focus-pending = true; }
 
             Timer {
                 // Stop blinking (and thus repainting) when the window isn't

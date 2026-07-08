@@ -4,6 +4,7 @@ import { IconButton } from "widgets.slint";
 export struct TabInfo {
     id: string,
     title: string,
+    title_len: int,
     kind: string,   // "welcome" | "terminal"
     connected: bool,
 }
@@ -14,6 +15,7 @@ component SingleTab inherits Rectangle {
     in property <bool> active;
     callback selected();
     callback closed();
+    callback title-copy(string /* title */);
     // Drag-to-reorder (v0.5): emitted while dragging when the tab should hop one
     // slot left (-1) or right (+1). The model reorders and the tab follows.
     callback reorder(int /* dir */);
@@ -31,9 +33,8 @@ component SingleTab inherits Rectangle {
     out property <bool> dragging;
 
     height: 30px;
-    min-width: 100px;          // 缩短：原 120px，短名称（如 "pve"）时更紧凑
-    max-width: 160px;          // 新增：防止长名称把 tab 撑得过宽
-    horizontal-stretch: 0;    // 新增：不参与 TabBar 的等分拉伸，保持自然宽度
+    width: clamp(100px, 64px + info.title_len * 7px * Theme.ui-scale, 320px);
+    horizontal-stretch: 0;
     border-radius: Theme.radius-sm;
     border-width: active ? 1px : 0px;
     border-color: active ? Theme.tab-active-border : transparent;
@@ -67,6 +68,7 @@ component SingleTab inherits Rectangle {
             } else if (e.kind == PointerEventKind.up) {
                 if (root.pressing && !root.dragging) {
                     root.selected();
+                    root.title-copy(root.info.title);
                 } else if (root.pressing && root.dragging) {
                     root.drag-dropped(self.absolute-position.x + self.mouse-x,
                                       self.absolute-position.y + self.mouse-y);
@@ -119,10 +121,11 @@ component SingleTab inherits Rectangle {
                 : (info.connected ? Theme.success : Theme.warning);
         }
 
-        Text {
+        title-text := Text {
             text: info.title;
             color: active ? Theme.text-primary : Theme.text-secondary;
-            font-size: Theme.fs-sm;
+            font-size: info.title_len > 24 ? 9px * Theme.ui-scale
+                : (info.title_len > 12 ? 10px * Theme.ui-scale : Theme.fs-sm);
             vertical-alignment: center;
             overflow: elide;
             horizontal-stretch: 1;
@@ -138,6 +141,7 @@ component SingleTab inherits Rectangle {
         y: (parent.height - self.height) / 2;
         clicked => { root.closed(); }
     }
+
 }
 
 // --- Tab context-menu item -------------------------------------------------
@@ -177,6 +181,7 @@ export component TabBar inherits Rectangle {
     in property <length> reserve-right: 0px;
     callback tab-selected(string);
     callback tab-closed(string);
+    callback tab-title-copy(string);
     callback new-tab();
     // Drag-to-reorder: move the tab at `from` one slot in `dir` (#v0.5).
     callback tab-reorder(int /* from */, int /* dir */);
@@ -199,7 +204,7 @@ export component TabBar inherits Rectangle {
     background: Theme.bg-panel-alt;
 
     // True only when the tabs are wider than the available strip width (#122).
-    // Computed from the TabBar's own width (set by the parent) — NOT flick.width —
+    // Computed from the TabBar's own width (set by the parent), not flick.width,
     // so showing the arrows (which shrink the flickable) can't feed back into this
     // condition and form a binding loop. The 64px allows for the two arrows.
     property <bool> tab-overflow:
@@ -222,6 +227,7 @@ export component TabBar inherits Rectangle {
                     info: tab;
                     active: tab.id == root.active-id;
                     selected => { root.tab-selected(tab.id); }
+                    title-copy(title) => { root.tab-title-copy(title); }
                     closed => { root.tab-closed(tab.id); }
                     reorder(dir) => { root.tab-reorder(i, dir); }
                     context-requested(ax, ay) => {

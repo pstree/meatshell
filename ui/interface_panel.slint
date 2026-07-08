@@ -385,10 +385,17 @@ export component InterfacePanel inherits Rectangle {
                 }
                 Rectangle { height: 12px; }
 
-                // Built-in choices: None / Light / Dark / Fantasy 3048.
-                HorizontalLayout {
-                    spacing: 11px;
-                    alignment: start;
+                // Built-in choices: keep this row horizontally scrollable as
+                // bundled wallpapers grow.
+                builtin-wallpapers-scroll := ScrollView {
+                    height: 106px;
+                    width: 100%;
+                    viewport-width: max(self.visible-width, builtin-wallpapers-row.preferred-width);
+                    viewport-height: self.visible-height;
+
+                    builtin-wallpapers-row := HorizontalLayout {
+                        spacing: 11px;
+                        alignment: start;
                     VerticalLayout {
                         spacing: 5px;
                         WallpaperSwatch {
@@ -478,6 +485,21 @@ export component InterfacePanel inherits Rectangle {
                         spacing: 5px;
                         WallpaperSwatch {
                             width: 100px;
+                            selected: root.current-wallpaper == "builtin:ms";
+                            clicked => { root.set-wallpaper("builtin:ms"); }
+                            Image {
+                                width: 100%; height: 100%;
+                                source: @image-url("../assets/ms.jpg");
+                                image-fit: cover;
+                            }
+                        }
+                        Text { text: "MS"; font-size: 11px * Theme.panel-font;
+                               color: Theme.text-secondary; horizontal-alignment: center; }
+                    }
+                    VerticalLayout {
+                        spacing: 5px;
+                        WallpaperSwatch {
+                            width: 100px;
                             selected: root.current-wallpaper == "builtin:miku";
                             clicked => { root.set-wallpaper("builtin:miku"); }
                             Image {
@@ -488,6 +510,7 @@ export component InterfacePanel inherits Rectangle {
                         }
                         Text { text: "Miku"; font-size: 11px * Theme.panel-font;
                                color: Theme.text-secondary; horizontal-alignment: center; }
+                    }
                     }
                 }
 

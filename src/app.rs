@@ -723,9 +723,9 @@ pub fn run() -> Result<()> {
         // Restore the user's preferred window size, if any (#dock).
         let (ww, wh) = s.window_size();
         if ww > 0.0 && wh > 0.0 {
-            window
-                .window()
-                .set_size(slint::LogicalSize::new(ww, wh));
+            let _ = clamp_window_size_to_monitor(&window.window(), Some((ww, wh)));
+        } else {
+            let _ = clamp_window_size_to_monitor(&window.window(), None);
         }
     }
     {
@@ -1059,6 +1059,7 @@ pub fn run() -> Result<()> {
     let tabs_model: Rc<VecModel<TabInfo>> = Rc::new(VecModel::default());
     tabs_model.push(TabInfo {
         id: "welcome".into(),
+        title_len: tab_title_len(&t("新标签页", "New tab")),
         title: t("新标签页", "New tab").into(),
         kind: "welcome".into(),
         connected: false,
@@ -1211,6 +1212,7 @@ pub fn run() -> Result<()> {
         splitters_model.clone(),
         handles.clone(),
         bufs.clone(),
+        render_gates.clone(),
         runtime.clone(),
         last_term_size.clone(),
         sftp_handles.clone(),
@@ -1253,6 +1255,7 @@ pub fn run() -> Result<()> {
             for i in 0..tabs_model.row_count() {
                 if let Some(mut row) = tabs_model.row_data(i) {
                     if row.id.as_str() == "welcome" {
+                        row.title_len = tab_title_len(&t("新标签页", "New tab"));
                         row.title = t("新标签页", "New tab").into();
                         tabs_model.set_row_data(i, row);
                     }
@@ -1560,6 +1563,7 @@ pub fn run() -> Result<()> {
         splitters_model.clone(),
         handles.clone(),
         bufs.clone(),
+        render_gates.clone(),
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
     );
@@ -1577,6 +1581,7 @@ pub fn run() -> Result<()> {
             sftp_handles: sftp_handles.clone(),
             sftp_last_cwd: sftp_last_cwd.clone(),
             bufs: bufs.clone(),
+            render_gates: render_gates.clone(),
             tab_statuses: tab_statuses.clone(),
             local_snap: local_snap.clone(),
             local_net_hist: local_net_hist.clone(),
@@ -1632,10 +1637,7 @@ pub fn run() -> Result<()> {
             };
             // Append the raw local throughput to the bottom-graph ring buffer
             // (normalisation happens at display time so the graph auto-scales).
-            push_ring(
-                &mut tick_net.lock().unwrap(),
-                snap.net_bytes_per_sec as f32,
-            );
+            push_ring(&mut tick_net.lock().unwrap(), snap.net_bytes_per_sec as f32);
             // Stash the local sample; the sidebar shows it on the welcome tab
             // and in the bottom network graph.
             *tick_local.lock().unwrap() = snap.clone();
@@ -1867,12 +1869,18 @@ fn center_window(win: &AppWindow) {
     }
     #[link(name = "user32")]
     extern "system" {
-        fn SystemParametersInfoW(action: u32, uiparam: u32, pvparam: *mut Rect, winini: u32) -> i32;
+        fn SystemParametersInfoW(action: u32, uiparam: u32, pvparam: *mut Rect, winini: u32)
+            -> i32;
     }
     const SPI_GETWORKAREA: u32 = 0x0030;
 
     let size = win.window().size(); // physical pixels
-    let mut wa = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut wa = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
     let ok = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa, 0) };
     if ok == 0 {
         return;
@@ -2240,6 +2248,7 @@ fn wire_session_callbacks(
     splitters_model: Rc<VecModel<SplitterInfo>>,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
+    render_gates: RenderGates,
     runtime: Arc<Runtime>,
     last_term_size: Arc<Mutex<(u32, u32)>>,
     sftp_handles: SftpHandles,
@@ -2265,6 +2274,11 @@ fn wire_session_callbacks(
             w.set_session_groups(session_groups_model(&store_ng.borrow()));
             w.set_dialog_forwards(forward_model(&[]));
             let empty = Session::new_empty();
+            let (jump_labels, jump_ids, jump_idx) =
+                jump_candidates(&store_ng.borrow(), &empty.id, "");
+            w.set_jump_choices(jump_labels);
+            w.set_jump_ids(jump_ids);
+            w.set_dialog_jump_index(jump_idx);
             w.set_dialog_id(empty.id.into());
             w.set_dialog_name("".into());
             w.set_dialog_host("".into());
@@ -2288,6 +2302,7 @@ fn wire_session_callbacks(
             w.set_dialog_parity("none".into());
             w.set_dialog_flow("none".into());
             w.set_dialog_disable_shell_integration(false);
+            w.set_dialog_note("".into());
             w.set_dialog_editing(false);
             w.set_dialog_open(true);
         }
@@ -2303,7 +2318,9 @@ fn wire_session_callbacks(
             let mut added = 0usize;
             if hosts.is_empty() {
                 if let Some(w) = weak.upgrade() {
-                    w.set_ssh_import_hint(t("未找到 ~/.ssh/config", "no ~/.ssh/config found").into());
+                    w.set_ssh_import_hint(
+                        t("未找到 ~/.ssh/config", "no ~/.ssh/config found").into(),
+                    );
                 }
                 return;
             }
@@ -2312,9 +2329,10 @@ fn wire_session_callbacks(
                 for h in hosts {
                     // Skip if a session already has this alias, or the same
                     // host + user pair.
-                    let dup = s.sessions().iter().any(|x| {
-                        x.name == h.alias || (x.host == h.hostname && x.user == h.user)
-                    });
+                    let dup = s
+                        .sessions()
+                        .iter()
+                        .any(|x| x.name == h.alias || (x.host == h.hostname && x.user == h.user));
                     if dup {
                         continue;
                     }
@@ -2458,7 +2476,9 @@ fn wire_session_callbacks(
         window.on_edit_session(move |id: SharedString| {
             let id = id.to_string();
             let store = store.borrow();
-            let Some(session) = store.get(&id) else { return; };
+            let Some(session) = store.get(&id) else {
+                return;
+            };
             *ef_edit.borrow_mut() = session.forwards.clone();
             if let Some(w) = weak.upgrade() {
                 w.set_session_groups(session_groups_model(&store));
@@ -2473,7 +2493,8 @@ fn wire_session_callbacks(
                 // leave it blank; a blank field on save keeps the existing one.
                 w.set_dialog_password("".into());
                 w.set_dialog_key_path(session.private_key_path.clone().into());
-
+                w.set_dialog_key_inline("".into());
+                w.set_dialog_key_inline_mode(!session.private_key_inline.is_empty());
                 let (proxy_type, proxy_hostport) = split_proxy(&session.proxy);
                 w.set_dialog_proxy_type(proxy_type.into());
                 w.set_dialog_proxy_hostport(proxy_hostport.into());
@@ -2491,6 +2512,7 @@ fn wire_session_callbacks(
                 w.set_dialog_parity(session.parity.clone().into());
                 w.set_dialog_flow(session.flow_control.clone().into());
                 w.set_dialog_disable_shell_integration(session.disable_shell_integration);
+                w.set_dialog_note(session.note.clone().into());
                 w.set_dialog_editing(true);
                 w.set_dialog_open(true);
             }
@@ -2771,7 +2793,8 @@ fn wire_session_callbacks(
     {
         let weak = window.as_weak();
         window.on_session_dialog_pick_key(move || {
-            let mut dialog = rfd::FileDialog::new().set_title(t("选择私钥文件", "Choose private key file"));
+            let mut dialog =
+                rfd::FileDialog::new().set_title(t("选择私钥文件", "Choose private key file"));
             // Start in ~/.ssh if it exists.
             if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().join(".ssh")) {
                 if home.is_dir() {
@@ -2848,6 +2871,7 @@ fn wire_session_callbacks(
         let content_size = content_size.clone();
         let handles = handles.clone();
         let bufs = bufs.clone();
+        let render_gates = render_gates.clone();
         let runtime = runtime.clone();
         let last_term_size = last_term_size.clone();
         let sftp_handles = sftp_handles.clone();
@@ -2892,6 +2916,7 @@ fn wire_session_callbacks(
             // Register tab + terminal state (SFTP fields start empty/loading).
             tabs_model.push(TabInfo {
                 id: tab_id.clone().into(),
+                title_len: tab_title_len(&tab_title),
                 title: tab_title.into(),
                 kind: "terminal".into(),
                 connected: false,
@@ -2922,18 +2947,20 @@ fn wire_session_callbacks(
                 find_matches: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 selection: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 sftp_path: "/".into(),
-                sftp_entries: ModelRc::from(
-                    std::rc::Rc::new(VecModel::<SftpEntry>::default()),
-                ),
+                sftp_entries: ModelRc::from(std::rc::Rc::new(VecModel::<SftpEntry>::default())),
                 sftp_status: if has_sftp {
                     t("SFTP 连接中...", "SFTP connecting...").into()
                 } else {
-                    t("此会话类型不支持 SFTP", "SFTP not available for this session").into()
+                    t(
+                        "此会话类型不支持 SFTP",
+                        "SFTP not available for this session",
+                    )
+                    .into()
                 },
                 sftp_loading: has_sftp,
-                sftp_tree_nodes: ModelRc::from(
-                    std::rc::Rc::new(VecModel::<SftpTreeNode>::default()),
-                ),
+                sftp_tree_nodes: ModelRc::from(std::rc::Rc::new(
+                    VecModel::<SftpTreeNode>::default(),
+                )),
                 sftp_selected_count: 0,
                 sftp_collapsed: sftp_collapsed_default,
                 sftp_panel_height: sftp_h_default,
@@ -2960,6 +2987,10 @@ fn wire_session_callbacks(
                     raw: std::collections::VecDeque::new(),
                 },
             );
+            render_gates
+                .lock()
+                .unwrap()
+                .insert(tab_id.clone(), Arc::new(TabRenderGate::new()));
             // No followed-cwd yet: the first OSC 7 always triggers a follow.
             sftp_last_cwd.lock().unwrap().remove(&tab_id);
             // Add the new tab to the focused pane and re-flatten (this also sets
@@ -2985,6 +3016,7 @@ fn wire_session_callbacks(
                 sftp_handles: sftp_handles.clone(),
                 sftp_last_cwd: sftp_last_cwd.clone(),
                 bufs: bufs.clone(),
+                render_gates: render_gates.clone(),
                 tab_statuses: tab_statuses.clone(),
                 local_snap: local_snap.clone(),
                 local_net_hist: local_net_hist.clone(),
@@ -3039,6 +3071,7 @@ struct ConnectCtx {
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
     bufs: TermBuffers,
+    render_gates: RenderGates,
     tab_statuses: TabStatuses,
     local_snap: LocalSnap,
     local_net_hist: NetHist,
@@ -3120,6 +3153,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let local_pump = ctx.local_snap.clone();
         let net_pump = ctx.local_net_hist.clone();
         let follow_cd_pump = ctx.sftp_follow_cd.clone();
+        let render_gates_pump = ctx.render_gates.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
@@ -3254,6 +3288,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 let st_evt = statuses_pump.clone();
                 let lc_evt = local_pump.clone();
                 let nh_evt = net_pump.clone();
+                let gates_evt = render_gates_pump.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(win) = weak_evt.upgrade() {
                         let terminals_rc = win.get_terminals();
@@ -3302,6 +3337,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 &tid2,
                                 evt,
                                 &bufs_evt,
+                                &gates_evt,
                                 &st_evt,
                                 &lc_evt,
                                 &nh_evt,
@@ -3321,27 +3357,42 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let statuses_sftp = ctx.tab_statuses.clone();
         let local_sftp = ctx.local_snap.clone();
         let net_sftp = ctx.local_net_hist.clone();
+        let gates_sftp = ctx.render_gates.clone();
         std::thread::spawn(move || {
             let mut sftp_rx = sftp_evt_tx;
+            let mut drained: Vec<SessionEvent> = Vec::new();
             loop {
                 match sftp_rx.blocking_recv() {
                     None => break,
-                    Some(sftp_evt) => {
-                        let weak_s = weak_sftp.clone();
-                        let tid = tab_id_sftp.clone();
-                        let bufs_s = bufs_sftp.clone();
-                        let st_s = statuses_sftp.clone();
-                        let lc_s = local_sftp.clone();
-                        let nh_s = net_sftp.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(win) = weak_s.upgrade() {
-                                apply_session_event_to_window(
-                                    &win, &tid, sftp_evt, &bufs_s, &st_s, &lc_s, &nh_s,
-                                );
-                            }
-                        });
+                    Some(first) => drained.push(first),
+                }
+                const SFTP_DRAIN_CAP: usize = 256;
+                while drained.len() < SFTP_DRAIN_CAP {
+                    match sftp_rx.try_recv() {
+                        Ok(evt) => drained.push(evt),
+                        Err(_) => break,
                     }
                 }
+                let ui_batch: Vec<SessionEvent> = drained.drain(..).collect();
+                if ui_batch.is_empty() {
+                    continue;
+                }
+                let weak_s = weak_sftp.clone();
+                let tid = tab_id_sftp.clone();
+                let bufs_s = bufs_sftp.clone();
+                let st_s = statuses_sftp.clone();
+                let lc_s = local_sftp.clone();
+                let nh_s = net_sftp.clone();
+                let gates_s = gates_sftp.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(win) = weak_s.upgrade() {
+                        for sftp_evt in ui_batch {
+                            apply_session_event_to_window(
+                                &win, &tid, sftp_evt, &bufs_s, &gates_s, &st_s, &lc_s, &nh_s,
+                            );
+                        }
+                    }
+                });
             }
         });
     }
@@ -3444,12 +3495,22 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
     s.set_sidebar_width(win.get_sidebar_width());
     s.set_sidebar_height(win.get_sidebar_height());
     s.set_sidebar_dock(win.get_sidebar_dock().to_string());
+    s.set_sidebar_collapsed(win.get_sidebar_collapsed());
     s.set_sftp_panel_width(win.get_sftp_panel_width());
     s.set_sftp_panel_height(win.get_sftp_panel_height());
     s.set_sftp_dock(win.get_sftp_dock().to_string());
+    s.set_welcome_sidebar_width(win.get_welcome_sidebar_width());
+    s.set_welcome_sidebar_dock(win.get_welcome_sidebar_dock().to_string());
+    s.set_welcome_collapsed(win.get_welcome_collapsed());
     // A maximized size isn't a useful "preferred" size to restore to, so only
-    // remember the windowed size.
-    if !win.get_window_maximized() && w > 200.0 && h > 200.0 {
+    // remember the windowed size. Ask the native window too, because the Slint
+    // property can lag during startup/shutdown on frameless Windows (#234).
+    let native_maximized = win
+        .window()
+        .with_winit_window(|ww| ww.is_maximized())
+        .unwrap_or_else(|| win.get_window_maximized());
+    if !native_maximized && w > 200.0 && h > 200.0 {
+        let (w, h) = clamp_window_size_to_monitor(&win.window(), Some((w, h))).unwrap_or((w, h));
         s.set_window_size(w, h);
     }
     let _ = s.save();
@@ -3544,7 +3605,11 @@ fn quick_cmd_model(
                     name: c.name.clone().into(),
                     command: c.command.clone().into(),
                     group: group.clone().into(),
-                    group_header: if i == 0 { group.clone().into() } else { "".into() },
+                    group_header: if i == 0 {
+                        group.clone().into()
+                    } else {
+                        "".into()
+                    },
                     collapsed: is_collapsed,
                     orig_index: *orig_idx as i32,
                     send_enter: c.send_enter,
@@ -3986,13 +4051,12 @@ fn refresh_sidebar(
         Some(st) if st.state == 1 => {
             win.set_conn_state(1);
             win.set_connection_state(st.host.clone().into());
+            win.set_conn_host(conn_ip(&st.host).into());
             win.set_resource_title(t("服务器资源", "Server resources").into());
             win.set_cpu_percent(st.cpu);
             win.set_mem_percent(pct(st.mem_used_kib, st.mem_total_kib));
             win.set_swap_percent(pct(st.swap_used_kib, st.swap_total_kib));
-            win.set_mem_detail(
-                format_mem(st.mem_used_kib / 1024, st.mem_total_kib / 1024).into(),
-            );
+            win.set_mem_detail(format_mem(st.mem_used_kib / 1024, st.mem_total_kib / 1024).into());
             win.set_swap_detail(
                 format_mem(st.swap_used_kib / 1024, st.swap_total_kib / 1024).into(),
             );
@@ -4012,6 +4076,7 @@ fn refresh_sidebar(
         Some(st) if st.state == 2 => {
             win.set_conn_state(2);
             win.set_connection_state(format!("{} {}", st.host, t("已断开", "disconnected")).into());
+            win.set_conn_host(conn_ip(&st.host).into());
             win.set_resource_title(t("服务器资源", "Server resources").into());
             clear_stats(win);
             set_top_local(win);
@@ -4020,6 +4085,7 @@ fn refresh_sidebar(
         Some(st) => {
             win.set_conn_state(0);
             win.set_connection_state(format!("{} {}", t("连接中", "Connecting"), st.host).into());
+            win.set_conn_host(conn_ip(&st.host).into());
             win.set_resource_title(t("服务器资源", "Server resources").into());
             clear_stats(win);
             set_top_local(win);
@@ -4028,6 +4094,7 @@ fn refresh_sidebar(
         None => {
             win.set_conn_state(0);
             win.set_connection_state(t("未连接", "Not connected").into());
+            win.set_conn_host("".into());
             show_local_res(win);
             set_top_local(win);
         }
@@ -4041,6 +4108,7 @@ fn apply_session_event_to_window(
     tab_id: &str,
     event: SessionEvent,
     bufs: &TermBuffers,
+    gates: &RenderGates,
     statuses: &TabStatuses,
     local: &LocalSnap,
     local_net_hist: &NetHist,
@@ -4176,6 +4244,7 @@ fn apply_session_event_to_window(
                     )
                 )),
                 bufs,
+                gates,
                 statuses,
                 local,
                 local_net_hist,
@@ -4306,6 +4375,7 @@ fn apply_session_event_to_window(
                         error
                     )),
                     bufs,
+                    gates,
                     statuses,
                     local,
                     local_net_hist,
@@ -4411,7 +4481,15 @@ fn apply_session_event_to_window(
             need_password,
             responder,
         } => {
-            enqueue_cred_prompt(win, session_id, host, user, need_user, need_password, responder);
+            enqueue_cred_prompt(
+                win,
+                session_id,
+                host,
+                user,
+                need_user,
+                need_password,
+                responder,
+            );
         }
         SessionEvent::MfaPrompt {
             session_id,
@@ -5010,6 +5088,7 @@ fn wire_tab_callbacks(
     splitters_model: Rc<VecModel<SplitterInfo>>,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
+    render_gates: RenderGates,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
 ) {
@@ -5022,6 +5101,7 @@ fn wire_tab_callbacks(
         let tabs_model = tabs_model.clone();
         let panes_model = panes_model.clone();
         let splitters_model = splitters_model.clone();
+        let bufs_tab_sel = bufs.clone();
         window.on_pane_tab_selected(move |pane_id: i32, id: SharedString| {
             let id = id.to_string();
             {
@@ -5029,7 +5109,7 @@ fn wire_tab_callbacks(
                 lay.focused = pane_id as u64;
                 if let Some(l) = lay.leaf_mut(pane_id as u64) {
                     if l.tabs.iter().any(|t| t == &id) {
-                        l.active = id;
+                        l.active = id.clone();
                     }
                 }
             }
@@ -5042,6 +5122,9 @@ fn wire_tab_callbacks(
                     &panes_model,
                     &splitters_model,
                 );
+                // Tab just became visible — render any output ingested while it
+                // was in the background (e.g. another session was unzipping).
+                rebuild_tab_display(&w, &bufs_tab_sel, &id);
             }
         });
     }
@@ -5096,6 +5179,7 @@ fn wire_tab_callbacks(
         let terminals_model = terminals_model.clone();
         let handles = handles.clone();
         let bufs = bufs.clone();
+        let render_gates = render_gates.clone();
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
         let panes_model = panes_model.clone();
@@ -5113,6 +5197,7 @@ fn wire_tab_callbacks(
             }
             sftp_last_cwd.lock().unwrap().remove(&id);
             bufs.lock().unwrap().remove(&id);
+            render_gates.lock().unwrap().remove(&id);
 
             // Remove from tabs + terminals models.
             let mut idx = None;
@@ -5302,13 +5387,13 @@ fn wire_tab_callbacks(
                 }
                 if let Some(w) = weak.upgrade() {
                     refresh_panes(
-                    &w,
-                    &layout.borrow(),
-                    content_size.get(),
-                    &tabs_model,
-                    &panes_model,
-                    &splitters_model,
-                );
+                        &w,
+                        &layout.borrow(),
+                        content_size.get(),
+                        &tabs_model,
+                        &panes_model,
+                        &splitters_model,
+                    );
                 }
             },
         );
@@ -8070,6 +8155,36 @@ impl TermBuffer {
         out
     }
 
+    /// If the current find query is outside the visible window, jump to the
+    /// first matching row in scrollback/live content so old serial output can be
+    /// found without manually scrolling back first (#233).
+    fn scroll_to_first_find_match(&mut self, query: &str) -> bool {
+        if query.is_empty() || self.parser.screen().alternate_screen() {
+            return false;
+        }
+        let q = query.to_lowercase();
+        let (live, _) = self.live_rows();
+        let rows = self.parser.screen().size().0 as usize;
+        let hist_len = self.history.len();
+        let combined_len = hist_len + live.len();
+        let Some(match_idx) = self
+            .history
+            .iter()
+            .map(|line| &line.0)
+            .chain(live.iter().map(|line| &line.0))
+            .position(|line| line.to_lowercase().contains(&q))
+        else {
+            return false;
+        };
+        let top = match_idx.min(combined_len.saturating_sub(rows));
+        let new_offset = combined_len.saturating_sub(rows + top);
+        if self.view_offset == new_offset {
+            return false;
+        }
+        self.view_offset = new_offset;
+        true
+    }
+
     /// Extract the selected text from the combined buffer (whole selection,
     /// even the parts currently scrolled out of view).
     fn extract_selection_text(&self) -> String {
@@ -8450,10 +8565,12 @@ impl TermBuffer {
                 &live[idx - hist_len]
             };
             for hs in &line.1 {
+                let (fg, bg) =
+                    vt_span_colors(hs.fg, hs.bg, hs.bold, hs.inverse, self.is_dark);
                 spans.push(TermSpan {
                     text: hs.text.clone().into(),
-                    fg: vt_color_to_slint(hs.fg, hs.bold, self.is_dark),
-                    bg: vt_bg_to_slint(hs.bg, self.is_dark),
+                    fg,
+                    bg,
                     bold: hs.bold,
                     row: d as i32,
                     col: hs.col,
