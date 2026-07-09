@@ -551,8 +551,10 @@ export component AppWindow inherits Window {
     in-out property <int>    editor-current-match: -1;
     in-out property <string> editor-find-status: "";
     in-out property <int>    editor-highlight-trigger: 0;
+    in-out property <int>    editor-find-focus-trigger: 0;
     pure callback editor-search-matches(string, string) -> [int];
     pure callback editor-byte-length-of(string) -> int;
+    pure callback editor-line-index-at(string, int) -> int;
     callback editor-replace-all(string);
 
     // Editor card geometry: draggable by its title bar, resizable from the
@@ -1613,6 +1615,7 @@ export component AppWindow inherits Window {
         triggered => {
             root.editor-pending-open = false;
             root.editor-search-refresh();
+            root.editor-find-focus-trigger = root.editor-find-focus-trigger + 1;
             root.editor-highlight-trigger = root.editor-highlight-trigger + 1;
         }
     }
@@ -1728,6 +1731,16 @@ export component AppWindow inherits Window {
                 let off = root.editor-match-offsets[root.editor-current-match];
                 let len = root.editor-byte-length-of(root.editor-find-query);
                 edit-input.set-selection-offsets(off, off + len);
+                self.editor-scroll-to-offset(off);
+            }
+
+            function editor-scroll-to-offset(offset: int) {
+                let line-index = root.editor-line-index-at(root.editor-content, offset);
+                let row-height = edit-input.font-size * 1.35;
+                let match-y = line-index * row-height;
+                let target-top = max(0px, match-y - max(0px, ed-scroll.visible-height / 2 - row-height));
+                let min-y = min(0px, ed-scroll.visible-height - ed-scroll.viewport-height);
+                ed-scroll.viewport-y = max(min-y, min(0px, -target-top));
             }
             Rectangle {
                 x: root.ed-x;
@@ -1844,6 +1857,8 @@ export component AppWindow inherits Window {
                                         font-family: Theme.ui-font-family;
                                         color: Theme.text-primary;
                                         vertical-alignment: center;
+                                        property <int> focus-trigger: root.editor-find-focus-trigger;
+                                        changed focus-trigger => { self.focus(); }
                                         edited => {
                                             root.editor-search-refresh();
                                             root.editor-highlight-trigger =

@@ -6179,6 +6179,14 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
         });
     }
 
+    // Pure: zero-based visual line index for a byte offset. Slint uses this to
+    // center the ScrollView on the active find match.
+    {
+        window.on_editor_line_index_at(move |text: SharedString, offset: i32| {
+            editor_line_index_at(text.as_str(), offset) as i32
+        });
+    }
+
     // Replace every occurrence of the query with `replacement`. Uses Rust's
     // `str::replace` (handles non-overlapping matches identically to the find
     // loop). After writing the new content back, Slint refreshes the search.
@@ -7620,6 +7628,15 @@ fn editor_find_offsets(text: &str, query: &str) -> Vec<i32> {
         start = abs + query.len();
     }
     offsets
+}
+
+fn editor_line_index_at(text: &str, offset: i32) -> usize {
+    let offset = offset.max(0) as usize;
+    let end = offset.min(text.len());
+    text.as_bytes()[..end]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
 }
 
 /// Write `text` to the system clipboard. Call from a dedicated thread, never the
