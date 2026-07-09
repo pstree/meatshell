@@ -514,28 +514,18 @@ export component TerminalView inherits Rectangle {
                                 }
                             }
                             scroll-event(ev) => {
-                                // Positive delta-y = wheel/swipe up. Smooth input
-                                // (Magic Mouse / trackpad) arrives as small deltas,
-                                // so accumulate until it reaches one wheel step.
-                                root.wheel-accum-y += ev.delta-y;
-                                if (root.wheel-accum-y >= root.wheel-step-y
-                                        || root.wheel-accum-y <= -root.wheel-step-y) {
-                                    if (root.is-alt-screen) {
-                                        // Alt-screen app (tmux/less/vim): forward the
-                                        // wheel so the program scrolls instead of
-                                        // nothing (#170).
-                                        root.terminal-wheel(
-                                            root.wheel-accum-y > 0px ? 1 : -1,
-                                            floor(self.mouse-x / root.cell-w),
-                                            floor(self.mouse-y / root.cell-h));
-                                    } else {
-                                        // Normal screen: scroll our own scrollback
-                                        // history (~3 lines per notch).
-                                        root.terminal-scroll(root.wheel-accum-y > 0px ? 3 : -3);
-                                    }
-                                    root.wheel-accum-y = root.wheel-accum-y > 0px
-                                        ? root.wheel-accum-y - root.wheel-step-y
-                                        : root.wheel-accum-y + root.wheel-step-y;
+                                // Positive delta-y = wheel up.
+                                if (root.is-alt-screen) {
+                                    // Alt-screen app (tmux/less/vim): forward the wheel
+                                    // so the program scrolls instead of nothing (#170).
+                                    root.terminal-wheel(
+                                        ev.delta-y > 0 ? 1 : -1,
+                                        floor(self.mouse-x / root.cell-w),
+                                        floor(self.mouse-y / root.cell-h));
+                                } else {
+                                    // Normal screen: scroll our own scrollback history
+                                    // (~3 lines per notch).
+                                    root.terminal-scroll(ev.delta-y > 0 ? 3 : -3);
                                 }
                                 accept
                             }
