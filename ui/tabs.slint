@@ -68,7 +68,6 @@ component SingleTab inherits Rectangle {
             } else if (e.kind == PointerEventKind.up) {
                 if (root.pressing && !root.dragging) {
                     root.selected();
-                    root.title-copy(root.info.title);
                 } else if (root.pressing && root.dragging) {
                     root.drag-dropped(self.absolute-position.x + self.mouse-x,
                                       self.absolute-position.y + self.mouse-y);
