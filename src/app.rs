@@ -2192,7 +2192,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
         last_used: "".into(),
         group: group.into(),
         group_header: group.into(),
-        collapsed: false,
+        collapsed: true,
     };
 
     let mut rows: Vec<SessionInfo> = Vec::new();
@@ -2226,7 +2226,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
                     } else {
                         "".into()
                     },
-                    collapsed: false,
+                    collapsed: true,
                 });
             }
         }
