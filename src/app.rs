@@ -78,6 +78,10 @@ enum CsiState {
 /// Max UI renders per second for a tab under sustained output (#209).
 const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
+/// Per-tab terminal buffer — each tab has its own lock so a burst of output on
+/// one session (e.g. `unzip` listing thousands of files) doesn't block keyboard
+/// input on another (#209).
+type TermBufferHandle = Arc<Mutex<TermBuffer>>;
 type TermBuffers = Arc<Mutex<HashMap<String, TermBuffer>>>;
 
 /// Coalesces render requests so a firehose of output schedules at most one UI
@@ -99,6 +103,14 @@ impl TabRenderGate {
 }
 
 type RenderGates = Arc<Mutex<HashMap<String, Arc<TabRenderGate>>>>;
+
+fn ingest_terminal_output(bufs: &TermBuffers, tab_id: &str, chunk: &[u8]) {
+    if let Ok(mut map) = bufs.lock() {
+        if let Some(buf) = map.get_mut(tab_id) {
+            buf.ingest(chunk);
+        }
+    }
+}
 
 use anyhow::{Context, Result};
 use i_slint_backend_winit::WinitWindowAccessor;
@@ -3608,44 +3620,35 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                     continue;
                 }
 
-                // Pre-process Output events on the pump thread —
-                // vt100 parsing + render happen HERE, not on the UI thread.
-                // When `cat /var/log/syslog` dumps 20 MB of output, this keeps
-                // the UI responsive for mouse/keyboard events (#171 regression).
-                let tid = tab_id_pump.clone();
-                let mut prebuilt_outputs: Vec<PreBuiltOutput> = Vec::new();
-                let mut other_events: Vec<SessionEvent> = Vec::new();
+                // Ingest terminal output on this pump thread (not the UI thread)
+                // so a firehose can't block keyboard input or repaints (#209).
+                let mut had_output = false;
+                let mut ui_only: Vec<SessionEvent> = Vec::with_capacity(ui_batch.len());
                 for evt in ui_batch {
                     match evt {
                         SessionEvent::Output(chunk) => {
-                            if let Ok(mut map) = bufs_thread.lock() {
-                                if let Some(buf) = map.get_mut(&tid) {
-                                    buf.ingest(chunk.as_bytes());
-                                    let cols = buf.parser.screen().size().1;
-                                    let b = buf.render();
-                                    let matches =
-                                        compute_find_matches(&buf.displayed_text, &buf.find_query);
-                                    let sel = buf.selection_rects_visible(cols);
-                                    prebuilt_outputs.push(PreBuiltOutput {
-                                        spans: b.spans,
-                                        cursor_row: b.cursor_row,
-                                        cursor_col: b.cursor_col,
-                                        rows_used: b.rows_used,
-                                        is_alt: b.is_alt,
-                                        scroll_max: b.scroll_max,
-                                        scroll_offset: b.scroll_offset,
-                                        matches,
-                                        sel,
-                                    });
-                                }
-                            }
+                            ingest_terminal_output(&bufs_thread, &tab_id_pump, chunk.as_bytes());
+                            had_output = true;
                         }
-                        other => other_events.push(other),
+                        other => ui_only.push(other),
                     }
                 }
 
+                if had_output {
+                    request_tab_render(
+                        weak_inner.clone(),
+                        &tab_id_pump,
+                        &bufs_thread,
+                        &render_gates_pump,
+                    );
+                }
+
+                if ui_only.is_empty() {
+                    continue;
+                }
+
                 let weak_evt = weak_inner.clone();
-                let tid2 = tid.clone();
+                let tid = tab_id_pump.clone();
                 let bufs_evt = bufs_thread.clone();
                 let st_evt = statuses_pump.clone();
                 let lc_evt = local_pump.clone();
@@ -3653,56 +3656,9 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 let gates_evt = render_gates_pump.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(win) = weak_evt.upgrade() {
-                        let terminals_rc = win.get_terminals();
-                        let terminals = terminals_rc
-                            .as_any()
-                            .downcast_ref::<VecModel<TerminalState>>()
-                            .expect("terminals model must be a VecModel");
-                        // Apply pre-computed output: only VecModel wrappers +
-                        // set_row_data — no vt100 parsing on the UI thread (#171).
-                        for built in prebuilt_outputs {
-                            let spans_model: ModelRc<TermSpan> =
-                                ModelRc::from(std::rc::Rc::new(VecModel::from(built.spans)));
-                            let matches_model: ModelRc<TermMatch> =
-                                ModelRc::from(std::rc::Rc::new(VecModel::from(built.matches)));
-                            let sel_model: ModelRc<TermMatch> =
-                                ModelRc::from(std::rc::Rc::new(VecModel::from(built.sel)));
-                            let (cur_row, cur_col, rows_used, is_alt) = (
-                                built.cursor_row,
-                                built.cursor_col,
-                                built.rows_used,
-                                built.is_alt,
-                            );
-                            let (smax, soff) = (built.scroll_max, built.scroll_offset);
-                            for i in 0..terminals.row_count() {
-                                if let Some(mut row) = terminals.row_data(i) {
-                                    if row.id.as_str() == tid2.as_str() {
-                                        row.spans = spans_model.clone();
-                                        row.cursor_row = cur_row;
-                                        row.cursor_col = cur_col;
-                                        row.rows_used = rows_used;
-                                        row.is_alt_screen = is_alt;
-                                        row.find_matches = matches_model.clone();
-                                        row.selection = sel_model.clone();
-                                        row.scroll_max = smax;
-                                        row.scroll_offset = soff;
-                                        terminals.set_row_data(i, row);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        // Non-Output events still go through the normal path.
-                        for evt in other_events {
+                        for evt in ui_only {
                             apply_session_event_to_window(
-                                &win,
-                                &tid2,
-                                evt,
-                                &bufs_evt,
-                                &gates_evt,
-                                &st_evt,
-                                &lc_evt,
-                                &nh_evt,
+                                &win, &tid, evt, &bufs_evt, &gates_evt, &st_evt, &lc_evt, &nh_evt,
                             );
                         }
                     }
