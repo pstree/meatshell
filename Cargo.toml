@@ -1,6 +1,6 @@
 [package]
 name = "meatshell"
-version = "0.5.71"
+version = "0.6.1"
 edition = "2021"
 authors = ["meatshell contributors"]
 description = "A lightweight FinalShell-style SSH/terminal client written in Rust + Slint"
@@ -90,7 +90,8 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 # Compile the Skia renderer in *only* on macOS (feature is additive over the base
 # slint dependency) so users can opt into it at launch with SLINT_BACKEND=winit-skia.
 # The default stays femtovg — see the renderer history note in main.rs (#108/#129).
-# Windows/Linux never compile Skia.
+# Windows/Linux never compile Skia; on Windows it conflicts with another ICU
+# import library at link time when using the MSVC toolchain (#224).
 [target.'cfg(target_os = "macos")'.dependencies]
 slint = { version = "1.8", features = ["renderer-skia"] }
 

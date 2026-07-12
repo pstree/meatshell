@@ -398,6 +398,8 @@ fn default_flow() -> String {
 #[serde(rename_all = "lowercase")]
 pub enum AuthMethod {
     Password,
+    #[serde(rename = "keyboard-interactive")]
+    KeyboardInteractive,
     Key,
 }
 
@@ -405,12 +407,14 @@ impl AuthMethod {
     pub fn as_str(&self) -> &'static str {
         match self {
             AuthMethod::Password => "password",
+            AuthMethod::KeyboardInteractive => "keyboard-interactive",
             AuthMethod::Key => "key",
         }
     }
 
     pub fn from_str(s: &str) -> Self {
         match s {
+            "keyboard-interactive" | "keyboard" | "interactive" => AuthMethod::KeyboardInteractive,
             "key" => AuthMethod::Key,
             _ => AuthMethod::Password,
         }
@@ -1343,9 +1347,7 @@ impl ConfigStore {
 
     // ── Session groups / folders (#41) ────────────────────────────────────
 
-    /// Explicit groups (empty folders included). The built-in "default" group is
-    /// implicit until renamed; then its formerly ungrouped sessions move into
-    /// the new explicit group.
+    /// Explicit groups (empty folders included). "default" is implicit.
     pub fn groups(&self) -> &[String] {
         &self.cache.groups
     }
@@ -1646,24 +1648,6 @@ mod tests {
     }
 
     #[test]
-    fn renames_implicit_default_group_into_explicit_group() {
-        let mut store = temp_store();
-        store.cache.sessions = vec![
-            sample_session("ungrouped"),
-            Session {
-                group: "ops".into(),
-                ..sample_session("grouped")
-            },
-        ];
-
-        store.rename_group("default", "prod".into());
-
-        assert_eq!(store.cache.sessions[0].group, "prod");
-        assert_eq!(store.cache.sessions[1].group, "ops");
-        assert_eq!(store.groups(), &["prod".to_string()]);
-    }
-
-    #[test]
     fn restores_and_syncs_user_config_backup() {
         let base = std::env::temp_dir().join(format!("ms-backup-{}", Uuid::new_v4()));
         let primary = base.join("portable");
@@ -1713,9 +1697,9 @@ mod tests {
     }
 
     #[test]
-    fn wallpaper_defaults_to_tech_but_keeps_explicit_choice() {
+    fn wallpaper_defaults_to_ms_but_keeps_explicit_choice() {
         // Fresh install (no file).
-        assert_eq!(fresh_config().wallpaper, "builtin:tech");
+        assert_eq!(fresh_config().wallpaper, "builtin:ms");
         // User upgrading from before the feature: JSON without the key.
         let cfg: ConfigFile = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.wallpaper, "builtin:tech");

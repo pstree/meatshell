@@ -3,6 +3,80 @@
 All notable changes are documented here. 本文件记录所有重要变更。
 中英对照（中文在前，English after）.
 
+## [0.6.1] - 2026-07-11
+
+### 新增 / Added
+
+- **新增运行时 SSH 隧道面板 (#206)。** SFTP 底部面板新增“文件 / 隧道”切换，已连接 SSH 会话可在运行中新增和停止本地转发 `-L` 与 SOCKS 动态转发 `-D`，现有会话配置不会被自动改写。
+
+### 修复 / Fixed
+
+- **移除点击标签页时复制标签名称的旧行为。** 点击标签页现在只负责切换会话，多窗口/分屏标签交互不再污染剪贴板。
+
+---
+
+### Added
+
+- **Add a runtime SSH tunnel panel (#206).** The SFTP bottom panel now has Files / Tunnels tabs, allowing connected SSH sessions to add and stop local `-L` forwards and SOCKS dynamic `-D` forwards at runtime without modifying the saved session configuration.
+
+### Fixed
+
+- **Remove the old copy-title-on-tab-click behavior.** Clicking a tab now only switches sessions, so multi-window/split-pane tab interaction no longer overwrites the clipboard.
+
+## [0.6.0] - 2026-07-10
+
+### 修复 / Fixed
+
+- **修复拖动资源侧栏宽度时突然变宽的问题 (#244)。** 资源侧栏分隔条改为使用稳定的窗口绝对坐标计算宽高，不再把移动中的分隔条局部坐标反复累加到当前宽度，避免拖动时宽度突然跳变。
+- **修复 Windows 10 无边框窗口点击坐标整体错位的问题 (#193)。** Windows 创建 Slint/winit 窗口前会禁用 undecorated shadow 兼容层，避免部分 Win10 环境把隐藏边框计入命中区域，导致渲染位置与鼠标点击位置产生垂直偏移。
+- **改善 Windows 高 DPI 缩放下字体发糊的问题 (#224)。** Windows 默认使用 Slint software 渲染器，避开 2K/4K 屏幕开启 125%/150% 等缩放时 OpenGL/FemtoVG 路径可能导致的 UI 与设置页文字偏糊问题；仍可通过 `SLINT_BACKEND` 手动切换渲染器。
+- **修复 SFTP 面板拖动后拖拽上传命中区域错误的问题 (#253)。** 文件拖拽上传的落点判断会跟随 SFTP 面板的左、右、上、下停靠位置，只在当前文件列表区域内触发上传，不再固定只识别默认底部文件区。
+- **支持显式选择键盘交互认证 (#249)。** SSH 会话新增“键盘交互”认证方式，可直接走 keyboard-interactive 登录；密码 / 首次应答会自动用于第一条普通提示，MFA / OTP 等额外提示继续弹窗询问，SFTP 连接也复用同一认证路径。
+- **修复 macOS 触控板无法滚动终端的问题 (#252)。** 终端滚动命中层显式铺满输出区域，并在 macOS 上增加 winit 级触控板滚轮兜底；触控板双指滚动会进入终端回滚/alt-screen 滚轮逻辑，不再只能拖动右侧滚动条。
+
+---
+
+### Fixed
+
+- **Fix sudden resource-sidebar width jumps while resizing (#244).** The resource-sidebar splitter now computes size from stable window-space coordinates instead of repeatedly adding local splitter deltas to the current width, preventing resize jumps while dragging.
+- **Fix whole-window click offset on Windows 10 frameless windows (#193).** Windows now disables winit's undecorated-shadow compatibility layer before creating Slint/winit windows, preventing some Win10 environments from counting hidden frame space in hit testing and shifting clicks vertically away from rendered pixels.
+- **Improve blurry text on Windows high-DPI scaling (#224).** Windows now defaults to Slint's software renderer, avoiding the OpenGL/FemtoVG path that can make UI and settings text look soft on 2K/4K displays using 125%/150% scaling; `SLINT_BACKEND` can still override the renderer manually.
+- **Fix drag-and-drop upload hit testing after moving the SFTP panel (#253).** File-drop upload detection now follows the SFTP panel on the left, right, top, or bottom dock and only triggers inside the current file-list area instead of staying fixed to the default bottom panel.
+- **Support explicit keyboard-interactive authentication (#249).** SSH sessions can now choose keyboard-interactive directly; the saved password / first answer is used for the first regular prompt, MFA / OTP prompts still ask interactively, and SFTP reuses the same auth path.
+- **Fix terminal scrolling with the macOS trackpad (#252).** The terminal scroll hit layer now explicitly covers the output area, and macOS gets a winit-level trackpad wheel fallback; two-finger scrolling feeds the terminal scrollback/alt-screen wheel path instead of requiring the scrollbar thumb.
+
+## [0.5.71] - 2026-07-10
+
+### 新增 / Added
+
+- **SFTP 文件列表支持排序 (#248)。** 文件列表的名称、大小、修改时间表头支持点击排序，点击循环为升序、降序、恢复默认；右键菜单新增“清除排序”，可直接恢复默认排序。
+
+### 改进 / Changed
+
+- **WebDAV 上传前自动创建缺失目录。** 上传连接配置前会逐级检查远端父目录，目录不存在时尝试通过 WebDAV `MKCOL` 创建；如果文件夹不存在且无权限创建，会返回明确提示“文件夹不存在也无权限创建”。
+
+### 修复 / Fixed
+
+- **修复顶部工具栏与 SFTP 操作栏间距问题 (#245)。** 统一沉浸式标题栏场景下顶部工具栏图标的 Y 轴计算，并增加 SFTP 文件面板操作栏高度和上下内边距，避免上传按钮贴近拖动条。
+- **修复复制终端软换行文本时多出换行的问题 (#241)。** 终端行会保留 vt100 的软换行标记，复制选区时跳过由终端宽度造成的自动折行换行，只在真实换行处插入换行符。
+- **修复部分旧服务器 SFTP 认证失败的问题 (#186)。** SFTP 在 password 认证被拒后会像终端连接一样重连并尝试 keyboard-interactive，兼容只开放键盘交互认证的 GBK/旧服务器。
+
+---
+
+### Added
+
+- **Support sorting the SFTP file list (#248).** The name, size, and modified-time headers now cycle through ascending, descending, and default order when clicked. The context menu also adds “Clear sort” to restore the default order.
+
+### Changed
+
+- **Create missing WebDAV folders before upload.** Before uploading the connection config, WebDAV now checks each remote parent folder and creates missing folders with `MKCOL`; if a folder is missing and cannot be created, it reports “folder does not exist and cannot be created”.
+
+### Fixed
+
+- **Fix top toolbar and SFTP action bar spacing (#245).** The top toolbar Y offset is now centralized for immersive-titlebar layouts, and the SFTP file panel action bar has more height and vertical padding so the upload button no longer sits too close to the splitter.
+- **Preserve logical lines when copying soft-wrapped terminal text (#241).** Terminal rows now retain vt100 soft-wrap metadata, and selection copy skips newlines introduced only by terminal-width wrapping while preserving real line breaks.
+- **Fix SFTP authentication on some legacy servers (#186).** When password authentication is rejected, SFTP now reconnects and tries keyboard-interactive like terminal sessions do, improving compatibility with GBK/legacy servers that only allow keyboard-interactive auth.
+
 ## [0.5.7] - 2026-07-08
 
 ### 新增 / Added

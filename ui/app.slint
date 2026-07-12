@@ -22,14 +22,14 @@ import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton, DockExpandButton, IconButton, ToolStrip } from "widgets.slint";
 import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint";
-import { SftpEntry, SftpTreeNode } from "sftp_panel.slint";
+import { SftpEntry, SftpTreeNode, TunnelInfo } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
 import { InterfacePanel } from "interface_panel.slint";
 // Re-export so `slint::include_modules!` generates the ProcWindow Rust type.
 export { ProcWindow }
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
-export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, QuickCmd, PortFwd }
+export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd }
 
 // --- TerminalState ---------------------------------------------------------
 // Per-terminal view-model exposed to Rust. A TabInfo has the metadata; the
@@ -67,6 +67,9 @@ export struct TerminalState {
     sftp-loading: bool,
     sftp-tree-nodes: [SftpTreeNode],
     sftp-selected-count: int,   // checked entries in the SFTP panel (#100)
+    sftp-sort-key: string,      // ""|"name"|"size"|"modified" (#248)
+    sftp-sort-dir: int,         // 0 default / 1 asc / -1 desc (#248)
+    tunnels: [TunnelInfo],      // runtime SSH tunnels (#206)
     sftp-collapsed: bool,       // SFTP panel minimised — per session (#v0.5)
     sftp-panel-height: length,  // SFTP panel extent (bottom dock) — per session
     sftp-panel-width: length,   // SFTP panel extent (side dock) — per session
@@ -319,6 +322,8 @@ export component AppWindow inherits Window {
         + ((root.welcome-as-sidebar && root.welcome-sidebar-dock == "top")
             ? root.welcome-sidebar-taken
             : 0px);
+    property <length> toolbar-y:
+        (root.custom-titlebar ? 43px : 5px + root.titlebar-inset) + root.toolbar-y-off;
     in-out property <bool> about-open: false;     // centered About dialog
     callback open-repo();                          // open the project's GitHub page
     in-out property <bool> shortcuts-open: false; // centered keyboard-shortcuts dialog (#103)
@@ -615,6 +620,7 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-flow: "none";
     in-out property <bool> dialog-disable-shell-integration: false;
     in-out property <string> dialog-note;
+    in-out property <string> dialog-test-status;
 
     // Delete-confirmation modal state (#28).
     in-out property <bool> confirm-delete-open: false;
@@ -638,6 +644,7 @@ export component AppWindow inherits Window {
     callback toggle-group(string /* group */);
     callback remove-session(string /* session-id */);
     callback session-dialog-submit(SessionDraft);
+    callback session-dialog-test(SessionDraft);
     callback session-dialog-cancel();
     callback session-dialog-pick-key();
     // Port forwards for the session being edited (#56).
@@ -709,6 +716,10 @@ export component AppWindow inherits Window {
     callback sftp-edit(string /* tab-id */, string /* path */);
     callback sftp-open-external(string /* tab-id */, string /* path */);
     callback sftp-edit-external(string /* tab-id */, string /* path */);
+    callback sftp-sort-request(string /* tab-id */, string /* key */);
+    callback sftp-clear-sort(string /* tab-id */);
+    callback tunnel-add(string /* tab-id */, string /* name */, string /* kind */, string /* bind */, string /* bind-port */, string /* host */, string /* host-port */);
+    callback tunnel-stop(string /* tab-id */, string /* tunnel-id */);
     // SFTP context-menu extensions (#69): rename / chmod / mkdir / touch share
     // one single-input prompt dialog; copy-path goes straight to the clipboard.
     in-out property <bool> sftp-prompt-open: false;
@@ -863,6 +874,29 @@ export component AppWindow inherits Window {
             expand => {
                 root.welcome-collapsed = false;
                 root.set-welcome-collapsed(false);
+                if (root.sidebar-dock == root.welcome-sidebar-dock) {
+                    root.sidebar-collapsed = true;
+                    root.set-sidebar-collapsed(true);
+                }
+            }
+            expand-second => {
+                root.sidebar-collapsed = false;
+                root.set-sidebar-collapsed(false);
+            }
+        }
+
+        if dock-area.sidebar-strip-outside : ToolStrip {
+            x: root.welcome-sidebar-dock == "right" ? parent.width - parent.sidebar-outside-strip : 0px;
+            y: root.welcome-sidebar-dock == "bottom" ? parent.height - parent.sidebar-outside-strip : 0px;
+            width: parent.welcome-horizontal ? parent.sidebar-outside-strip : parent.width;
+            height: parent.welcome-horizontal ? parent.height : parent.sidebar-outside-strip;
+            dock-edge: root.welcome-sidebar-dock;
+            glyph: "\u{E871}";
+            expand => {
+                root.sidebar-collapsed = false;
+                root.set-sidebar-collapsed(false);
+                root.welcome-collapsed = true;
+                root.set-welcome-collapsed(true);
             }
         }
 
@@ -1116,18 +1150,25 @@ export component AppWindow inherits Window {
                 moved => {
                     if (root.sidebar-dragging) {
                         if (root.sidebar-horizontal) {
-                            // left grows with +dx, right grows with -dx.
+                            // Track the cursor in stable dock-area coordinates.
+                            // The splitter moves while resizing, so adding local
+                            // mouse deltas to the current width feeds the movement
+                            // back into itself and can suddenly widen the panel
+                            // on Win10 (#244).
                             root.sidebar-width = clamp(
-                                root.sidebar-width
-                                    + (root.sidebar-dock == "right" ? -1 : 1)
-                                      * (self.mouse-x - root.sidebar-drag-start-x),
+                                root.sidebar-dock == "right"
+                                    ? dock-area.absolute-position.x + dock-area.width
+                                        - (self.absolute-position.x + self.mouse-x)
+                                    : (self.absolute-position.x + self.mouse-x)
+                                        - dock-area.absolute-position.x,
                                 160px, 520px);
                         } else {
-                            // top grows with +dy, bottom grows with -dy.
                             root.sidebar-height = clamp(
-                                root.sidebar-height
-                                    + (root.sidebar-dock == "bottom" ? -1 : 1)
-                                      * (self.mouse-y - root.sidebar-drag-start-y),
+                                root.sidebar-dock == "bottom"
+                                    ? dock-area.absolute-position.y + dock-area.height
+                                        - (self.absolute-position.y + self.mouse-y)
+                                    : (self.absolute-position.y + self.mouse-y)
+                                        - dock-area.absolute-position.y,
                                 120px, 480px);
                         }
                     }
@@ -1174,7 +1215,6 @@ export component AppWindow inherits Window {
                     active-id: pane.active-id;
                     tab-selected(id) => { root.pane-tab-selected(pane.id, id); }
                     tab-closed(id) => { root.pane-tab-closed(pane.id, id); }
-                    tab-title-copy(title) => { root.copy-text(title); }
                     new-tab() => { root.pane-new-tab(pane.id); }
                     tab-reorder(from, dir) => { root.pane-tab-reorder(pane.id, from, dir); }
                     tab-split(id, dir) => { root.pane-split(pane.id, id, dir); }
@@ -1278,6 +1318,9 @@ export component AppWindow inherits Window {
                     sftp-tree-nodes: term.sftp-tree-nodes;
                     sftp-transfer-targets: root.tabs;
                     sftp-selected-count: term.sftp-selected-count;
+                    sftp-sort-key: term.sftp-sort-key;
+                    sftp-sort-dir: term.sftp-sort-dir;
+                    tunnels: term.tunnels;
                     quick-commands: root.quick-commands;
                     command-history: root.command-history;
                     history-view: root.history-view;
@@ -1332,6 +1375,12 @@ export component AppWindow inherits Window {
                     sftp-edit(path) => { root.sftp-edit(term.id, path); }
                     sftp-open-external(path) => { root.sftp-open-external(term.id, path); }
                     sftp-edit-external(path) => { root.sftp-edit-external(term.id, path); }
+                    sftp-sort-request(key) => { root.sftp-sort-request(term.id, key); }
+                    sftp-clear-sort() => { root.sftp-clear-sort(term.id); }
+                    tunnel-add(name, kind, bind, bind-port, host, host-port) => {
+                        root.tunnel-add(term.id, name, kind, bind, bind-port, host, host-port);
+                    }
+                    tunnel-stop(id) => { root.tunnel-stop(term.id, id); }
                     // #69 context-menu extensions → shared prompt dialog.
                     sftp-rename-request(path, name) => {
                         root.sftp-prompt-kind = "rename";
@@ -1470,28 +1519,28 @@ export component AppWindow inherits Window {
     // of the tab row — below the custom title bar when frameless (y offset), or
     // at the very top on macOS where the native title bar is separate (#119).
     IconBtn {
-        x: root.width - 34px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
+        x: root.width - 34px - root.toolbar-x-off; y: root.toolbar-y;
         icon: "\u{E8B8}";
         tooltip: root.lang-en ? "Settings" : "设置";
         active: root.settings-open;
         clicked => { root.settings-open = !root.settings-open; root.download-open = false; root.ssh-import-hint = ""; }
     }
     IconBtn {
-        x: root.width - 64px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
+        x: root.width - 64px - root.toolbar-x-off; y: root.toolbar-y;
         icon: "\u{E2C4}";
         tooltip: root.lang-en ? "Download" : "下载";
         active: root.download-open;
         clicked => { root.download-open = !root.download-open; root.settings-open = false; }
     }
     IconBtn {
-        x: root.width - 94px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
+        x: root.width - 94px - root.toolbar-x-off; y: root.toolbar-y;
         icon: Theme.dark ? "\u{E518}" : "\u{E51C}";
         icon-color: Theme.dark ? #f5c542 : #5856d6;
         tooltip: root.lang-en ? "Toggle theme" : "切换主题";
         clicked => { root.toggle-theme(); }
     }
     IconBtn {
-        x: root.width - 124px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
+        x: root.width - 124px - root.toolbar-x-off; y: root.toolbar-y;
         icon: "\u{E627}";
         icon-color: root.sync-input ? Theme.accent : Theme.text-secondary;
         active: root.sync-input;
@@ -1577,6 +1626,7 @@ export component AppWindow inherits Window {
             }
             Rectangle {
                 width: 68px; height: 26px;
+                y: (parent.height - self.height) / 2;
                 border-radius: Theme.radius-sm;
                 background: upd-dl-ta.has-hover ? #ffffff45 : #ffffff28;
                 upd-dl-ta := TouchArea {
@@ -1588,6 +1638,7 @@ export component AppWindow inherits Window {
             }
             Rectangle {
                 width: 26px; height: 26px;
+                y: (parent.height - self.height) / 2;
                 border-radius: Theme.radius-sm;
                 background: upd-cl-ta.has-hover ? #ffffff45 : transparent;
                 upd-cl-ta := TouchArea {
@@ -1687,10 +1738,8 @@ export component AppWindow inherits Window {
             scroll-event(event) => { accept }
         }
         edit-fs := FocusScope {
-            // Ctrl+S saves, Ctrl+F toggles find/replace, F3 steps through
-            // matches, Esc closes the find panel (or the editor if the panel
-            // is already hidden). These bubble up from the focused TextInput
-            // because it doesn't consume them.
+            // Ctrl+S saves, Esc closes. These bubble up from the focused
+            // TextInput because it doesn't consume them.
             key-pressed(e) => {
                 // ⌘S on macOS, Ctrl+S elsewhere. (Slint maps `control` to Cmd on
                 // macOS — see #158, so no platform branch is needed here.) On macOS
@@ -3494,8 +3543,10 @@ export component AppWindow inherits Window {
         draft-flow <=> root.dialog-flow;
         draft-disable-shell-integration <=> root.dialog-disable-shell-integration;
         draft-note <=> root.dialog-note;
+        test-status <=> root.dialog-test-status;
         forwards: root.dialog-forwards;
         submit(draft) => { root.session-dialog-submit(draft); }
+        test-connection(draft) => { root.session-dialog-test(draft); }
         cancel => { root.session-dialog-cancel(); }
         pick-key-file => { root.session-dialog-pick-key(); }
         add-forward(n, k, b, p, h, hp) => { root.add-forward(n, k, b, p, h, hp); }

@@ -313,13 +313,6 @@ fn apply_window_chrome(window: &slint::Window) {
         let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
         let hwnd = h.hwnd.get();
 
-        #[repr(C)]
-        struct Margins {
-            left: i32,
-            right: i32,
-            top: i32,
-            bottom: i32,
-        }
         #[link(name = "dwmapi")]
         extern "system" {
             fn DwmSetWindowAttribute(
@@ -328,7 +321,6 @@ fn apply_window_chrome(window: &slint::Window) {
                 pv: *const core::ffi::c_void,
                 cb: u32,
             ) -> i32;
-            fn DwmExtendFrameIntoClientArea(hwnd: isize, margins: *const Margins) -> i32;
         }
         // DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2 (Windows 11+).
         const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
@@ -341,18 +333,8 @@ fn apply_window_chrome(window: &slint::Window) {
                 (&pref as *const u32).cast(),
                 4,
             );
-            // A borderless (WS_POPUP) window has no system shadow; extending the
-            // DWM frame by a hair brings it back. The margin renders as glass, but
-            // our opaque background paints over it — only the shadow shows.
-            let m = Margins {
-                left: 1,
-                right: 1,
-                top: 1,
-                bottom: 1,
-            };
-            let shadow_hr = DwmExtendFrameIntoClientArea(hwnd, &m);
             tracing::debug!(
-                "window chrome applied: hwnd={hwnd:#x} corner_hr={corner_hr:#x} shadow_hr={shadow_hr:#x}"
+                "window chrome applied: hwnd={hwnd:#x} corner_hr={corner_hr:#x}"
             );
         }
     });
@@ -361,7 +343,38 @@ fn apply_window_chrome(window: &slint::Window) {
 #[cfg(not(windows))]
 fn apply_window_chrome(_window: &slint::Window) {}
 
-fn clamp_window_size_to_monitor(window: &slint::Window, preferred: Option<(f32, f32)>) -> Option<(f32, f32)> {
+#[cfg(windows)]
+fn setup_windows_platform() {
+    use i_slint_backend_winit::winit::platform::windows::WindowAttributesExtWindows;
+
+    let mut builder = i_slint_backend_winit::Backend::builder();
+    if let Ok(backend) = std::env::var("SLINT_BACKEND") {
+        if let Some(renderer) = backend.strip_prefix("winit-").filter(|s| !s.is_empty()) {
+            builder = builder.with_renderer_name(renderer.to_owned());
+        }
+    }
+    let backend = builder
+        .with_window_attributes_hook(|attrs| {
+            attrs
+                .with_transparent(false)
+                .with_undecorated_shadow(false)
+        })
+        .build();
+
+    match backend {
+        Ok(backend) => {
+            if slint::platform::set_platform(Box::new(backend)).is_err() {
+                tracing::warn!("Windows winit backend was already initialized");
+            }
+        }
+        Err(err) => tracing::warn!("failed to initialize Windows winit backend: {err}"),
+    }
+}
+
+fn clamp_window_size_to_monitor(
+    window: &slint::Window,
+    preferred: Option<(f32, f32)>,
+) -> Option<(f32, f32)> {
     use i_slint_backend_winit::winit::dpi::{LogicalPosition, LogicalSize};
 
     window.with_winit_window(|ww| {
@@ -473,6 +486,12 @@ fn setup_macos_platform() {
 }
 
 pub fn run() -> Result<()> {
+    // Windows frameless-window attributes must be fixed before the first Slint
+    // window is created; doing it afterwards leaves some Win10 machines with an
+    // invisible frame that shifts mouse hit testing (#193).
+    #[cfg(windows)]
+    setup_windows_platform();
+
     // Immersive native title bar on macOS (must precede the first window).
     #[cfg(target_os = "macos")]
     setup_macos_platform();
@@ -1667,17 +1686,14 @@ pub fn run() -> Result<()> {
         let close_handles = handles.clone();
         let ev_store = store.clone();
         let ev_activity = activity.clone();
+        let mut last_cursor_logical: Option<(f32, f32)> = None;
+        let mut macos_wheel_accum = 0.0_f32;
         // Track the inputs that make up WinActivity; recompute on each change.
         let mut focused = true;
         let mut minimized = false;
         let mut occluded = false;
-        // Cursor position in logical (CSS) pixels, tracked for the macOS
-        // trackpad/wheel fallback (#252).
-        let mut last_cursor_logical: Option<(f32, f32)> = None;
-        // Smooth-scroll accumulator (macOS winit-level path).
-        let mut macos_wheel_accum = 0.0_f32;
-        // Apply the Win11 rounded-corner + shadow chrome once, on the first event
-        // (the HWND reliably exists by then, unlike a pre-run timer) (#162/#166).
+        // Apply the Win11 rounded-corner hint once, on the first event (the HWND
+        // reliably exists by then, unlike a pre-run timer) (#166).
         let mut chrome_done = false;
         window.window().on_winit_window_event(move |_w, event| {
             if !chrome_done {
@@ -1954,6 +1970,248 @@ fn active_sftp_path(win: &AppWindow, tab_id: &str) -> String {
     String::new()
 }
 
+fn handle_macos_terminal_wheel(
+    win: &AppWindow,
+    bufs: &TermBuffers,
+    x: f32,
+    y: f32,
+    lines: i32,
+) -> bool {
+    let Some(hit) = terminal_wheel_hit(win, bufs, x, y) else {
+        return false;
+    };
+    if hit.is_alt {
+        win.invoke_terminal_wheel(hit.tab_id.into(), lines.signum(), hit.col, hit.row);
+    } else {
+        win.invoke_terminal_scroll(hit.tab_id.into(), lines);
+    }
+    true
+}
+
+struct TerminalWheelHit {
+    tab_id: String,
+    is_alt: bool,
+    col: i32,
+    row: i32,
+}
+
+fn terminal_wheel_hit(
+    win: &AppWindow,
+    bufs: &TermBuffers,
+    x: f32,
+    y: f32,
+) -> Option<TerminalWheelHit> {
+    let (active, term, term_state) = active_terminal_panel_rects(win)?;
+    let mut term_x = term.x;
+    let mut term_y = term.y;
+    let mut term_w = term.w;
+    let mut term_h = term.h;
+
+    // TerminalView starts with a 24px status line, then the SFTP dock-region.
+    term_y += 24.0;
+    term_h = (term_h - 24.0).max(0.0);
+
+    let sftp_dock = win.get_sftp_dock().to_string();
+    let sftp_take = if term_state.sftp_collapsed {
+        36.0
+    } else if sftp_dock == "left" || sftp_dock == "right" {
+        term_state.sftp_panel_width + 4.0
+    } else {
+        term_state.sftp_panel_height + 4.0
+    };
+    shrink_edge(&mut term_x, &mut term_y, &mut term_w, &mut term_h, &sftp_dock, sftp_take);
+
+    // Leave the command bar to TextInput/history handling; wheel fallback is for
+    // terminal output only.
+    term_h = (term_h - 34.0).max(0.0);
+    if !contains_logical(
+        LogicalRect {
+            x: term_x,
+            y: term_y,
+            w: term_w,
+            h: term_h,
+        },
+        x,
+        y,
+    ) {
+        return None;
+    }
+
+    let h = bufs.lock().ok()?;
+    let guard = h.get(&active)?;
+    let screen = guard.parser.screen();
+    let (rows, cols) = screen.size();
+    let cell_w = (term_w / cols.max(1) as f32).max(1.0);
+    let cell_h = (term_h / rows.max(1) as f32).max(1.0);
+    Some(TerminalWheelHit {
+        tab_id: active,
+        is_alt: screen.alternate_screen(),
+        col: ((x - term_x) / cell_w).floor() as i32,
+        row: ((y - term_y) / cell_h).floor() as i32,
+    })
+}
+
+fn shrink_edge(x: &mut f32, y: &mut f32, w: &mut f32, h: &mut f32, dock: &str, amount: f32) {
+    let amount = amount.max(0.0);
+    match dock {
+        "left" => {
+            *x += amount;
+            *w = (*w - amount).max(0.0);
+        }
+        "right" => *w = (*w - amount).max(0.0),
+        "top" => {
+            *y += amount;
+            *h = (*h - amount).max(0.0);
+        }
+        "bottom" => *h = (*h - amount).max(0.0),
+        _ => {}
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LogicalRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+fn contains_logical(rect: LogicalRect, x: f32, y: f32) -> bool {
+    x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h
+}
+
+fn app_content_area(win: &AppWindow) -> LogicalRect {
+    let size = win.window().size();
+    let scale = win.window().scale_factor().max(0.01) as f32;
+    let mut area = LogicalRect {
+        x: 0.0,
+        y: if win.get_custom_titlebar() {
+            38.0
+        } else if win.get_is_mac() {
+            28.0
+        } else {
+            0.0
+        },
+        w: size.width as f32 / scale,
+        h: 0.0,
+    };
+    area.h = size.height as f32 / scale - area.y;
+
+    if win.get_welcome_as_sidebar() {
+        let dock = win.get_welcome_sidebar_dock().to_string();
+        let sidebar_strip_outside = !win.get_welcome_collapsed()
+            && win.get_sidebar_collapsed()
+            && win.get_sidebar_dock().as_str() == dock.as_str();
+        let welcome_taken = (if win.get_welcome_collapsed() {
+            36.0
+        } else {
+            win.get_welcome_sidebar_width()
+        }) + if sidebar_strip_outside { 36.0 } else { 0.0 };
+        shrink_edge(
+            &mut area.x,
+            &mut area.y,
+            &mut area.w,
+            &mut area.h,
+            &dock,
+            welcome_taken,
+        );
+    }
+
+    let side_dock = win.get_sidebar_dock().to_string();
+    let side_take = if win.get_sidebar_collapsed() {
+        36.0
+    } else if side_dock == "left" || side_dock == "right" {
+        win.get_sidebar_width() + 4.0
+    } else {
+        win.get_sidebar_height() + 4.0
+    };
+    shrink_edge(
+        &mut area.x,
+        &mut area.y,
+        &mut area.w,
+        &mut area.h,
+        &side_dock,
+        side_take,
+    );
+    area
+}
+
+fn active_terminal_panel_rects(win: &AppWindow) -> Option<(String, LogicalRect, TerminalState)> {
+    let active = win.get_active_tab_id().to_string();
+    if active.is_empty() || active == "welcome" {
+        return None;
+    }
+
+    let area = app_content_area(win);
+    let panes = win.get_panes();
+    let pane = (0..panes.row_count())
+        .filter_map(|i| panes.row_data(i))
+        .find(|p| p.active_id.as_str() == active.as_str())?;
+
+    let terms = win.get_terminals();
+    let term_state = (0..terms.row_count())
+        .filter_map(|i| terms.row_data(i))
+        .find(|t| t.id.as_str() == active.as_str())?;
+
+    Some((
+        active,
+        LogicalRect {
+            x: area.x + pane.x,
+            y: area.y + pane.y + 40.0,
+            w: pane.w,
+            h: (pane.h - 40.0).max(0.0),
+        },
+        term_state,
+    ))
+}
+
+fn active_sftp_file_list_rect(win: &AppWindow) -> Option<LogicalRect> {
+    let (_active, term, term_state) = active_terminal_panel_rects(win)?;
+    if term_state.sftp_collapsed {
+        return None;
+    }
+
+    // TerminalView starts with a 24px connection-status line; SFTP docks inside
+    // the remaining dock-region. This mirrors ui/terminal_view.slint.
+    let dock_region = LogicalRect {
+        x: term.x,
+        y: term.y + 24.0,
+        w: term.w,
+        h: (term.h - 24.0).max(0.0),
+    };
+    let dock = win.get_sftp_dock().to_string();
+    let mut panel = LogicalRect {
+        x: dock_region.x,
+        y: dock_region.y,
+        w: if dock == "left" || dock == "right" {
+            term_state.sftp_panel_width
+        } else {
+            dock_region.w
+        },
+        h: if dock == "left" || dock == "right" {
+            dock_region.h
+        } else {
+            term_state.sftp_panel_height
+        },
+    };
+    if dock == "right" {
+        panel.x = dock_region.x + (dock_region.w - panel.w).max(0.0);
+    } else if dock == "bottom" {
+        panel.y = dock_region.y + (dock_region.h - panel.h).max(0.0);
+    }
+
+    // SftpPanel layout: toolbar 34, then file headers 20 + separator 1; when the
+    // tree is shown (top/bottom docks), the file list starts after tree 160 + sep.
+    let show_tree = dock != "left" && dock != "right";
+    panel.y += 34.0 + 20.0 + 1.0;
+    panel.h = (panel.h - 34.0 - 20.0 - 1.0).max(0.0);
+    if show_tree {
+        panel.x += 160.0 + 1.0;
+        panel.w = (panel.w - 160.0 - 1.0).max(0.0);
+    }
+    Some(panel)
+}
+
 /// Current mouse cursor position in physical screen pixels (Windows).
 #[cfg(windows)]
 fn cursor_pos() -> Option<(i32, i32)> {
@@ -1983,7 +2241,6 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: std::path
     }
     let w = win.window();
     let scale = w.scale_factor().max(0.01);
-    let size = w.size(); // physical
     let Some(inner) = w.with_winit_window(|ww| ww.inner_position().ok()).flatten() else {
         return;
     };
@@ -1993,17 +2250,10 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: std::path
     // Drop point in logical client coordinates.
     let client_x = (cx - inner.x) as f32 / scale;
     let client_y = (cy - inner.y) as f32 / scale;
-    let w_logical = size.width as f32 / scale;
-    let h_logical = size.height as f32 / scale;
-    let h_sftp = win.get_sftp_panel_height();
-
-    // File-list box (logical): right of the sidebar(220)+tree(160)+sep(1),
-    // below the SFTP toolbar(30)+header(20)+sep(1), above the status bar(18).
-    let zone_left = 381.0_f32;
-    let zone_top = h_logical - h_sftp + 51.0;
-    let zone_bottom = h_logical - 18.0;
-    if client_x < zone_left || client_x > w_logical || client_y < zone_top || client_y > zone_bottom
-    {
+    let Some(file_list) = active_sftp_file_list_rect(win) else {
+        return;
+    };
+    if !contains_logical(file_list, client_x, client_y) {
         return; // dropped outside the file list — ignore
     }
 
@@ -2065,156 +2315,6 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: std::path
             }
         }
         win.set_download_open(true);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// macOS trackpad wheel fallback (#252)
-// ---------------------------------------------------------------------------
-
-/// Winit-level scroll handler for macOS. On macOS, smooth-scroll events from a
-/// trackpad / Magic Mouse may not reach Slint's TouchArea `scroll-event` (the
-/// Flickable's internal handler swallows them even with `interactive: false`).
-/// This fallback catches `WEvent::MouseWheel` at the winit layer, accumulates
-/// the pixel/line deltas, and feeds them directly into the terminal's scroll
-/// or alt-screen wheel callback — the same way Slint's native ScrollView handles
-/// smooth scrolling in the SFTP tree.
-fn handle_macos_terminal_wheel(
-    win: &AppWindow,
-    bufs: &TermBuffers,
-    x: f32,
-    y: f32,
-    lines: i32,
-) -> bool {
-    let Some(hit) = terminal_wheel_hit(win, bufs, x, y) else {
-        return false;
-    };
-    if hit.is_alt {
-        win.invoke_terminal_wheel(hit.tab_id.into(), lines.signum(), hit.col, hit.row);
-    } else {
-        win.invoke_terminal_scroll(hit.tab_id.into(), lines);
-    }
-    true
-}
-
-struct TerminalWheelHit {
-    tab_id: String,
-    is_alt: bool,
-    col: i32,
-    row: i32,
-}
-
-/// Hit-test a window-space coordinate against the active terminal's output area.
-fn terminal_wheel_hit(
-    win: &AppWindow,
-    bufs: &TermBuffers,
-    x: f32,
-    y: f32,
-) -> Option<TerminalWheelHit> {
-    let active = win.get_active_tab_id().to_string();
-    if active.is_empty() || active == "welcome" {
-        return None;
-    }
-
-    let size = win.window().size();
-    let scale = win.window().scale_factor().max(0.01) as f32;
-    let mut area_x = 0.0_f32;
-    let mut area_y = if win.get_custom_titlebar() {
-        38.0
-    } else if win.get_is_mac() {
-        28.0
-    } else {
-        0.0
-    };
-    let mut area_w = size.width as f32 / scale;
-    let mut area_h = size.height as f32 / scale - area_y;
-
-    if win.get_welcome_as_sidebar() {
-        let dock = win.get_welcome_sidebar_dock().to_string();
-        let sidebar_strip_outside = !win.get_welcome_collapsed()
-            && win.get_sidebar_collapsed()
-            && win.get_sidebar_dock().as_str() == dock.as_str();
-        let welcome_taken = (if win.get_welcome_collapsed() {
-            36.0
-        } else {
-            win.get_welcome_sidebar_width()
-        }) + if sidebar_strip_outside { 36.0 } else { 0.0 };
-        shrink_edge(&mut area_x, &mut area_y, &mut area_w, &mut area_h, &dock, welcome_taken);
-    }
-
-    let side_dock = win.get_sidebar_dock().to_string();
-    let side_take = if win.get_sidebar_collapsed() {
-        36.0
-    } else if side_dock == "left" || side_dock == "right" {
-        win.get_sidebar_width() + 4.0
-    } else {
-        win.get_sidebar_height() + 4.0
-    };
-    shrink_edge(&mut area_x, &mut area_y, &mut area_w, &mut area_h, &side_dock, side_take);
-
-    let panes = win.get_panes();
-    let pane = (0..panes.row_count())
-        .filter_map(|i| panes.row_data(i))
-        .find(|p| p.active_id.as_str() == active.as_str())?;
-    let mut term_x = area_x + pane.x;
-    let mut term_y = area_y + pane.y + 40.0; // tab strip
-    let mut term_w = pane.w;
-    let mut term_h = (pane.h - 40.0).max(0.0);
-
-    let terms = win.get_terminals();
-    let term_state = (0..terms.row_count())
-        .filter_map(|i| terms.row_data(i))
-        .find(|t| t.id.as_str() == active.as_str())?;
-
-    // TerminalView starts with a 24px status line, then the SFTP dock-region.
-    term_y += 24.0;
-    term_h = (term_h - 24.0).max(0.0);
-
-    let sftp_dock = win.get_sftp_dock().to_string();
-    let sftp_take = if term_state.sftp_collapsed {
-        36.0
-    } else if sftp_dock == "left" || sftp_dock == "right" {
-        term_state.sftp_panel_width + 4.0
-    } else {
-        term_state.sftp_panel_height + 4.0
-    };
-    shrink_edge(&mut term_x, &mut term_y, &mut term_w, &mut term_h, &sftp_dock, sftp_take);
-
-    // Leave the command bar to TextInput/history handling; wheel fallback is for
-    // terminal output only.
-    term_h = (term_h - 34.0).max(0.0);
-    if x < term_x || y < term_y || x > term_x + term_w || y > term_y + term_h {
-        return None;
-    }
-
-    let h = bufs.lock().ok()?;
-    let guard = h.get(&active)?;
-    let screen = guard.parser.screen();
-    let (rows, cols) = screen.size();
-    let cell_w = (term_w / cols.max(1) as f32).max(1.0);
-    let cell_h = (term_h / rows.max(1) as f32).max(1.0);
-    Some(TerminalWheelHit {
-        tab_id: active,
-        is_alt: screen.alternate_screen(),
-        col: ((x - term_x) / cell_w).floor() as i32,
-        row: ((y - term_y) / cell_h).floor() as i32,
-    })
-}
-
-fn shrink_edge(x: &mut f32, y: &mut f32, w: &mut f32, h: &mut f32, dock: &str, amount: f32) {
-    let amount = amount.max(0.0);
-    match dock {
-        "left" => {
-            *x += amount;
-            *w = (*w - amount).max(0.0);
-        }
-        "right" => *w = (*w - amount).max(0.0),
-        "top" => {
-            *y += amount;
-            *h = (*h - amount).max(0.0);
-        }
-        "bottom" => *h = (*h - amount).max(0.0),
-        _ => {}
     }
 }
 
@@ -2310,8 +2410,7 @@ fn jump_candidates(
     exclude_id: &str,
     current_jump_id: &str,
 ) -> (ModelRc<SharedString>, ModelRc<SharedString>, i32) {
-    let mut labels: Vec<SharedString> =
-        vec![t("无（直接连接）", "None (direct)").into()];
+    let mut labels: Vec<SharedString> = vec![t("无（直接连接）", "None (direct)").into()];
     let mut ids: Vec<SharedString> = vec!["".into()];
     let mut selected: i32 = 0;
     for s in store.sessions() {
@@ -2484,6 +2583,7 @@ fn wire_session_callbacks(
             w.set_dialog_key_path("".into());
             w.set_dialog_key_inline("".into());
             w.set_dialog_key_inline_mode(false);
+            w.set_dialog_test_status("".into());
             w.set_dialog_proxy_type("none".into());
             w.set_dialog_proxy_hostport("".into());
             w.set_dialog_group("".into());
@@ -2688,6 +2788,7 @@ fn wire_session_callbacks(
                 w.set_dialog_key_path(session.private_key_path.clone().into());
                 w.set_dialog_key_inline("".into());
                 w.set_dialog_key_inline_mode(!session.private_key_inline.is_empty());
+                w.set_dialog_test_status("".into());
                 let (proxy_type, proxy_hostport) = split_proxy(&session.proxy);
                 w.set_dialog_proxy_type(proxy_type.into());
                 w.set_dialog_proxy_hostport(proxy_hostport.into());
@@ -2971,6 +3072,71 @@ fn wire_session_callbacks(
         });
     }
 
+    // Test connection from the session dialog. This is intentionally lightweight:
+    // it checks network reachability for the current host/port without saving the
+    // draft or opening a terminal tab.
+    {
+        let weak = window.as_weak();
+        let runtime = runtime.clone();
+        window.on_session_dialog_test(move |draft: SessionDraft| {
+            let kind = draft.kind.to_string();
+            if kind == "serial" {
+                let port_name = draft.serial_port.to_string();
+                let baud = if draft.baud_rate <= 0 {
+                    115_200
+                } else {
+                    draft.baud_rate as u32
+                };
+                let weak_done = weak.clone();
+                runtime.spawn(async move {
+                    let message = match tokio::task::spawn_blocking(move || {
+                        serialport::new(&port_name, baud)
+                            .timeout(std::time::Duration::from_millis(800))
+                            .open()
+                    })
+                    .await
+                    {
+                        Ok(Ok(_)) => t("连接正常", "Connection OK").to_string(),
+                        Ok(Err(e)) => format!("{}: {e}", t("连接失败", "Connection failed")),
+                        Err(e) => format!("{}: {e}", t("连接失败", "Connection failed")),
+                    };
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(w) = weak_done.upgrade() {
+                            w.set_dialog_test_status(message.into());
+                        }
+                    });
+                });
+                return;
+            }
+            let host = draft.host.to_string();
+            let default_port = if kind == "telnet" { 23 } else { 22 };
+            let port = if draft.port <= 0 {
+                default_port
+            } else {
+                draft.port as u16
+            };
+            let weak_done = weak.clone();
+            runtime.spawn(async move {
+                let target = format!("{host}:{port}");
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tokio::net::TcpStream::connect((host.as_str(), port)),
+                )
+                .await;
+                let message = match result {
+                    Ok(Ok(_)) => t("连接正常", "Connection OK").to_string(),
+                    Ok(Err(e)) => format!("{}: {e}", t("连接失败", "Connection failed")),
+                    Err(_) => format!("{}: {target}", t("连接超时", "Connection timed out")),
+                };
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak_done.upgrade() {
+                        w.set_dialog_test_status(message.into());
+                    }
+                });
+            });
+        });
+    }
+
     // Cancel dialog.
     {
         let weak = window.as_weak();
@@ -3155,6 +3321,9 @@ fn wire_session_callbacks(
                     VecModel::<SftpTreeNode>::default(),
                 )),
                 sftp_selected_count: 0,
+                sftp_sort_key: "".into(),
+                sftp_sort_dir: 0,
+                tunnels: ModelRc::from(std::rc::Rc::new(VecModel::<TunnelInfo>::default())),
                 sftp_collapsed: sftp_collapsed_default,
                 sftp_panel_height: sftp_h_default,
                 sftp_panel_width: sftp_w_default,
@@ -3605,6 +3774,124 @@ fn terminal_sftp_paths(w: &AppWindow) -> HashMap<String, String> {
         }
     }
     out
+}
+
+fn sorted_sftp_entries_from_model(
+    model: &ModelRc<SftpEntry>,
+    key: &str,
+    dir: i32,
+) -> ModelRc<SftpEntry> {
+    let Some(vec_model) = model.as_any().downcast_ref::<VecModel<SftpEntry>>() else {
+        return model.clone();
+    };
+    let mut entries = Vec::with_capacity(vec_model.row_count());
+    for i in 0..vec_model.row_count() {
+        if let Some(entry) = vec_model.row_data(i) {
+            entries.push(entry);
+        }
+    }
+    sort_sftp_entries(&mut entries, key, dir);
+    ModelRc::from(std::rc::Rc::new(VecModel::from(entries)))
+}
+
+fn sort_sftp_entries(entries: &mut [SftpEntry], key: &str, dir: i32) {
+    use std::cmp::Ordering;
+
+    let name_cmp = |a: &SftpEntry, b: &SftpEntry| natural_name_cmp(&a.name, &b.name);
+    let default_cmp = |a: &SftpEntry, b: &SftpEntry| match (a.is_dir, b.is_dir) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => name_cmp(a, b),
+    };
+
+    if dir == 0 || key.is_empty() {
+        entries.sort_by(default_cmp);
+        return;
+    }
+
+    entries.sort_by(|a, b| {
+        let group = match (a.is_dir, b.is_dir) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => Ordering::Equal,
+        };
+        if group != Ordering::Equal {
+            return group;
+        }
+        let ord = match key {
+            "size" => a
+                .size_bytes
+                .partial_cmp(&b.size_bytes)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| default_cmp(a, b)),
+            "modified" => a
+                .modified_ts
+                .partial_cmp(&b.modified_ts)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| default_cmp(a, b)),
+            _ => name_cmp(a, b).then_with(|| default_cmp(a, b)),
+        };
+        if dir < 0 {
+            ord.reverse()
+        } else {
+            ord
+        }
+    });
+}
+
+fn natural_name_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    natural_ascii_cmp(&a.to_lowercase(), &b.to_lowercase()).then_with(|| a.cmp(b))
+}
+
+fn natural_ascii_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let mut ai = 0;
+    let mut bi = 0;
+    while ai < ab.len() && bi < bb.len() {
+        let ad = ab[ai].is_ascii_digit();
+        let bd = bb[bi].is_ascii_digit();
+        if ad && bd {
+            let a_start = ai;
+            let b_start = bi;
+            while ai < ab.len() && ab[ai].is_ascii_digit() {
+                ai += 1;
+            }
+            while bi < bb.len() && bb[bi].is_ascii_digit() {
+                bi += 1;
+            }
+
+            let mut a_sig = a_start;
+            let mut b_sig = b_start;
+            while a_sig < ai && ab[a_sig] == b'0' {
+                a_sig += 1;
+            }
+            while b_sig < bi && bb[b_sig] == b'0' {
+                b_sig += 1;
+            }
+
+            let a_len = ai - a_sig;
+            let b_len = bi - b_sig;
+            let ord = a_len
+                .cmp(&b_len)
+                .then_with(|| ab[a_sig..ai].cmp(&bb[b_sig..bi]))
+                .then_with(|| (ai - a_start).cmp(&(bi - b_start)));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            continue;
+        }
+
+        let ord = ab[ai].cmp(&bb[bi]);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+        ai += 1;
+        bi += 1;
+    }
+    ab.len().cmp(&bb.len())
 }
 
 /// Push a value into a fixed-length ring buffer (newest at the end).
@@ -4070,6 +4357,7 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
         row.scroll_max = smax;
         row.scroll_offset = soff;
     });
+    win.window().request_redraw();
 }
 
 /// Resolve the user's saved theme preference to a dark/light bool (mirrors the
@@ -4484,6 +4772,29 @@ fn apply_session_event_to_window(
                 refresh_sidebar(win, statuses, local, local_net_hist);
             }
         }
+        SessionEvent::TunnelUpdate(rows) => {
+            let items = rows
+                .into_iter()
+                .map(|r| TunnelInfo {
+                    id: r.id.into(),
+                    name: r.name.into(),
+                    kind: r.kind.clone().into(),
+                    bind: format!("{}:{}", r.bind_addr, r.bind_port).into(),
+                    target: if r.kind == "dynamic" {
+                        "SOCKS5".into()
+                    } else if r.host.is_empty() || r.host_port == 0 {
+                        "".into()
+                    } else {
+                        format!("{}:{}", r.host, r.host_port).into()
+                    },
+                    status: r.status.into(),
+                    active: r.active,
+                })
+                .collect::<Vec<_>>();
+            update_terminal(&|t| {
+                t.tunnels = ModelRc::from(std::rc::Rc::new(VecModel::from(items.clone())));
+            });
+        }
 
         // --- SFTP events ---------------------------------------------------
         SessionEvent::CwdChanged(path) => {
@@ -4495,7 +4806,7 @@ fn apply_session_event_to_window(
             });
         }
         SessionEvent::SftpEntries { path, entries } => {
-            let slint_entries: Vec<SftpEntry> = entries
+            let mut slint_entries: Vec<SftpEntry> = entries
                 .iter()
                 .map(|e| SftpEntry {
                     name: e.name.clone().into(),
@@ -4506,11 +4817,21 @@ fn apply_session_event_to_window(
                     } else {
                         format_size(e.size).into()
                     },
+                    size_bytes: e.size as f32,
                     modified: format_mtime(e.modified).into(),
+                    modified_ts: e.modified as f32,
                     mode: (e.mode & 0o7777) as i32,
                     selected: false,
                 })
                 .collect();
+            let (sort_key, sort_dir) = (0..terminals.row_count())
+                .find_map(|i| {
+                    let row = terminals.row_data(i)?;
+                    (row.id.as_str() == tab_id)
+                        .then(|| (row.sftp_sort_key.to_string(), row.sftp_sort_dir))
+                })
+                .unwrap_or_default();
+            sort_sftp_entries(&mut slint_entries, &sort_key, sort_dir);
             let model = ModelRc::from(std::rc::Rc::new(VecModel::from(slint_entries)));
             update_terminal(&|t| {
                 t.sftp_path = path.clone().into();
@@ -5946,6 +6267,48 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
         });
     }
 
+    // SFTP file-list sorting (#248): click a header to cycle asc -> desc -> default.
+    {
+        let weak = window.as_weak();
+        window.on_sftp_sort_request(move |tab_id: SharedString, key: SharedString| {
+            let Some(w) = weak.upgrade() else { return };
+            let terminals = w.get_terminals();
+            let Some(tm) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() else {
+                return;
+            };
+            update_terminal_row(tm, tab_id.as_str(), |row| {
+                let key = key.to_string();
+                let next_dir = if row.sftp_sort_key.as_str() != key || row.sftp_sort_dir == 0 {
+                    1
+                } else if row.sftp_sort_dir > 0 {
+                    -1
+                } else {
+                    0
+                };
+                let next_key = if next_dir == 0 { String::new() } else { key };
+                row.sftp_entries =
+                    sorted_sftp_entries_from_model(&row.sftp_entries, &next_key, next_dir);
+                row.sftp_sort_key = next_key.into();
+                row.sftp_sort_dir = next_dir;
+            });
+        });
+    }
+    {
+        let weak = window.as_weak();
+        window.on_sftp_clear_sort(move |tab_id: SharedString| {
+            let Some(w) = weak.upgrade() else { return };
+            let terminals = w.get_terminals();
+            let Some(tm) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() else {
+                return;
+            };
+            update_terminal_row(tm, tab_id.as_str(), |row| {
+                row.sftp_entries = sorted_sftp_entries_from_model(&row.sftp_entries, "", 0);
+                row.sftp_sort_key = "".into();
+                row.sftp_sort_dir = 0;
+            });
+        });
+    }
+
     // SFTP multi-select: toggle a row's checkbox + recount (#100).
     {
         let weak = window.as_weak();
@@ -6425,6 +6788,56 @@ fn wire_key_input(
     store: Rc<RefCell<ConfigStore>>,
     ctx: ConnectCtx,
 ) {
+    // Runtime SSH tunnel panel (#206). These tunnels live only for the active
+    // connection; saved session configuration remains unchanged.
+    {
+        let handles_rc = handles.clone();
+        window.on_tunnel_add(
+            move |tab_id: SharedString,
+                  name: SharedString,
+                  kind: SharedString,
+                  bind: SharedString,
+                  bind_port: SharedString,
+                  host: SharedString,
+                  host_port: SharedString| {
+                let kind = kind.to_string();
+                if kind != "local" && kind != "dynamic" {
+                    return;
+                }
+                let Ok(bind_port) = bind_port.trim().parse::<u16>() else {
+                    return;
+                };
+                let host_port = if kind == "dynamic" {
+                    0
+                } else {
+                    match host_port.trim().parse::<u16>() {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    }
+                };
+                let forward = crate::config::PortForward {
+                    kind,
+                    name: name.trim().to_string(),
+                    bind_addr: bind.trim().to_string(),
+                    bind_port,
+                    host: host.trim().to_string(),
+                    host_port,
+                };
+                if let Some(handle) = handles_rc.borrow().get(tab_id.as_str()) {
+                    handle.add_tunnel(format!("runtime-{}", uuid::Uuid::new_v4()), forward);
+                }
+            },
+        );
+    }
+    {
+        let handles_rc = handles.clone();
+        window.on_tunnel_stop(move |tab_id: SharedString, tunnel_id: SharedString| {
+            if let Some(handle) = handles_rc.borrow().get(tab_id.as_str()) {
+                handle.stop_tunnel(tunnel_id.to_string());
+            }
+        });
+    }
+
     // --- Command bar (#55): run command + quick-command management ---------
     {
         let handles_rc = handles.clone();
@@ -7296,7 +7709,11 @@ fn wire_key_input(
                 } else {
                     // alternate-scroll: 3 arrow presses per notch, app-cursor aware.
                     let one: &[u8] = if dir > 0 {
-                        if screen.application_cursor() { b"\x1bOA" } else { b"\x1b[A" }
+                        if screen.application_cursor() {
+                            b"\x1bOA"
+                        } else {
+                            b"\x1b[A"
+                        }
                     } else if screen.application_cursor() {
                         b"\x1bOB"
                     } else {
@@ -7561,6 +7978,13 @@ fn webdav_auth_header(username: &str, password: &str) -> Option<String> {
     ))
 }
 
+fn webdav_auth_req(mut req: ureq::Request, auth: Option<&str>) -> ureq::Request {
+    if let Some(auth) = auth {
+        req = req.set("Authorization", auth);
+    }
+    req
+}
+
 #[derive(Debug)]
 struct WebDavAcceptAnyCertVerifier;
 
@@ -7677,6 +8101,74 @@ fn webdav_error(e: ureq::Error) -> anyhow::Error {
     }
 }
 
+fn webdav_parent_dirs(url: &str) -> Vec<String> {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Vec::new();
+    };
+    let Some((authority, path)) = rest.split_once('/') else {
+        return Vec::new();
+    };
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() <= 1 {
+        return Vec::new();
+    }
+    let mut dirs = Vec::with_capacity(parts.len() - 1);
+    let mut current = format!("{scheme}://{authority}");
+    for part in parts.iter().take(parts.len() - 1) {
+        current.push('/');
+        current.push_str(part);
+        current.push('/');
+        dirs.push(current.clone());
+        current.pop();
+    }
+    dirs
+}
+
+fn webdav_dir_missing_or_no_create_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}",
+        t(
+            "文件夹不存在也无权限创建",
+            "folder does not exist and cannot be created"
+        )
+    )
+}
+
+fn webdav_dir_exists(agent: &ureq::Agent, url: &str, auth: Option<&str>) -> Result<bool> {
+    let req = webdav_auth_req(agent.request("PROPFIND", url).set("Depth", "0"), auth);
+    match req.call() {
+        Ok(_) => Ok(true),
+        Err(ureq::Error::Status(status, _)) if status == 404 || status == 409 => Ok(false),
+        Err(ureq::Error::Status(status, _)) if status == 401 || status == 403 || status == 405 => {
+            Err(webdav_dir_missing_or_no_create_error())
+        }
+        Err(e) => Err(webdav_error(e)),
+    }
+}
+
+fn webdav_create_dir(agent: &ureq::Agent, url: &str, auth: Option<&str>) -> Result<()> {
+    let req = webdav_auth_req(agent.request("MKCOL", url), auth);
+    match req.call() {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(status, _)) if status == 405 => Ok(()),
+        Err(ureq::Error::Status(status, _))
+            if status == 401 || status == 403 || status == 404 || status == 409 =>
+        {
+            Err(webdav_dir_missing_or_no_create_error())
+        }
+        Err(e) => Err(webdav_error(e)),
+    }
+}
+
+fn webdav_ensure_parent_dirs(agent: &ureq::Agent, url: &str, auth: Option<&str>) -> Result<()> {
+    for dir in webdav_parent_dirs(url) {
+        if !webdav_dir_exists(agent, &dir, auth)? {
+            webdav_create_dir(agent, &dir, auth)?;
+        }
+    }
+    Ok(())
+}
+
 fn webdav_put_json(
     base_url: &str,
     remote_path: &str,
@@ -7687,11 +8179,12 @@ fn webdav_put_json(
 ) -> Result<()> {
     let url = webdav_url(base_url, remote_path)?;
     let agent = webdav_agent(accept_invalid_certs);
-    let mut req = agent.put(&url).set("Content-Type", "application/json");
     let auth = webdav_auth_header(username, password);
-    if let Some(auth) = auth.as_deref() {
-        req = req.set("Authorization", auth);
-    }
+    webdav_ensure_parent_dirs(&agent, &url, auth.as_deref())?;
+    let req = webdav_auth_req(
+        agent.put(&url).set("Content-Type", "application/json"),
+        auth.as_deref(),
+    );
     req.send_string(&json).map(|_| ()).map_err(webdav_error)
 }
 
@@ -7704,11 +8197,8 @@ fn webdav_get_json(
 ) -> Result<String> {
     let url = webdav_url(base_url, remote_path)?;
     let agent = webdav_agent(accept_invalid_certs);
-    let mut req = agent.get(&url);
     let auth = webdav_auth_header(username, password);
-    if let Some(auth) = auth.as_deref() {
-        req = req.set("Authorization", auth);
-    }
+    let req = webdav_auth_req(agent.get(&url), auth.as_deref());
     req.call()
         .map_err(webdav_error)?
         .into_string()
@@ -8252,8 +8742,9 @@ struct HistSpan {
     cells: i32,
 }
 
-/// A rendered line: plain text (one char per cell, for find/selection) + runs.
-type Line = (String, Vec<HistSpan>);
+/// A rendered line: plain text (one char per cell, for find/selection), style runs,
+/// and whether the row was soft-wrapped by the terminal width.
+type Line = (String, Vec<HistSpan>, bool);
 
 /// Per-session scrollback cap (recycled on clear / tab close).
 const MAX_HISTORY: usize = 100_000;
@@ -8356,7 +8847,7 @@ fn build_row(screen: &vt100::Screen, r: u16, cols: u16) -> Line {
             cells,
         });
     }
-    (plain, runs)
+    (plain, runs, screen.row_wrapped(r))
 }
 
 /// Detect how many lines scrolled off the top between two screen snapshots by
@@ -8392,7 +8883,7 @@ impl TermBuffer {
         let live: Vec<Line> = (0..rows).map(|r| build_row(s, r, cols)).collect();
         let used = live
             .iter()
-            .rposition(|(_, runs)| !runs.is_empty())
+            .rposition(|(_, runs, _)| !runs.is_empty())
             .map(|i| i + 1)
             .unwrap_or(0);
         (live, used)
@@ -8540,7 +9031,14 @@ impl TermBuffer {
                 String::new()
             };
             out.push_str(seg.trim_end());
-            if r != hi_r {
+            let wrapped = if r < hist_len {
+                self.history[r].2
+            } else if r - hist_len < live.len() {
+                live[r - hist_len].2
+            } else {
+                false
+            };
+            if r != hi_r && !wrapped {
                 out.push('\n');
             }
         }
@@ -8808,13 +9306,12 @@ impl TermBuffer {
             let mut last_content = 0i32;
             let s = self.parser.screen();
             for r in 0..rows {
-                let (plain, runs) = build_row(s, r, cols);
+                let (plain, runs, _wrapped) = build_row(s, r, cols);
                 if !runs.is_empty() {
                     last_content = r as i32;
                 }
                 for hs in runs {
-                    let (fg, bg) =
-                        vt_span_colors(hs.fg, hs.bg, hs.bold, hs.inverse, self.is_dark);
+                    let (fg, bg) = vt_span_colors(hs.fg, hs.bg, hs.bold, hs.inverse, self.is_dark);
                     spans.push(TermSpan {
                         cjk: contains_cjk(&hs.text),
                         text: hs.text.into(),
@@ -8871,8 +9368,7 @@ impl TermBuffer {
                 &live[idx - hist_len]
             };
             for hs in &line.1 {
-                let (fg, bg) =
-                    vt_span_colors(hs.fg, hs.bg, hs.bold, hs.inverse, self.is_dark);
+                let (fg, bg) = vt_span_colors(hs.fg, hs.bg, hs.bold, hs.inverse, self.is_dark);
                 spans.push(TermSpan {
                     text: hs.text.clone().into(),
                     fg,
@@ -9318,8 +9814,64 @@ mod key_tests {
 mod selection_tests {
     use super::*;
 
+    fn sftp_entry(name: &str, is_dir: bool) -> SftpEntry {
+        SftpEntry {
+            name: name.into(),
+            full_path: format!("/{name}").into(),
+            is_dir,
+            size: String::new().into(),
+            size_bytes: 0.0,
+            modified: String::new().into(),
+            modified_ts: 0.0,
+            mode: 0,
+            selected: false,
+        }
+    }
+
+    fn sftp_names(entries: &[SftpEntry]) -> Vec<String> {
+        entries.iter().map(|e| e.name.to_string()).collect()
+    }
+
+    #[test]
+    fn sftp_name_sort_uses_natural_numeric_order() {
+        let mut entries = vec![
+            sftp_entry("file100", false),
+            sftp_entry("file10", false),
+            sftp_entry("file2", false),
+            sftp_entry("file11", false),
+            sftp_entry("file1", false),
+        ];
+        sort_sftp_entries(&mut entries, "name", 1);
+        assert_eq!(
+            sftp_names(&entries),
+            vec!["file1", "file2", "file10", "file11", "file100"]
+        );
+
+        sort_sftp_entries(&mut entries, "name", -1);
+        assert_eq!(
+            sftp_names(&entries),
+            vec!["file100", "file11", "file10", "file2", "file1"]
+        );
+    }
+
+    #[test]
+    fn sftp_default_sort_keeps_dirs_first_with_natural_names() {
+        let mut entries = vec![
+            sftp_entry("file100", false),
+            sftp_entry("dir10", true),
+            sftp_entry("file11", false),
+            sftp_entry("dir2", true),
+        ];
+        sort_sftp_entries(&mut entries, "", 0);
+        assert_eq!(sftp_names(&entries), vec!["dir2", "dir10", "file11", "file100"]);
+    }
+
     fn hist_line(s: &str) -> Line {
-        (s.to_string(), Vec::new())
+        (s.to_string(), Vec::new(), false)
+    }
+
+    fn wrapped_hist_line(s: &str) -> Line {
+        (s.to_string(), Vec::new(), true)
     }
 
     /// A TermBuffer whose live screen (rows×cols) shows `live_lines`, with the
@@ -9392,6 +9944,23 @@ mod selection_tests {
         };
         assert_eq!(sel(3), sel(0));
         assert_eq!(sel(3), "HIST0\nHIST1\nHIST2\nLIVE0\nLIVE1");
+    }
+
+    #[test]
+    fn extract_joins_soft_wrapped_rows() {
+        let mut buf = make_buf(5, 10, &[], &["x"], 0);
+        buf.history = vec![
+            wrapped_hist_line("0123456789"),
+            wrapped_hist_line("abcdefghij"),
+            hist_line("klmnop"),
+            hist_line("next"),
+        ];
+        buf.sel_anchor = Some((0, 0));
+        buf.sel_focus = Some((3, 9));
+        assert_eq!(
+            buf.extract_selection_text(),
+            "0123456789abcdefghijklmnop\nnext"
+        );
     }
 
     #[test]
@@ -9472,7 +10041,7 @@ mod selection_tests {
 
         let mut parser = vt100::Parser::new(3, 30, 0);
         parser.process(b"abc \x1b[7m20260705\x1b[27m end");
-        let (_plain, runs) = build_row(parser.screen(), 0, 30);
+        let (_plain, runs, _wrapped) = build_row(parser.screen(), 0, 30);
         let hit = runs
             .iter()
             .find(|span| span.text.contains("20260705"))
