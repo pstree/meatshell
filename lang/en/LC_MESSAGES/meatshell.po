@@ -105,6 +105,15 @@ msgstr "Password"
 msgid "Private key"
 msgstr "Private key"
 
+msgid "Keyboard-interactive"
+msgstr "Keyboard-interactive"
+
+msgid "Password / first answer"
+msgstr "Password / first answer"
+
+msgid "Server prompts are shown during login; MFA / OTP prompts will ask again."
+msgstr "Server prompts are shown during login; MFA / OTP prompts will ask again."
+
 msgid "Leave blank to keep the current password"
 msgstr "Leave blank to keep the current password"
 
@@ -141,6 +150,9 @@ msgstr "Remember for this session"
 msgid "Please enter a host / IP address."
 msgstr "Please enter a host / IP address."
 
+msgid "Please enter a serial port."
+msgstr "Please enter a serial port."
+
 msgid "Cancel"
 msgstr "Cancel"
 
@@ -152,6 +164,21 @@ msgstr "Create"
 
 msgid "Connect"
 msgstr "Connect"
+
+msgid "Test connection"
+msgstr "Test connection"
+
+msgid "Testing..."
+msgstr "Testing..."
+
+msgid "Connection OK"
+msgstr "Connection OK"
+
+msgid "Connection failed"
+msgstr "Connection failed"
+
+msgid "Connection timed out"
+msgstr "Connection timed out"
 
 msgid "SFTP not connected"
 msgstr "SFTP not connected"
@@ -467,3 +494,6 @@ msgstr "Duplicate connection"
 
 msgid "Copied"
 msgstr "Copied"
+
+msgid "Clear sort"
+msgstr "Clear sort"
