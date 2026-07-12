@@ -331,9 +331,12 @@ const DEFAULT_WALLPAPER_OVERLAY: f32 = 1.0 - DEFAULT_WALLPAPER_TRANSPARENCY;
 fn fresh_config() -> ConfigFile {
     ConfigFile {
         wallpaper: default_wallpaper(),
-        welcome_as_sidebar: true,
+        welcome_as_sidebar: false,
+        collapse_sidebar_default: false,
+        collapse_sftp_default: false,
         sidebar_dock: "left".to_string(),
-        wallpaper_overlay: DEFAULT_WALLPAPER_OVERLAY,
+        // 70% wallpaper transparency on first run (overlay opacity = 0.30).
+        wallpaper_overlay: 0.30,
         defaults_rev: DEFAULTS_REV,
         ..ConfigFile::default()
     }
