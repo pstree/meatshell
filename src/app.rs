@@ -6697,6 +6697,17 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
         });
     }
 
+    // Pure: number of logical lines in the text (newlines + 1). Slint divides
+    // the TextInput's `preferred-height` by this to measure the *actual* line
+    // height, which the find-scroll math needs to be exact (a hardcoded
+    // multiplier like `font-size * 1.35` drifts with the line index and lands
+    // on the wrong line — or scrolls the match off-screen — for deep matches).
+    {
+        window.on_editor_line_count(move |text: SharedString| {
+            text.as_str().split('\n').count().max(1) as i32
+        });
+    }
+
     // Replace every occurrence of the query with `replacement`. Uses Rust's
     // `str::replace` (handles non-overlapping matches identically to the find
     // loop). After writing the new content back, Slint refreshes the search.

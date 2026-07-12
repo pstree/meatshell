@@ -560,6 +560,7 @@ export component AppWindow inherits Window {
     pure callback editor-search-matches(string, string) -> [int];
     pure callback editor-byte-length-of(string) -> int;
     pure callback editor-line-index-at(string, int) -> int;
+    pure callback editor-line-count(string) -> int;
     callback editor-replace-all(string);
 
     // Editor card geometry: draggable by its title bar, resizable from the
@@ -1785,9 +1786,18 @@ export component AppWindow inherits Window {
 
             function editor-scroll-to-offset(offset: int) {
                 let line-index = root.editor-line-index-at(root.editor-content, offset);
-                let row-height = edit-input.font-size * 1.35;
-                let match-y = line-index * row-height;
-                let target-top = max(0px, match-y - max(0px, ed-scroll.visible-height / 2 - row-height));
+                // Measure the *actual* line height instead of guessing
+                // `font-size * 1.35`: the real value comes from the font's
+                // metrics and differs per font, so a fixed multiplier drifts
+                // with the line index and scrolls deep matches to the wrong
+                // place (or off-screen). Divide the TextInput's full content
+                // height by the line count for an exact, drift-free value.
+                let n-lines = root.editor-line-count(root.editor-content);
+                let line-height = edit-input.preferred-height / max(1, n-lines);
+                // The text starts `edit-input.y` px down inside the scroll
+                // content (8px padding), so include that offset.
+                let match-y = edit-input.y + line-index * line-height;
+                let target-top = max(0px, match-y - max(0px, ed-scroll.visible-height / 2 - line-height));
                 let min-y = min(0px, ed-scroll.visible-height - ed-scroll.viewport-height);
                 ed-scroll.viewport-y = max(min-y, min(0px, -target-top));
             }
