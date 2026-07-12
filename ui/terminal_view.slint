@@ -733,6 +733,12 @@ export component TerminalView inherits Rectangle {
                 width: key-capture.width;
                 height: 1px;
                 opacity: 0;
+                // Kill the native text caret: `opacity: 0` hides the element but
+                // Slint 1.8 still draws the TextInput's blinking bar caret, which
+                // shows up at (0, height-16) — a stray second cursor at the line
+                // start. Setting the caret width to 0 removes it; the terminal's
+                // own block cursor (the Rectangle below) is the only cursor shown.
+                text-cursor-width: 0px;
                 single-line: true;
 
                 // Reset blink phase on focus gain so cursor appears immediately.
