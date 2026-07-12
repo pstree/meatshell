@@ -422,7 +422,7 @@ export component SftpPanel inherits Rectangle {
         // --- Main area: tree (left) + file list (right) --------------------
         HorizontalLayout {
             visible: root.panel-mode == "files";
-            vertical-stretch: 1;
+            vertical-stretch: root.panel-mode == "files" ? 1 : 0;
             spacing: 0;
 
             // ── Left: directory tree (hidden when the panel is narrow) ──────
@@ -860,7 +860,7 @@ export component SftpPanel inherits Rectangle {
 
         Rectangle {
             visible: root.panel-mode == "tunnels";
-            vertical-stretch: 1;
+            vertical-stretch: root.panel-mode == "tunnels" ? 1 : 0;
             clip: true;
             background: transparent;
 
