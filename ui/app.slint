@@ -810,7 +810,7 @@ export component AppWindow inherits Window {
     callback terminal-wheel(string, int, int, int);
     callback terminal-scroll-to(string /* tab-id */, int /* offset */); // scrollbar drag (#103)
     // Drag-selection lifecycle (grid row/col coordinates).
-    callback term-select-start(string /* tab-id */, int /* row */, int /* col */, bool /* ctrl */, bool /* shift */);
+    callback term-select-start(string /* tab-id */, int /* row */, int /* col */);
     callback term-select-update(string /* tab-id */, int /* row */, int /* col */);
     callback term-select-end(string /* tab-id */);
     callback term-select-autoscroll(string /* tab-id */, int /* dir */);
@@ -1472,11 +1472,11 @@ export component AppWindow inherits Window {
                     terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
                     terminal-wheel(d, c, r) => { root.terminal-wheel(term.id, d, c, r); }
                     terminal-scroll-to(o) => { root.terminal-scroll-to(term.id, o); }
-                    select-start(r, c, ctrl, shift) => { root.term-select-start(term.id, r, c, ctrl, shift); }
-                    select-update(r, c) => { root.term-select-update(term.id, r, c); }
-                    select-end() => { root.term-select-end(term.id); }
-                    select-autoscroll(dir) => { root.term-select-autoscroll(term.id, dir); }
-                    select-word(r, c) => { root.term-select-word(term.id, r, c); }
+                    select-start(tab-id, r, c) => { root.term-select-start(tab-id, r, c); }
+                    select-update(tab-id, r, c) => { root.term-select-update(tab-id, r, c); }
+                    select-end(tab-id) => { root.term-select-end(tab-id); }
+                    select-autoscroll(tab-id, dir) => { root.term-select-autoscroll(tab-id, dir); }
+                    select-word(tab-id, r, c) => { root.term-select-word(tab-id, r, c); }
                 }
 
                 // Windows may show the terminal model being reconstructed when

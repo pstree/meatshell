@@ -104,7 +104,7 @@ export component TerminalView inherits Rectangle {
     in property <bool>   is-alt-screen;
     in property <[TermMatch]> find-matches; // search-highlight rectangles
     in property <[TermMatch]> selection;    // drag-selection highlight rectangles
-    callback select-word(int, int);
+    callback select-word(string, int, int);
 
     in property <string>  sftp-path: "/";
     in property <[SftpEntry]> sftp-entries;
@@ -217,10 +217,10 @@ export component TerminalView inherits Rectangle {
     // arrow keys (alternate-scroll).
     callback terminal-wheel(int /* dir */, int /* col */, int /* row */);
     callback terminal-scroll-to(int);       // jump to an absolute scrollback offset (#103)
-    callback select-start(int, int, bool, bool); // row, col, ctrl, shift
-    callback select-update(int, int);       // extend drag-selection to (row, col)
-    callback select-end();                  // finish selection → copy to clipboard
-    callback select-autoscroll(int);        // auto-scroll while dragging past edge (dir: -1 up / +1 down)
+    callback select-start(string, int, int); // tab-id, row, col
+    callback select-update(string, int, int);       // tab-id, extend drag-selection to (row, col)
+    callback select-end(string);                  // tab-id; finish selection → copy to clipboard
+    callback select-autoscroll(string, int);        // tab-id, auto-scroll while dragging past edge (dir: -1 up / +1 down)
 
     // Right-click context-menu anchor + find-bar visibility (private UI state).
     property <length> ctx-x;
@@ -432,7 +432,7 @@ export component TerminalView inherits Rectangle {
             Timer {
                 running: root.selecting && root.autoscroll-dir != 0;
                 interval: 50ms;
-                triggered => { root.select-autoscroll(root.autoscroll-dir); }
+                triggered => { root.select-autoscroll(root.tab-id, root.autoscroll-dir); }
             }
 
             VerticalLayout {
@@ -492,10 +492,9 @@ export component TerminalView inherits Rectangle {
                                     } else if (ev.button == PointerEventButton.left) {
                                         root.selecting = true;
                                         root.select-start(
+                                            root.tab-id,
                                             floor(self.mouse-y / root.cell-h),
-                                            floor(self.mouse-x / root.cell-w),
-                                            ev.modifiers.control,
-                                            ev.modifiers.shift);
+                                            floor(self.mouse-x / root.cell-w));
                                     }
                                 } else if (ev.kind == PointerEventKind.up) {
                                     if (ev.button == PointerEventButton.middle) {
@@ -505,7 +504,7 @@ export component TerminalView inherits Rectangle {
                                             && root.selecting) {
                                         root.selecting = false;
                                         root.autoscroll-dir = 0;
-                                        root.select-end();
+                                        root.select-end(root.tab-id);
                                     }
                                 }
                             }
@@ -515,6 +514,7 @@ export component TerminalView inherits Rectangle {
                                     // viewport (body-touch sits on the grid Rectangle
                                     // at content y=8px; viewport-y offsets the scroll).
                                     root.select-update(
+                                        root.tab-id,
                                         floor(self.mouse-y / root.cell-h),
                                         floor(self.mouse-x / root.cell-w));
                                     if (!root.is-alt-screen) {
@@ -640,10 +640,9 @@ export component TerminalView inherits Rectangle {
                                     } else if (ev.button == PointerEventButton.left) {
                                         root.selecting = true;
                                         root.select-start(
+                                            root.tab-id,
                                             floor(self.mouse-y / root.cell-h),
-                                            floor(self.mouse-x / root.cell-w),
-                                            ev.modifiers.control,
-                                            ev.modifiers.shift);
+                                            floor(self.mouse-x / root.cell-w));
                                     }
                                 } else if (ev.kind == PointerEventKind.up) {
                                     if (ev.button == PointerEventButton.middle) {
@@ -653,15 +652,16 @@ export component TerminalView inherits Rectangle {
                                             && root.selecting) {
                                         root.selecting = false;
                                         root.autoscroll-dir = 0;
-                                        root.select-end();
+                                        root.select-end(root.tab-id);
                                     }
                                 }
                             }
-                            moved => {
-                                if (root.selecting) {
-                                    root.select-update(
-                                        floor(self.mouse-y / root.cell-h),
-                                        floor(self.mouse-x / root.cell-w));
+                                moved => {
+                                    if (root.selecting) {
+                                        root.select-update(
+                                            root.tab-id,
+                                            floor(self.mouse-y / root.cell-h),
+                                            floor(self.mouse-x / root.cell-w));
                                     if (!root.is-alt-screen) {
                                         root.vis-y = self.mouse-y + 8px + flickable.viewport-y;
                                         if (root.vis-y < 0) {
@@ -700,6 +700,7 @@ export component TerminalView inherits Rectangle {
                             }
                             double-clicked => {
                                 root.select-word(
+                                    root.tab-id,
                                     floor(self.mouse-y / root.cell-h),
                                     floor(self.mouse-x / root.cell-w)
                                 );

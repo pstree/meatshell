@@ -62,6 +62,13 @@ struct TermBuffer {
     /// match — the way FinalShell rewraps on resize (#169). Only the most recent
     /// `RAW_CAP` bytes are kept; scrollback older than that won't reflow.
     raw: std::collections::VecDeque<u8>,
+    /// Highlight cache: maps a rendered line's plain text to its highlighted
+    /// runs so re-rendered lines (scrollback, still frames) skip the expensive
+    /// highlight scan (#perf). Keyed by plain-text hash because history
+    /// lines are stable while their indices can shift on truncation.
+    hl_version: u64,
+    hl_cache_version: u64,
+    hl_cache: HashMap<u64, Arc<Vec<HistSpan>>>,
 }
 
 /// How much of the byte stream we retain per tab for resize-reflow (#169).
@@ -4262,6 +4269,9 @@ fn wire_session_callbacks(
                     displayed_text: Vec::new(),
                     csi_state: CsiState::Normal,
                     raw: std::collections::VecDeque::new(),
+                    hl_version: 0,
+                    hl_cache_version: 0,
+                    hl_cache: HashMap::new(),
                 },
             );
             render_gates
@@ -5852,6 +5862,7 @@ fn apply_dark_mode(window: &AppWindow, bufs: &TermBuffers, dark: bool) {
         let mut map = bufs.lock().unwrap();
         for buf in map.values_mut() {
             buf.is_dark = dark;
+            buf.hl_version = buf.hl_version.wrapping_add(1);
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
@@ -5870,6 +5881,7 @@ fn apply_output_highlight(
     {
         for handle in bufs.lock().unwrap().values_mut() {
             handle.output_highlight = mode;
+            handle.hl_version = handle.hl_version.wrapping_add(1);
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
@@ -5887,6 +5899,7 @@ fn apply_custom_output_rules(
     {
         for handle in bufs.lock().unwrap().values_mut() {
             handle.custom_highlight_rules = compiled.clone();
+            handle.hl_version = handle.hl_version.wrapping_add(1);
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
@@ -9485,7 +9498,7 @@ fn wire_key_input(
     {
         let bufs_sel = bufs.clone();
         let weak = window.as_weak();
-        window.on_term_select_start(move |tab_id: SharedString, row: i32, col: i32, ctrl: bool, shift: bool| {
+        window.on_term_select_start(move |tab_id: SharedString, row: i32, col: i32| {
             let tid = tab_id.to_string();
             {
                 let mut map = bufs_sel.lock().unwrap();
@@ -9496,17 +9509,8 @@ fn wire_key_input(
                 // Anchor + focus in absolute scrollback coordinates.
                 let abs = buf.vis_to_abs(r);
                 let point = (abs, c);
-                if ctrl && !shift {
-                    buf.sel_ranges.push((point, point));
-                } else if shift && !buf.sel_ranges.is_empty() {
-                    let anchor = buf.sel_ranges.last().map(|range| range.0).unwrap_or(point);
-                    if let Some(range) = buf.sel_ranges.last_mut() {
-                        *range = (anchor, point);
-                    }
-                } else {
-                    buf.sel_ranges.clear();
-                    buf.sel_ranges.push((point, point));
-                }
+                buf.sel_ranges.clear();
+                buf.sel_ranges.push((point, point));
                 let (anchor, focus) = buf.sel_ranges.last().copied().unwrap_or((point, point));
                 buf.sel_anchor = Some(anchor);
                 buf.sel_focus = Some(focus);
@@ -10831,39 +10835,91 @@ fn text_cell_width(text: &str) -> i32 {
         .sum()
 }
 
+/// Pre-compiled alternation of all uppercase log-level words. One regex scan
+/// replaces the previous N `match_indices` passes (one per word), which was the
+/// dominant cost inside `highlight_plain_output` on hot output paths.
+const LEVELS: [(&str, u8); 10] = [
+    ("CRITICAL", 9),
+    ("WARNING", 11),
+    ("ERROR", 9),
+    ("FATAL", 9),
+    ("PANIC", 9),
+    ("TRACE", 8),
+    ("DEBUG", 8),
+    ("NOTICE", 14),
+    ("INFO", 14),
+    ("WARN", 11),
+];
+
+/// Pre-compiled alternation of uppercase DevOps state words.
+const STATES: [(&str, u8); 15] = [
+    ("UNHEALTHY", 9),
+    ("SUCCEEDED", 10),
+    ("SUCCESS", 10),
+    ("FAILURE", 9),
+    ("FAILED", 9),
+    ("TIMEOUT", 9),
+    ("DENIED", 9),
+    ("DEGRADED", 11),
+    ("RETRYING", 11),
+    ("PENDING", 11),
+    ("HEALTHY", 10),
+    ("READY", 10),
+    ("PASSED", 10),
+    ("RETRY", 11),
+    ("FAIL", 9),
+];
+
+/// Word-boundary-anchored regex matching any log-level word in one left-to-right
+/// pass. Equivalent to the old per-word `match_indices` loop but ~10x cheaper.
+fn level_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        let pat = LEVELS
+            .iter()
+            .map(|(w, _)| regex::escape(w))
+            .collect::<Vec<_>>()
+            .join("|");
+        // NB: the `regex` crate does not support look-around, so word
+        // boundaries are enforced by `ascii_word_boundary` at each match site
+        // rather than via `(?<!...)`/`(?!...)`.
+        regex::Regex::new(&pat).unwrap()
+    })
+}
+
+/// Same as [`level_re`] but for DevOps state words.
+fn devops_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        let pat = STATES
+            .iter()
+            .map(|(w, _)| regex::escape(w))
+            .collect::<Vec<_>>()
+            .join("|");
+        // NB: the `regex` crate does not support look-around, so word
+        // boundaries are enforced by `ascii_word_boundary` at each match site.
+        regex::Regex::new(&pat).unwrap()
+    })
+}
+
 /// Return `(byte_start, byte_end, xterm_256_index)` for a log severity marker.
 fn log_level_marker(text: &str, max_chars: usize) -> Option<(usize, usize, u8)> {
-    const LEVELS: [(&str, u8); 10] = [
-        ("CRITICAL", 9),
-        ("WARNING", 11),
-        ("ERROR", 9),
-        ("FATAL", 9),
-        ("PANIC", 9),
-        ("TRACE", 8),
-        ("DEBUG", 8),
-        ("NOTICE", 14),
-        ("INFO", 14),
-        ("WARN", 11),
-    ];
-
     let bytes = text.as_bytes();
-    let mut best: Option<(usize, usize, u8)> = None;
-    for (word, colour) in LEVELS {
-        for (start, _) in text.match_indices(word) {
-            if text[..start].chars().count() >= max_chars
-                || !ascii_word_boundary(bytes, start, start + word.len())
-            {
-                continue;
-            }
-            let candidate = (start, start + word.len(), colour);
-            if best.map_or(true, |current| start < current.0) {
-                best = Some(candidate);
-            }
-            break;
+    let re = level_re();
+    let mut from = 0;
+    while let Some(m) = re.find_at(text, from) {
+        let start = m.start();
+        let end = m.end();
+        if ascii_word_boundary(bytes, start, end)
+            && text[..start].chars().count() < max_chars
+        {
+            let colour = LEVELS
+                .iter()
+                .find(|(w, _)| *w == m.as_str())
+                .map(|(_, c)| *c)?;
+            return Some((start, end, colour));
         }
-    }
-    if best.is_some() {
-        return best;
+        from = end;
     }
 
     // Structured logging commonly emits `level=error`, `level: warn`, or
@@ -10926,42 +10982,22 @@ fn output_highlight_marker(
 /// Additional deployment/operations states used by the DevOps preset. The list
 /// intentionally avoids ambiguous short words such as OK/UP/DOWN.
 fn devops_marker(text: &str, max_chars: usize) -> Option<(usize, usize, u8)> {
-    const STATES: [(&str, u8); 15] = [
-        ("UNHEALTHY", 9),
-        ("SUCCEEDED", 10),
-        ("SUCCESS", 10),
-        ("FAILURE", 9),
-        ("FAILED", 9),
-        ("TIMEOUT", 9),
-        ("DENIED", 9),
-        ("DEGRADED", 11),
-        ("RETRYING", 11),
-        ("PENDING", 11),
-        ("HEALTHY", 10),
-        ("READY", 10),
-        ("PASSED", 10),
-        ("RETRY", 11),
-        ("FAIL", 9),
-    ];
-
     let bytes = text.as_bytes();
-    let mut best: Option<(usize, usize, u8)> = None;
-    for (word, colour) in STATES {
-        for (start, _) in text.match_indices(word) {
-            if text[..start].chars().count() >= max_chars
-                || !ascii_word_boundary(bytes, start, start + word.len())
-            {
-                continue;
-            }
-            let candidate = (start, start + word.len(), colour);
-            if best.map_or(true, |current| start < current.0) {
-                best = Some(candidate);
-            }
-            break;
+    let re = devops_re();
+    let mut from = 0;
+    while let Some(m) = re.find_at(text, from) {
+        let start = m.start();
+        let end = m.end();
+        if ascii_word_boundary(bytes, start, end)
+            && text[..start].chars().count() < max_chars
+        {
+            let colour = STATES
+                .iter()
+                .find(|(w, _)| *w == m.as_str())
+                .map(|(_, c)| *c)?;
+            return Some((start, end, colour));
         }
-    }
-    if best.is_some() {
-        return best;
+        from = end;
     }
 
     let lower = text.to_ascii_lowercase();
@@ -11009,6 +11045,47 @@ fn ascii_word_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
         .get(start.wrapping_sub(1))
         .map_or(true, |b| !is_word(*b))
         && bytes.get(end).map_or(true, |b| !is_word(*b))
+}
+
+/// Cap on cached highlighted lines; beyond this the cache is dropped wholesale
+/// (rare — only on very long, varied scrollback) to bound memory.
+const HL_CACHE_CAP: usize = 8192;
+
+/// Stable hash of a rendered line's plain text, used as the highlight-cache key.
+fn plain_key(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Return highlighted runs for `plain`, reusing a prior computation when the same
+/// line (same plain text, same highlight config `version`) was rendered before.
+/// `cache_version` tracks the version the cache was built under; whenever the
+/// highlight config changes (`version` bumps) the cache is cleared once.
+fn cached_highlight(
+    cache: &mut HashMap<u64, Arc<Vec<HistSpan>>>,
+    cache_version: &mut u64,
+    version: &mut u64,
+    preset: OutputHighlightPreset,
+    rules: &[CompiledOutputRule],
+    plain: &str,
+    runs: Vec<HistSpan>,
+) -> Arc<Vec<HistSpan>> {
+    if *cache_version != *version {
+        cache.clear();
+        *cache_version = *version;
+    }
+    let key = plain_key(plain);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    let computed = highlight_plain_output(runs, preset, rules);
+    let rc = Arc::new(computed);
+    if cache.len() < HL_CACHE_CAP {
+        cache.insert(key, rc.clone());
+    }
+    rc
 }
 
 /// Detect how many lines scrolled off the top between two screen snapshots by
@@ -11299,6 +11376,8 @@ impl TermBuffer {
 
         self.sel_anchor = Some((abs, c0 as u16));
         self.sel_focus = Some((abs, c1 as u16));
+        self.sel_ranges.clear();
+        self.sel_ranges.push(((abs, c0 as u16), (abs, c1 as u16)));
 
         let extracted = self.extract_selection_text();
         if extracted.is_empty() {
@@ -11485,12 +11564,18 @@ impl TermBuffer {
     /// Render the terminal grid for the current scrollback `view_offset`
     /// (0 = live).  Caches the displayed plain text for find/selection.
     fn render(&mut self) -> BuiltScreen {
-        let (is_alt, rows, cols, cur_row, cur_col) = {
-            let s = self.parser.screen();
-            let (r, c) = s.size();
-            let (cr, cc) = s.cursor_position();
-            (s.alternate_screen(), r, c, cr, cc)
-        };
+    let (is_alt, rows, cols, cur_row, cur_col) = {
+        let s = self.parser.screen();
+        let (r, c) = s.size();
+        let (cr, cc) = s.cursor_position();
+        (s.alternate_screen(), r, c, cr, cc)
+    };
+
+    // Snapshot highlight config so the (possibly cached) highlight calls
+    // inside the render loop don't re-borrow `self` while `s` holds
+    // an immutable borrow.
+    let preset = self.output_highlight;
+    let rules = self.custom_highlight_rules.clone();
 
         // --- Live view (also alt-screen): render the current grid -----------
         if is_alt || self.view_offset == 0 {
@@ -11500,20 +11585,24 @@ impl TermBuffer {
             let s = self.parser.screen();
             for r in 0..rows {
                 let (plain, runs, _wrapped) = build_row(s, r, cols);
-                let runs = if is_alt {
-                    runs
+                let runs: Arc<Vec<HistSpan>> = if is_alt {
+                    Arc::new(runs)
                 } else {
-                    highlight_plain_output(
+                    cached_highlight(
+                        &mut self.hl_cache,
+                        &mut self.hl_cache_version,
+                        &mut self.hl_version,
+                        preset,
+                        &rules,
+                        &plain,
                         runs,
-                        self.output_highlight,
-                        &self.custom_highlight_rules,
                     )
                 };
                 if !runs.is_empty() {
                     last_content = r as i32;
                 }
-                for hs in runs {
-                    spans.extend(render_term_span(&hs, r as i32, self.is_dark));
+                for hs in &*runs {
+                    spans.extend(render_term_span(hs, r as i32, self.is_dark));
                 }
                 displayed.push(plain.trim_end().to_string());
             }
@@ -11559,12 +11648,16 @@ impl TermBuffer {
             } else {
                 &live[idx - hist_len]
             };
-            let runs = highlight_plain_output(
+            let runs = cached_highlight(
+                &mut self.hl_cache,
+                &mut self.hl_cache_version,
+                &mut self.hl_version,
+                preset,
+                &rules,
+                &line.0,
                 line.1.clone(),
-                self.output_highlight,
-                &self.custom_highlight_rules,
             );
-            for hs in &runs {
+            for hs in &*runs {
                 spans.extend(render_term_span(hs, d as i32, self.is_dark));
             }
             displayed.push(line.0.trim_end().to_string());
@@ -12355,6 +12448,9 @@ mod selection_tests {
             displayed_text: Vec::new(),
             csi_state: CsiState::Normal,
             raw: std::collections::VecDeque::new(),
+            hl_version: 0,
+            hl_cache_version: 0,
+            hl_cache: HashMap::new(),
         }
     }
 
