@@ -3,6 +3,127 @@
 All notable changes are documented here. 本文件记录所有重要变更。
 中英对照（中文在前，English after）.
 
+## [Unreleased]
+
+## [0.6.5] - 2026-07-17
+
+### 新增 / Added
+
+- **支持自定义终端输入光标（#275）。** 设置 → 字体新增块状、竖线和下划线三种光标形状；点击颜色预览可从弹出色板选择常用颜色，也可通过十六进制 RGB 输入精确自定义。选择会即时应用于所有已打开及新建终端并持久保存；Vim 等全屏编辑器中的竖线光标会显示在当前字符右边缘，避免行尾双宽 emoji 遮住光标。隐藏的 IME 输入锚点不再额外绘制白色系统插入线，终端中只保留一个可见光标。既有配置默认继续使用块状光标和主题前景色。
+
+### 修复 / Fixed
+
+- **修复 SFTP 左右停靠时工具栏越界（#285）。** 侧边 SFTP 面板增加与紧凑工具栏匹配的最小宽度，窄宽度下文件与隧道标签切换为图标并隐藏次要批量操作，面板内容同时启用裁剪，不再覆盖相邻 terminal。
+- **缩短 SSH 会话终端首屏等待时间。** SSH 认证和 PTY 建立后会立即读取并显示首个终端输出，不再同步等待 shell integration、SFTP、资源监控和进程监控；SFTP 在终端就绪后启动，轻量资源采样、进程列表与一次性详细系统信息再按优先级分阶段后台加载。新增 `[SESSION_START]` 分阶段耗时日志，便于区分网络握手、认证、PTY 和首屏输出耗时。
+- **修复跨平台多行文本粘贴格式错位（#284）。** 终端现在会跟随远端 shell、编辑器或复用器请求的括号粘贴模式，将剪贴板内容作为单个受保护的数据块发送，从而保留 Windows 到 Linux 粘贴时的换行、缩进和多行布局；未启用该模式的程序仍会把 CRLF/LF 统一转换为终端回车。
+- **优化当前标签的高亮样式（#283）。** 移除标签内部突兀的顶部横条，改用主题强调色光条完整包裹当前标签，在壁纸和不同明暗主题下保持清晰可辨。
+- **修复“测试连接”未验证 SSH 凭据的问题（#276）。** SSH 测试现在复用正式终端连接的握手与认证流程，实际校验密码、keyboard-interactive、私钥及口令，并遵循代理、跳板机和主机密钥验证；编辑连接时留空的密码会继续使用已保存凭据。新增包含空格、符号和中文的密码加密落盘回归测试，避免端口可达被误报为登录成功。
+
+---
+
+### Added
+
+- **Add customizable terminal insertion cursors (#275).** Settings → Font now offers block, bar, and underline cursor shapes. Clicking the color preview opens a palette of common colors, while the hexadecimal RGB field supports precise custom values. Changes apply immediately to every open and new terminal and persist across launches. In full-screen editors such as Vim, a bar cursor is placed at the current cell's trailing edge so a double-width emoji cannot obscure the end-of-line caret. The hidden IME input anchor no longer paints an extra white system caret, leaving exactly one visible terminal cursor. Existing configurations keep the block cursor and theme foreground color by default.
+
+### Fixed
+
+- **Fix SFTP toolbar overflow when docked left or right (#285).** Side-docked SFTP panels now enforce a minimum width matching the compact toolbar. At narrow widths, Files and Tunnels switch to icons and secondary batch actions are hidden, while panel clipping prevents any content from covering the adjacent terminal.
+- **Reduce SSH terminal time-to-first-frame.** The first PTY output is now read and displayed immediately after SSH authentication and terminal creation instead of synchronously waiting for shell integration, SFTP, resource monitoring, and process monitoring. SFTP starts after the terminal is ready, followed by staged background loading for lightweight resources, processes, and one-shot detailed system information. New `[SESSION_START]` stage timings distinguish transport, authentication, PTY, and first-output latency.
+- **Fix cross-platform multi-line paste formatting (#284).** The terminal now honors bracketed-paste mode requested by the remote shell, editor, or multiplexer and sends clipboard contents as one protected payload, preserving line endings, indentation, and multi-line layout when pasting from Windows to Linux. Applications without bracketed-paste support keep the existing CRLF/LF-to-terminal-return normalization.
+- **Improve active-tab highlighting (#283).** The distracting inset top bar is replaced with a complete accent-colour outline around the active tab, keeping it identifiable across wallpapers and light or dark themes.
+- **Fix connection tests that did not validate SSH credentials (#276).** SSH tests now reuse the real terminal handshake and authentication flow, validating passwords, keyboard-interactive authentication, private keys and passphrases while honoring proxies, jump hosts, and host-key verification. Blank password fields while editing reuse saved credentials, and a persistence regression test covers passwords containing spaces, symbols, and Chinese text so an open port is no longer reported as a successful login.
+
+## [0.6.4] - 2026-07-17
+
+### 新增 / Added
+
+- **原生支持 PuTTY / MobaXterm 的 PPK 私钥（#281）。** SSH、SFTP 与跳板连接现在可直接加载 PPKv2 和 PPKv3 文件，支持 RSA、Ed25519 及 NIST ECDSA 密钥，并支持 PPKv2 的 SHA-1 派生及 PPKv3 的 Argon2 加密私钥。PPK 会先在内存中完成 AES-CBC 解密和 HMAC 完整性校验，再转换为 russh 使用的密钥对象；不会调用外部 `puttygen`，也不会将转换后的私钥写入临时文件。私钥选择器同时加入 `.ppk` 类型，粘贴的 PPK 内容也可自动识别。
+
+### 修复 / Fixed
+
+- **修复主窗口无法记住上次调整大小的问题（#278）。** 配置中的窗口尺寸会由首个原生 `Resized` 事件驱动恢复；若 Slint 的默认 `1440×900` 初始化随后覆盖请求，后续尺寸事件会继续重新应用保存值，直到原生窗口实际达到目标尺寸后才允许写回配置，不再依赖固定延迟或机器启动速度。窗口尚未归属具体显示器时会回退到主显示器，最大化、最小化及安装更新期间的临时尺寸不会覆盖用户选择；恢复过程会写入 `[WINDOW_SIZE]` 诊断日志。
+- **修复 Windows 运行期间无法通过安装程序更新的问题（#267）。** 用户确认退出后，MeatShell 会记录关闭状态、隐藏主窗口及附属窗口、主动关闭 SSH/本地终端/SFTP 工作线程并清空活动会话，然后退出事件循环。Windows Installer 或 Restart Manager 随后重复发送的关闭请求会直接放行，不再反复弹出确认框或进入无法关闭的状态；确认按钮连续点击也只执行一次退出流程。
+- **修复 Debian 桌面端 nano 中 `Ctrl+X` 错误进入搜索的问题（#274）。** Slint 在 Debian 及其衍生桌面环境按下 Ctrl 时可能先产生 `U+0011` 或 `U+0016` 裸修饰键标记；MeatShell 会依据客户端本机 `/etc/os-release` 仅在 Debian 系发行版精准过滤这些标记，避免 nano 先收到 `Ctrl+Q`。真正的 `Ctrl+X`、`Ctrl+R` 等控制组合仍按原字节发送，Windows、macOS 及其他 Linux 发行版保持原逻辑。
+- **修复超长多行粘贴无法确认的问题（#271）。** 短内容继续使用紧凑确认框；超过 600 个字符或 12 行的 AI 提示词及其他长文本会自动切换为最大 `1160×760`、受主窗口边界约束的滚动审阅界面，完整显示粘贴内容，并将取消/粘贴按钮固定在底部。关闭应用时会临时隐藏粘贴审阅框，确保退出确认始终位于最上层；取消退出后，未发送的粘贴内容会原样恢复。
+
+---
+
+### Added
+
+- **Add native PuTTY / MobaXterm PPK private-key support (#281).** SSH, SFTP, and jump-host connections can now load PPKv2 and PPKv3 files directly, including RSA, Ed25519, and NIST ECDSA keys, with encrypted keys supported through the PPKv2 SHA-1 derivation scheme and PPKv3 Argon2. PPK data is decrypted with AES-CBC, authenticated with HMAC, and converted to russh key objects entirely in memory. MeatShell neither invokes an external `puttygen` nor writes converted private keys to temporary files. The key picker includes `.ppk`, and pasted PPK content is detected automatically.
+
+### Fixed
+
+- **Fix the main window forgetting its last adjusted size (#278).** The first native `Resized` event now drives restoration from configuration. If Slint's default `1440×900` initialization subsequently overrides the request, later resize events keep reapplying the saved dimensions until the native window actually reaches its target; only then can resize events write configuration. This removes fixed-delay and machine-speed assumptions. Startup falls back to the primary monitor when necessary, transient maximize, minimize, and installer geometry is ignored, and restoration emits `[WINDOW_SIZE]` diagnostics.
+- **Fix updates getting stuck while MeatShell is running on Windows (#267).** After the user confirms exit, MeatShell records the shutdown state, hides the main and detached windows, actively closes SSH/local-terminal/SFTP workers, clears live sessions, and then exits the event loop. Repeated close requests from Windows Installer or Restart Manager pass through without reopening the prompt or leaving the application uncloseable, and repeated clicks execute shutdown only once.
+- **Fix `Ctrl+X` opening search instead of exiting nano on Debian desktops (#274).** Slint may emit a bare `U+0011` or `U+0016` modifier marker when Ctrl is pressed on Debian and derivative desktops. MeatShell now consults the client's local `/etc/os-release` and filters those exact markers only for Debian-family distributions, preventing nano from receiving an unintended `Ctrl+Q`. Real `Ctrl+X`, `Ctrl+R`, and other control combinations keep their original bytes, while Windows, macOS, and other Linux distributions retain their previous behaviour.
+- **Fix unconfirmable long multi-line pastes (#271).** Short content keeps the compact confirmation card, while AI prompts and other text exceeding 600 characters or 12 lines automatically use a scrollable review surface up to `1160×760`, constrained to the main window. The complete paste remains reviewable and the Cancel/Paste actions stay fixed at the bottom. Requesting application exit temporarily hides paste review so the quit confirmation is always topmost; cancelling exit restores the unsent paste unchanged.
+
+## [0.6.3] - 2026-07-16
+
+### 新增 / Added
+
+- **终端支持彩色 emoji（#269）。** 终端输出会按完整 Unicode grapheme 识别普通 emoji、肤色修饰、旗帜和 ZWJ 家庭/职业组合，并以缓存的 Twemoji 彩色图像替代 Slint software/femtovg 渲染器产生的单色字体轮廓；图像仍严格占用原终端单元格，普通文字、ANSI 样式、CJK、选择与光标定位保持不变。
+- **进程监视支持居中打开、复制 PID 与安全结束进程。** 进程窗口每次打开时会在主窗口当前所在屏幕居中，并保留用户调整后的窗口尺寸。窗口中的 PID 现在可点击复制；右键进程行可发起结束操作，菜单在右键松开后才显示，避免同一次鼠标事件跳过确认。非 root 登录者结束本人进程时会先二次确认，结束 root 或其他用户的进程则必须输入当前登录用户的管理员（sudo）密码；登录用户本身为 root 时无需再次输入密码。操作通过独立 SSH exec 通道执行，不写入交互终端或命令历史；密码输入关闭回显并使用可清零密文承载，执行前还会重新校验来源会话、PID 与属主，避免切换标签后误操作。
+- **纯文本日志级别自动高亮。** 终端会为未携带 ANSI 颜色的 `TRACE`、`DEBUG`、`INFO`、`NOTICE`、`WARN`、`WARNING`、`ERROR`、`FATAL`、`CRITICAL` 和 `PANIC` 级别标记增加主题自适应颜色；结构化日志中的 `level=error` / JSON level 字段也受支持。远端程序已有的 ANSI 样式以及 vim、nano、htop 等全屏 TUI 保持不变。
+- **新增输出高亮设置与 DevOps 规则集。** 设置 → 输出高亮可即时启用或关闭客户端高亮，并在保守的“日志级别”与扩展的“DevOps”规则集之间切换；DevOps 模式额外识别部署结果、重试、健康状态及结构化 `status` / `state` / `result` 字段，切换时会同步重绘当前终端与历史输出。
+- **支持自定义输出高亮规则。** 设置 → 输出高亮现在可添加关键词或正则表达式规则，选择是否区分大小写、仅高亮匹配文字或高亮整行，并从红、黄、绿、青、紫、灰六种颜色中选择；规则可单独启停或删除，会持久化并即时应用于当前终端和历史输出。无效正则会在保存前提示，用户规则优先于内置规则但不会覆盖远端 ANSI 样式。
+
+### 修复 / Fixed
+
+- **不再采集或显示本地系统详情（#268）。** 详细系统信息现在仅对当前已连接的 Linux SSH 会话开放；欢迎页、本地终端、连接中及已断开的会话会隐藏侧栏信息按钮并禁用标题入口，同时清空详情模型。Windows 启动时不再为本机 GPU 等详情启动 PowerShell/CIM 探测，避免启动卡顿和窗口闪烁；侧栏的本机 CPU、内存、网络及磁盘概览保持不变。
+- **修复 Windows 11 双屏不同分辨率/缩放下的窗口定位与最大化恢复（#254、#272）。** 设置卡片在被拖动或缩放后，每次重新打开都会按主窗口当前可用尺寸重新约束大小并居中，不再沿用另一块屏幕上的旧逻辑坐标；主窗口从遮挡、失焦或 DPI 切换中恢复时会主动触发两次重绘，并在原生最大化标记与当前显示器几何尺寸明显不一致时重新应用最大化，避免窗口右侧消失或只显示旧屏幕大小的渲染区域。
+- **修复进程列表停止刷新以及 root 进程无法结束。** 进程采样现已拆分到独立的轻量 SSH 通道，不再被可能卡住的 `df`、`lspci` 等系统信息探测拖死；提权改为与手工操作一致的 `sudo -S`，使用关闭回显的 PTY，等待密码提示后再以回车提交当前登录用户的 sudo 密码，避免 `su root` 在 root 账户被锁定时始终认证失败。进程控制各阶段、远端安全输出及耗时会写入 `error.log`，密码内容始终脱敏。结束操作仍使用可正常清理资源的 `SIGTERM`（`kill -15`）。
+- **修复结束 root 进程时密码弹窗导致程序闪退。** 条件弹窗中的密码输入框不再在 Slint 布局初始化阶段同步抢占焦点，而是在下一轮事件循环、布局完成后自动聚焦，避免触发属性递归检测；同一修复也覆盖 MFA 动态输入框。
+- **移除终端底部多余的焦点恢复行。** 终端输出区原先保留的 16px 焦点恢复条会显示第二个 I-beam 鼠标光标并占用约一行空间；现已由覆盖整个终端主体的聚焦层接管，隐藏 IME 输入点缩为跟随真实终端光标的 1×1 锚点，释放完整终端高度。
+
+---
+
+### Added
+
+- **Render color emoji in the terminal (#269).** Terminal output recognizes complete Unicode graphemes—including ordinary emoji, skin tones, flags, and ZWJ family/profession sequences—and replaces the monochrome glyphs produced by Slint's software/femtovg renderers with cached Twemoji color images. Images retain their exact terminal-cell footprint, leaving ordinary text, ANSI styling, CJK, selection, and cursor positioning unchanged.
+- **Center the process monitor, copy PIDs, and safely terminate remote processes.** The process window now opens centered on the main window's current screen while preserving its user-adjusted size. PIDs are clickable to copy, and a row context menu can terminate a process; the menu opens on right-button release so the same pointer event cannot skip confirmation. Non-root logins must confirm their own processes and provide the connected user's administrator (sudo) password for root or other users' processes, while a root login needs no additional password. Actions run through a separate SSH exec channel without entering the interactive terminal or command history, password echo is disabled, secrets use zeroizing storage, and the source session, PID, and owner are revalidated before execution.
+- **Automatically highlight plain-text log levels.** The terminal now adds theme-aware colours to unstyled `TRACE`, `DEBUG`, `INFO`, `NOTICE`, `WARN`, `WARNING`, `ERROR`, `FATAL`, `CRITICAL`, and `PANIC` markers, including structured `level=error` and JSON level fields. Existing ANSI styling and alternate-screen TUIs such as vim, nano, and htop remain untouched.
+- **Add output-highlighting settings and a DevOps preset.** Settings → Output Highlighting can now enable or disable client-side highlighting immediately and switch between the conservative Log Levels preset and an expanded DevOps preset. DevOps mode also recognises deployment results, retries, health states, and structured `status` / `state` / `result` fields; switching presets redraws both live and historical output.
+- **Support custom output-highlighting rules.** Settings → Output Highlighting can now add keyword or regular-expression rules with case sensitivity, matching-text or whole-line scope, and red, yellow, green, cyan, magenta, or gray colours. Rules can be enabled individually or removed, persist across launches, and apply immediately to live and historical output. Invalid regexes are rejected before saving; user rules take priority over built-in presets without overriding remote ANSI styling.
+
+### Fixed
+
+- **Stop collecting and exposing local system details (#268).** Detailed system information is now available only for the active connected Linux SSH session. Welcome, local-terminal, connecting, and disconnected states hide the sidebar info button, disable the resource-title entry point, and clear detail models. Windows startup no longer launches PowerShell/CIM probes for local GPU details, preventing startup stalls and console flashes, while the sidebar's local CPU, memory, network, and disk summary remains available.
+- **Fix window placement and maximized recovery on Windows 11 mixed-resolution/DPI displays (#254, #272).** After the settings card has been dragged or resized, every reopen now constrains it to the main window's current available size and recenters it instead of retaining logical coordinates from another display. When the main window returns from occlusion, lost focus, or a DPI transition, it requests two redraws and reapplies maximization if the native maximized flag no longer matches the current monitor geometry, preventing a missing right side or a render surface stuck at the previous display size.
+- **Fix frozen process lists and root-process termination.** Process sampling now runs on a dedicated lightweight SSH channel, so a blocked `df`, `lspci`, or other system-information probe cannot freeze stale PIDs in the process window. Privilege elevation now matches manual operation through `sudo -S`: an echo-disabled PTY waits for the prompt and submits the connected user's sudo password, avoiding the guaranteed failure of `su root` on hosts with a locked root account. Process-control stages, safe remote output, and timings are written to `error.log` with the password always redacted. Termination still uses the cleanup-friendly `SIGTERM` (`kill -15`).
+- **Fix the crash when opening the root-password prompt.** Password fields created inside conditional dialogs now request focus on the next event-loop turn, after Slint has completed layout, instead of synchronously during initialization and triggering the property-recursion guard. The same fix also protects dynamic MFA inputs.
+- **Remove the redundant terminal focus-recovery row.** The terminal previously reserved a 16px focus strip that showed a second I-beam pointer and consumed roughly one output row. Full-body focus handling now replaces it, while the hidden IME input is a 1×1 anchor that follows the real terminal cursor, restoring the full terminal height.
+
+## [0.6.2]
+
+### 新增 / Added
+
+- **新增终端字体加粗开关 (#262)。** 设置 → 字体新增“终端字体加粗”，可将普通终端输出强制渲染为加粗字重，并会随配置持久化；ANSI 自带粗体仍然照常生效。
+- **新增详细系统信息窗口。** 点击侧栏“服务器资源 / 本机资源”标题或信息按钮可打开独立窗口，按概览、CPU、GPU、CPU 占用、内存、交换、网络接口与文件系统分区展示当前资源来源的详细状态，并跟随侧栏数据实时刷新。
+- **新增本地终端入口。** 快速连接列表新增内置 `system` 分组，可直接打开本机 PowerShell、CMD、WSL（Windows 可用时）或当前系统 Shell；内置项不写入配置，也不允许编辑、删除或移动分组。
+
+### 修复 / Fixed
+
+- **修复 SFTP 文件列表下方出现大块空白的问题 (#259)。** “文件 / 隧道”两个内容区改为互斥渲染，隐藏的隧道面板不再继续占用 SFTP 面板布局高度，文件列表可用空间恢复正常。
+- **修复 oh-my-zsh 首屏显示 shell integration 注入命令的问题 (#257)。** 连接 zsh/oh-my-zsh 服务器时，隐藏注入命令回显的逻辑现在能处理 `\r` 与软换行，并优先按注入命令尾部定位删除范围，避免 `test -z "$FISH_VERSION" ...` 泄露到终端首屏。
+
+---
+
+### Added
+
+- **Add a bold terminal text option (#262).** Settings → Font now includes a bold terminal text toggle that persists in the config and forces regular terminal output to render with a bold face while preserving ANSI bold behavior.
+- **Add Ctrl multi-selection and Shift range extension in the terminal (#262).** Hold Ctrl to add separate selection ranges and Shift to extend the active range; copied text preserves selection order.
+- **Add a multi-line paste safety prompt (#262).** Clipboard content containing line breaks now requires explicit review and confirmation before it is sent to the terminal.
+- **Collapse the built-in system terminal group by default.** WSL is listed only when `wsl.exe --status` reports that WSL is available.
+- **Add a server resource details window.** Clicking the sidebar “Server resources / Local resources” title or info button opens a detached system-information window with CPU, memory, swap, network, and filesystem status that updates with the sidebar data.
+
+### Fixed
+
+- **Fix the long shell-integration setup command appearing after SSH login (#266).** Late-echoed initialization commands are now filtered even when they arrive after the initial connection-output suppression window.
+- **Fix a large blank area under the SFTP file list (#259).** The Files / Tunnels content panes now render mutually exclusively, so the hidden tunnel panel no longer consumes SFTP panel layout height and the file list regains its available space.
+- **Fix shell-integration setup echo leaking on oh-my-zsh servers (#257).** When connecting to zsh/oh-my-zsh hosts, the setup-echo suppression now handles `\r` and soft-wrapped output and anchors removal on the setup command suffix, preventing the `test -z "$FISH_VERSION" ...` command from appearing on the first terminal screen.
+
 ## [0.6.1] - 2026-07-11
 
 ### 新增 / Added
