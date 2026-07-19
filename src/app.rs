@@ -75,6 +75,14 @@ struct TermBuffer {
     hl_version: u64,
     hl_cache_version: u64,
     hl_cache: HashMap<u64, Arc<Vec<HistSpan>>>,
+    /// Set by a Ctrl+C keystroke. While set, the shell pump thread discards
+    /// *large* `Output` batches (a real firehose, e.g. `tail -n 1000000`) so the
+    /// terminal stops scrolling instead of replaying the whole pre-read stream.
+    /// Small batches — the `^C` echo and the shell's fresh prompt that the
+    /// keystroke itself produces — are kept, so repeated Ctrl+C at an idle prompt
+    /// still shows a newline. The flag is cleared when a small batch is seen
+    /// (end of the flood), so the post-interrupt prompt is never dropped.
+    interrupt_drop: AtomicBool,
 }
 
 /// How much of the byte stream we retain per tab for resize-reflow (#169).
@@ -89,6 +97,12 @@ const OUTPUT_MERGE_BYTE_CAP: usize = 64 * 1024;
 /// lets the UI thread release `bufs` between frames (less render lock
 /// contention). ~2 screens of typical output.
 const INGEST_FRAME_BUDGET: usize = 64 * 1024;
+/// Output-batch size (bytes) above which a Ctrl+C-interrupting pump treats the
+/// batch as a sustained firehose and discards it. Kept far above a shell's
+/// `^C` echo + fresh prompt (typically < 1 KiB) so repeated Ctrl+C at an idle
+/// prompt still shows a newline, while `tail -n 1000000` batches (MB-scale) are
+/// dropped to stop the scroll.
+const CTRL_C_DROP_THRESHOLD: usize = 32 * 1024;
 
 /// Minimal CSI-final-byte rewriter state (persists across read chunks).
 #[derive(Clone, Copy, PartialEq)]
@@ -4313,6 +4327,7 @@ fn wire_session_callbacks(
                     hl_version: 0,
                     hl_cache_version: 0,
                     hl_cache: HashMap::new(),
+                    interrupt_drop: AtomicBool::new(false),
                 },
             );
             render_gates
@@ -4525,6 +4540,44 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                     match shell_rx.try_recv() {
                         Ok(evt) => drained.push(evt),
                         Err(_) => break,
+                    }
+                }
+
+                // Ctrl+C interrupt handling. Once a Ctrl+C is sent, large output
+                // batches (a real firehose, e.g. `tail -n 1000000`) are discarded
+                // so the terminal stops scrolling instead of replaying the whole
+                // pre-read stream. Small batches — the `^C` echo and the shell's
+                // fresh prompt that the keystroke itself produces — are kept, so
+                // repeated Ctrl+C at an idle prompt still shows a newline + prompt.
+                // The trigger stays set until a small batch is seen, which marks
+                // the end of the firehose (the process was interrupted).
+                let triggered = bufs_thread
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| {
+                        m.get_mut(&tab_id_pump)
+                            .map(|b| b.interrupt_drop.load(Ordering::SeqCst))
+                    })
+                    .unwrap_or(false);
+                if triggered {
+                    let batch_bytes: usize = drained
+                        .iter()
+                        .map(|e| match e {
+                            SessionEvent::Output(s) => s.len(),
+                            _ => 0,
+                        })
+                        .sum();
+                    if batch_bytes >= CTRL_C_DROP_THRESHOLD {
+                        // Sustained firehose: discard this batch's output only.
+                        drained.retain(|e| !matches!(e, SessionEvent::Output(_)));
+                    } else {
+                        // Small batch = the Ctrl+C echo/prompt (or end of flood):
+                        // keep it and stop discarding.
+                        if let Ok(mut m) = bufs_thread.lock() {
+                            if let Some(b) = m.get_mut(&tab_id_pump) {
+                                b.interrupt_drop.store(false, Ordering::SeqCst);
+                            }
+                        }
                     }
                 }
 
@@ -9198,6 +9251,17 @@ fn wire_key_input(
             }
 
             let bytes = key_to_pty_bytes(key.as_str(), ctrl, alt, app_cursor);
+            // Ctrl+C (0x03): mark this tab's output backlog for discard so a
+            // firehose stops scrolling immediately once the process is
+            // interrupted, instead of replaying the entire pre-read stream.
+            if bytes.as_slice() == [0x03] {
+                if let Ok(mut map) = bufs.lock() {
+                    if let Some(b) = map.get_mut(tab_id.as_str()) {
+                        b.interrupt_drop.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+
             // Log only the length — never the keystroke bytes, which can be
             // password characters (#15).
             tracing::debug!(
@@ -12512,6 +12576,7 @@ mod selection_tests {
             hl_version: 0,
             hl_cache_version: 0,
             hl_cache: HashMap::new(),
+            interrupt_drop: AtomicBool::new(false),
         }
     }
 
