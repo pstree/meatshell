@@ -37,7 +37,10 @@ struct TermBuffer {
     sel_anchor: Option<(usize, u16)>,
     sel_focus: Option<(usize, u16)>,
     /// Session scrollback: lines that have scrolled off the top (oldest first).
-    history: Vec<Line>,
+    /// A bounded queue — capped at `MAX_HISTORY`; oldest lines are dropped via
+    /// `pop_front` so the cap check is O(1) per overflow instead of an O(n)
+    /// `Vec::drain(0..drop)` shift.
+    history: VecDeque<Line>,
     /// Previous frame's grid lines, for scroll-off detection.
     prev: Vec<Line>,
     /// Scrollback view offset in lines (0 = live bottom).
@@ -3353,7 +3356,7 @@ fn wire_session_callbacks(
                     is_dark: is_dark_now,
                     sel_anchor: None,
                     sel_focus: None,
-                    history: Vec::new(),
+                    history: VecDeque::new(),
                     prev: Vec::new(),
                     view_offset: 0,
                     displayed_text: Vec::new(),
@@ -7571,7 +7574,7 @@ fn wire_key_input(
                 let (rows, cols) = buf.parser.screen().size();
                 buf.parser = vt100::Parser::new(rows, cols, 5000);
                 buf.find_query.clear();
-                buf.history = Vec::new(); // recycle the session scrollback
+                buf.history = VecDeque::new(); // recycle the session scrollback
                 buf.prev = Vec::new();
                 buf.view_offset = 0;
                 buf.sel_anchor = None;
@@ -8969,7 +8972,7 @@ impl TermBuffer {
         let mut out = String::new();
         for r in lo_r..=hi_r {
             let line: &str = if r < hist_len {
-                &self.history[r].0
+                &self.history.get(r).unwrap().0
             } else if r - hist_len < live.len() {
                 &live[r - hist_len].0
             } else {
@@ -8999,7 +9002,7 @@ impl TermBuffer {
             };
             out.push_str(seg.trim_end());
             let wrapped = if r < hist_len {
-                self.history[r].2
+                self.history.get(r).unwrap().2
             } else if r - hist_len < live.len() {
                 live[r - hist_len].2
             } else {
@@ -9017,7 +9020,7 @@ impl TermBuffer {
         let s = self.parser.screen();
         let (rows, cols) = s.size();
         let line_str = if abs < self.history.len() {
-            self.history[abs].0.clone()
+            self.history.get(abs).unwrap().0.clone()
         } else {
             let live_row_idx = abs - self.history.len();
             if live_row_idx < rows as usize {
@@ -9246,11 +9249,12 @@ impl TermBuffer {
         if !self.prev.is_empty() {
             let k = detect_scroll(&self.prev, &curr);
             for line in self.prev.iter().take(k) {
-                self.history.push(line.clone());
-            }
-            if self.history.len() > MAX_HISTORY {
-                let drop = self.history.len() - MAX_HISTORY;
-                self.history.drain(0..drop);
+                self.history.push_back(line.clone());
+                // Bounded queue: drop the oldest line the moment we exceed cap,
+                // so we never pay an O(n) `drain` shift and stay at <= MAX_HISTORY.
+                if self.history.len() > MAX_HISTORY {
+                    self.history.pop_front();
+                }
             }
         }
         self.prev = curr;
@@ -9330,7 +9334,7 @@ impl TermBuffer {
         let mut displayed = Vec::with_capacity(win);
         for (d, idx) in (start..end).enumerate() {
             let line: &Line = if idx < hist_len {
-                &self.history[idx]
+                self.history.get(idx).unwrap()
             } else {
                 &live[idx - hist_len]
             };
@@ -9916,12 +9920,12 @@ mod selection_tests {
     #[test]
     fn extract_joins_soft_wrapped_rows() {
         let mut buf = make_buf(5, 10, &[], &["x"], 0);
-        buf.history = vec![
+        buf.history = VecDeque::from(vec![
             wrapped_hist_line("0123456789"),
             wrapped_hist_line("abcdefghij"),
             hist_line("klmnop"),
             hist_line("next"),
-        ];
+        ]);
         buf.sel_anchor = Some((0, 0));
         buf.sel_focus = Some((3, 9));
         assert_eq!(
