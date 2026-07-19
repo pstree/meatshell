@@ -646,6 +646,15 @@ export component TerminalView inherits Rectangle {
                                 // Positive delta-y = wheel/swipe up.  Smooth input
                                 // (Magic Mouse / trackpad) arrives as small deltas,
                                 // so accumulate until they reach one wheel step.
+                                // Reverse direction: drop residual momentum from the
+                                // previous direction so a switch from up→down (or
+                                // down→up) responds immediately instead of draining
+                                // the old accumulator first (which scrolled the wrong
+                                // way for a few notches after a direction change).
+                                if ((root.wheel-accum-y > 0px && ev.delta-y < 0px)
+                                        || (root.wheel-accum-y < 0px && ev.delta-y > 0px)) {
+                                    root.wheel-accum-y = 0px;
+                                }
                                 root.wheel-accum-y += ev.delta-y;
                                 if (root.wheel-accum-y >= root.wheel-step-y
                                         || root.wheel-accum-y <= -root.wheel-step-y) {
