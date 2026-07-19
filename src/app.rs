@@ -82,13 +82,13 @@ const RAW_CAP: usize = 2 * 1024 * 1024;
 
 /// Max bytes merged into one Output event before starting a fresh chunk (#209).
 /// Keeps a single UI callback from spending hundreds of ms in vt100 ingest.
-const OUTPUT_MERGE_BYTE_CAP: usize = 16 * 1024;
+const OUTPUT_MERGE_BYTE_CAP: usize = 64 * 1024;
 /// Max terminal output the pump thread ingests before it forces a UI repaint
 /// and blocks on it. Paces a firehose (e.g. `tail -n 1000000`) to the render
 /// rate so the view scrolls smoothly instead of teleporting to the end, and
 /// lets the UI thread release `bufs` between frames (less render lock
 /// contention). ~2 screens of typical output.
-const INGEST_FRAME_BUDGET: usize = 32 * 1024;
+const INGEST_FRAME_BUDGET: usize = 64 * 1024;
 
 /// Minimal CSI-final-byte rewriter state (persists across read chunks).
 #[derive(Clone, Copy, PartialEq)]
