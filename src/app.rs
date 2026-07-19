@@ -44,7 +44,13 @@ struct TermBuffer {
     /// Shift extends it from its anchor while Ctrl adds another range.
     sel_ranges: Vec<((usize, u16), (usize, u16))>,
     /// Session scrollback: lines that have scrolled off the top (oldest first).
-    history: Vec<Line>,
+    ///
+    /// Modeled as a bounded message queue — each scrolled-off line is one
+    /// message. A `VecDeque` ring buffer makes head eviction O(1); a plain
+    /// `Vec` with `drain(0..n)` shifts the whole ~100k-line backlog on every
+    /// batch, which is O(n²) under a firehose (`tail -n 1000000`) and was the
+    /// main source of stutter (#perf).
+    history: VecDeque<Line>,
     /// Previous frame's grid lines, for scroll-off detection.
     prev: Vec<Line>,
     /// Scrollback view offset in lines (0 = live bottom).
@@ -76,7 +82,13 @@ const RAW_CAP: usize = 2 * 1024 * 1024;
 
 /// Max bytes merged into one Output event before starting a fresh chunk (#209).
 /// Keeps a single UI callback from spending hundreds of ms in vt100 ingest.
-const OUTPUT_MERGE_BYTE_CAP: usize = 64 * 1024;
+const OUTPUT_MERGE_BYTE_CAP: usize = 16 * 1024;
+/// Max terminal output the pump thread ingests before it forces a UI repaint
+/// and blocks on it. Paces a firehose (e.g. `tail -n 1000000`) to the render
+/// rate so the view scrolls smoothly instead of teleporting to the end, and
+/// lets the UI thread release `bufs` between frames (less render lock
+/// contention). ~2 screens of typical output.
+const INGEST_FRAME_BUDGET: usize = 32 * 1024;
 
 /// Minimal CSI-final-byte rewriter state (persists across read chunks).
 #[derive(Clone, Copy, PartialEq)]
@@ -150,7 +162,7 @@ fn highlight_color_index(color: &str) -> u8 {
 }
 
 /// Max UI renders per second for a tab under sustained output (#209).
-const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Per-tab terminal buffer — each tab has its own lock so a burst of output on
 /// one session (e.g. `unzip` listing thousands of files) doesn't block keyboard
@@ -164,6 +176,10 @@ struct TabRenderGate {
     scheduled: AtomicBool,
     pending: AtomicBool,
     last_render: Mutex<std::time::Instant>,
+    /// Monotonic counter bumped by the UI thread after each actual repaint of
+    /// this tab. The pump thread waits on it to pace a firehose to the render
+    /// rate (smooth scroll instead of teleporting, #perf).
+    rendered: std::sync::atomic::AtomicU64,
 }
 
 impl TabRenderGate {
@@ -172,6 +188,7 @@ impl TabRenderGate {
             scheduled: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             last_render: Mutex::new(std::time::Instant::now() - RENDER_MIN_INTERVAL),
+            rendered: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -322,6 +339,29 @@ fn request_tab_render(
     });
 }
 
+/// Block the pump thread until the UI has actually repainted `tab_id` at least
+/// once since we last observed its render counter — i.e. pace this pump to the
+/// render rate. A firehose (`tail -n 1000000`) is thus throttled to ~the frame
+/// rate and the view advances smoothly instead of jumping to the end. The wait
+/// is bounded so a hidden/background tab can never stall the pump (#perf).
+fn wait_ui_render(gates: &RenderGates, tab_id: &str) {
+    let load = || {
+        gates
+            .lock()
+            .ok()
+            .and_then(|m| {
+                m.get(tab_id)
+                    .map(|g| g.rendered.load(std::sync::atomic::Ordering::Acquire))
+            })
+            .unwrap_or(0)
+    };
+    let prev = load();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    while load() == prev && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// UI-thread entry: honour the throttle, then render. Timer must be created
 /// here — not on pump threads (#209).
 fn run_coalesced_tab_render(
@@ -374,6 +414,7 @@ fn do_tab_render_flush(
         if visible_tab_ids(&win).contains(tab_id) {
             rebuild_tab_display(&win, bufs, tab_id);
             *gate.last_render.lock().unwrap() = std::time::Instant::now();
+            gate.rendered.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -4263,7 +4304,7 @@ fn wire_session_callbacks(
                     sel_anchor: None,
                     sel_focus: None,
                     sel_ranges: Vec::new(),
-                    history: Vec::new(),
+                    history: VecDeque::new(),
                     prev: Vec::new(),
                     view_offset: 0,
                     displayed_text: Vec::new(),
@@ -4563,12 +4604,31 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 // Ingest terminal output on this pump thread (not the UI thread)
                 // so a firehose can't block keyboard input or repaints (#209).
                 let mut had_output = false;
+                let mut ingested_since_render = 0usize;
                 let mut ui_only: Vec<SessionEvent> = Vec::with_capacity(ui_batch.len());
                 for evt in ui_batch {
                     match evt {
                         SessionEvent::Output(chunk) => {
                             ingest_terminal_output(&bufs_thread, &tab_id_pump, chunk.as_bytes());
                             had_output = true;
+                            ingested_since_render += chunk.len();
+                            // Frame-aligned backpressure: once we've absorbed a
+                            // screenful-ish of output, ask the UI to repaint and
+                            // block until it actually has. This paces a firehose
+                            // to the render rate so the view scrolls smoothly
+                            // instead of teleporting, and lets the UI thread
+                            // release `bufs` between frames (less lock contention,
+                            // #perf).
+                            if ingested_since_render >= INGEST_FRAME_BUDGET {
+                                request_tab_render(
+                                    weak_inner.clone(),
+                                    &tab_id_pump,
+                                    &bufs_thread,
+                                    &render_gates_pump,
+                                );
+                                wait_ui_render(&render_gates_pump, &tab_id_pump);
+                                ingested_since_render = 0;
+                            }
                         }
                         other => ui_only.push(other),
                     }
@@ -9340,7 +9400,7 @@ fn wire_key_input(
                 let (rows, cols) = buf.parser.screen().size();
                 buf.parser = vt100::Parser::new(rows, cols, 5000);
                 buf.find_query.clear();
-                buf.history = Vec::new(); // recycle the session scrollback
+                buf.history = VecDeque::new(); // recycle the session scrollback
                 buf.prev = Vec::new();
                 buf.view_offset = 0;
                 buf.sel_anchor = None;
@@ -11551,11 +11611,12 @@ impl TermBuffer {
         if !self.prev.is_empty() {
             let k = detect_scroll(&self.prev, &curr);
             for line in self.prev.iter().take(k) {
-                self.history.push(line.clone());
+                self.history.push_back(line.clone());
             }
-            if self.history.len() > MAX_HISTORY {
-                let drop = self.history.len() - MAX_HISTORY;
-                self.history.drain(0..drop);
+            // Bounded queue: evict oldest messages from the front. O(1) per
+            // line on a VecDeque ring buffer (vs. O(n) shift on a Vec).
+            while self.history.len() > MAX_HISTORY {
+                self.history.pop_front();
             }
         }
         self.prev = curr;
@@ -12520,12 +12581,12 @@ mod selection_tests {
     #[test]
     fn extract_joins_soft_wrapped_rows() {
         let mut buf = make_buf(5, 10, &[], &["x"], 0);
-        buf.history = vec![
+        buf.history = VecDeque::from(vec![
             wrapped_hist_line("0123456789"),
             wrapped_hist_line("abcdefghij"),
             hist_line("klmnop"),
             hist_line("next"),
-        ];
+        ]);
         buf.sel_anchor = Some((0, 0));
         buf.sel_focus = Some((3, 9));
         assert_eq!(
