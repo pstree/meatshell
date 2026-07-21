@@ -631,6 +631,14 @@ export component AppWindow inherits Window {
     // --- Split panes (v0.5) — flattened from the Rust split tree -----------
     in property <[PaneInfo]> panes;
     in property <[SplitterInfo]> splitters;
+    // Expose the *real* split-pane area size to Rust. The `changed width/height`
+    // handler on `pane-area` that fires `content-resized` does NOT run during
+    // Slint's initial layout pass, so the first `refresh_panes` call would
+    // otherwise use a hard-coded (1200x800) guess and lay out buttons / pane
+    // geometry against the wrong size until the first user resize. Reading these
+    // after first paint gives the true content dimensions.
+    in-out property <length> pane-area-w: pane-area.width;
+    in-out property <length> pane-area-h: pane-area.height;
     in-out property <string> active-tab-id: "welcome";
     in property <[TerminalState]> terminals;
 
