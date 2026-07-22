@@ -1643,37 +1643,6 @@ pub fn run() -> Result<()> {
             }
         });
     }
-    // First-paint fix: Slint's `changed` handler that drives `on_content_resized`
-    // does not fire during the initial layout pass, so the `refresh_panes` call
-    // above ran against a hard-coded (1200x800) content size. Until the first
-    // resize that mismatch lays out the title-bar buttons / panes against the
-    // wrong dimensions (they appear shifted and are unclickable). After the first
-    // frame the real pane-area size is known, so re-run the layout once.
-    {
-        let weak = window.as_weak();
-        let layout = layout.clone();
-        let content_size = content_size.clone();
-        let tabs_model = tabs_model.clone();
-        let panes_model = panes_model.clone();
-        let splitters_model = splitters_model.clone();
-        slint::Timer::single_shot(std::time::Duration::ZERO, move || {
-            if let Some(win) = weak.upgrade() {
-                let cw = win.get_pane_area_w();
-                let ch = win.get_pane_area_h();
-                if cw > 0.0 && ch > 0.0 {
-                    content_size.set((cw, ch));
-                    refresh_panes(
-                        &win,
-                        &layout.borrow(),
-                        (cw, ch),
-                        &tabs_model,
-                        &panes_model,
-                        &splitters_model,
-                    );
-                }
-            }
-        });
-    }
     // Toggle welcome-as-sidebar at runtime: persist, then move the welcome tab in
     // or out of the split-tree (sidebar mode = no welcome tab) and re-flatten.
     {
