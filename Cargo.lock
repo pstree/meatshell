@@ -7888,7 +7888,7 @@ dependencies = [
  "core-foundation 0.9.4",
  "core-graphics",
  "cursor-icon",
- "dpi 0.1.1",
+ "dpi",
  "js-sys",
  "libc",
  "memmap2",
