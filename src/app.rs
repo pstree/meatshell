@@ -2386,6 +2386,34 @@ pub fn run() -> Result<()> {
                     // Moving a maximized frameless window between mixed-DPI
                     // monitors can leave Win11 reporting "maximized" while the
                     // native rectangle/render surface still has the old size.
+                    #[cfg(target_os = "linux")]
+                    {
+                        // On Linux the compositor often reports scale_factor()==1.0
+                        // when the window is first created, then delivers the real
+                        // fractional scale (1.25/1.5/2.0) once the window lands on its
+                        // monitor. If the render surface isn't rebuilt for the new DPI,
+                        // the layout is drawn into a surface sized for the old scale
+                        // while the native window is physically larger — content shifts
+                        // to the top-left and the edge resize grips (Slint MouseAreas)
+                        // land at the wrong position. Re-requesting the current logical
+                        // size makes winit recompute physical = logical*scale and Slint
+                        // rebuild the surface + re-run layout at the correct DPI.
+                        // When physical already equals logical*scale this is a no-op, so
+                        // it self-corrects only the desynced case and never loops.
+                        if let Some(win) = weak.upgrade() {
+                            win.window().with_winit_window(|ww| {
+                                let scale = ww.scale_factor().max(0.01);
+                                let physical = ww.inner_size();
+                                let logical =
+                                    physical.to_logical::<f64>(scale);
+                                let _ = ww.request_inner_size(
+                                    i_slint_backend_winit::winit::dpi::LogicalSize::new(
+                                        logical.width, logical.height,
+                                    ),
+                                );
+                            });
+                        }
+                    }
                     refresh_revealed_main_window(weak.clone());
                 }
                 WEvent::Resized(size) => {
