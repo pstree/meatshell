@@ -91,6 +91,7 @@ component MenuItem inherits Rectangle {
 // --- TerminalView ----------------------------------------------------------
 
 export component TerminalView inherits Rectangle {
+    in property <bool> active: true;
     in property <string> tab-id;
     in property <string> status-line: @tr("Not connected");
     in property <[TermSpan]> spans;     // coloured runs of the visible screen
