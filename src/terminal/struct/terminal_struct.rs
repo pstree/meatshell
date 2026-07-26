@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 use crate::ui::TermSpan;
@@ -14,12 +14,28 @@ pub(crate) struct TermBuffer {
     pub(crate) sel_anchor: Option<(usize, u16)>,
     pub(crate) sel_focus: Option<(usize, u16)>,
     pub(crate) sel_ranges: Vec<((usize, u16), (usize, u16))>,
-    pub(crate) history: Vec<Line>,
+    /// Session scrollback: lines that have scrolled off the top (oldest first).
+    /// Modeled as a bounded ring buffer so head eviction is O(1); a plain `Vec`
+    /// with `drain(0..n)` shifts the whole backlog on every batch, which is
+    /// O(n²) under a firehose (`tail -n 1000000`) — the main source of stutter.
+    pub(crate) history: VecDeque<Line>,
     pub(crate) prev: Vec<Line>,
     pub(crate) view_offset: usize,
     pub(crate) displayed_text: Vec<String>,
     pub(crate) csi_state: CsiState,
     pub(crate) raw: VecDeque<u8>,
+    /// Highlight cache: maps a rendered line's plain-text hash to its highlighted
+    /// runs so re-rendered lines (scrollback, still frames) skip the expensive
+    /// highlight scan. `hl_version` bumps whenever the highlight config changes;
+    /// `hl_cache_version` tracks the version the cache was built under so it is
+    /// cleared once on a config change.
+    pub(crate) hl_version: u64,
+    pub(crate) hl_cache_version: u64,
+    pub(crate) hl_cache: HashMap<u64, Arc<Vec<HistSpan>>>,
+    /// Set by a Ctrl+C keystroke. While set, the shell pump thread discards
+    /// *large* `Output` batches (a real firehose, e.g. `tail -n 1000000`) so the
+    /// terminal stops scrolling instead of replaying the whole pre-read stream.
+    pub(crate) interrupt_drop: AtomicBool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -43,14 +59,17 @@ pub(crate) struct CompiledOutputRule {
     pub(crate) ansi_index: u8,
 }
 
-pub(crate) type TermBufferHandle = Arc<Mutex<TermBuffer>>;
-pub(crate) type TermBuffers = Arc<Mutex<HashMap<String, TermBufferHandle>>>;
+pub(crate) type TermBuffers = Arc<Mutex<HashMap<String, TermBuffer>>>;
 
 /// Coalesces render requests for one terminal tab.
 pub(crate) struct TabRenderGate {
     pub(crate) scheduled: AtomicBool,
     pub(crate) pending: AtomicBool,
     pub(crate) last_render: Mutex<std::time::Instant>,
+    /// Monotonic counter bumped by the UI thread after each actual repaint of
+    /// this tab. The pump thread waits on it to pace a firehose to the render
+    /// rate (smooth scroll instead of teleporting).
+    pub(crate) rendered: AtomicU64,
 }
 
 pub(crate) type RenderGates = Arc<Mutex<HashMap<String, Arc<TabRenderGate>>>>;

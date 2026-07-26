@@ -18,5 +18,5 @@ pub(crate) mod zmodem;
 
 pub(crate) use terminal_struct::{
     BuiltScreen, CompiledOutputRule, CsiState, HistSpan, Line, OutputHighlightPreset, RenderGates,
-    TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
+    TabRenderGate, TermBuffer, TermBuffers,
 };

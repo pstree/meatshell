@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 
 use super::terminal_struct::TabRenderGate;
@@ -9,6 +9,7 @@ impl TabRenderGate {
             scheduled: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             last_render: Mutex::new(std::time::Instant::now() - min_interval),
+            rendered: AtomicU64::new(0),
         }
     }
 }

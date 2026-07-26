@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use crate::app::{
-    build_row, cell_prefix, char_after_cell_end, char_at_cell_start, detect_scroll,
-    highlight_plain_output, render_term_span, MAX_HISTORY, RAW_CAP,
+    build_row, cached_highlight, cell_prefix, char_after_cell_end, char_at_cell_start,
+    detect_scroll, render_term_span, MAX_HISTORY, RAW_CAP,
 };
-use crate::terminal::{BuiltScreen, CsiState, Line, TermBuffer};
+use crate::terminal::{BuiltScreen, CsiState, HistSpan, Line, TermBuffer};
 use crate::ui::TermMatch;
 impl TermBuffer {
     // ---- Absolute-coordinate selection helpers (#18 follow-up) -------------
@@ -207,6 +209,81 @@ impl TermBuffer {
         out
     }
 
+    /// Double-click word selection: select the "word" under the given visible
+    /// cell and return its text (or `None` if the cell is blank/non-word).
+    pub(crate) fn select_word_at(&mut self, vis_row: u16, vis_col: u16) -> Option<String> {
+        let abs = self.vis_to_abs(vis_row);
+        let s = self.parser.screen();
+        let (rows, cols) = s.size();
+        let line_str = if abs < self.history.len() {
+            self.history[abs].0.clone()
+        } else {
+            let live_row_idx = abs - self.history.len();
+            if live_row_idx < rows as usize {
+                build_row(s, live_row_idx as u16, cols).0
+            } else {
+                return None;
+            }
+        };
+
+        let chars: Vec<char> = line_str.chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+        let prefix = cell_prefix(&chars);
+        let char_idx = char_at_cell_start(&prefix, vis_col as usize);
+        if char_idx >= chars.len() {
+            return None;
+        }
+
+        let is_word_char = |c: char| {
+            c.is_alphanumeric()
+                || c == '_'
+                || c == '-'
+                || c == '.'
+                || c == '/'
+                || c == '\\'
+                || c == '~'
+                || c == '@'
+                || c == ':'
+                || c == '+'
+                || c == '$'
+                || c == '%'
+        };
+
+        if !is_word_char(chars[char_idx]) {
+            return None;
+        }
+
+        // Expand left
+        let mut start_idx = char_idx;
+        while start_idx > 0 && is_word_char(chars[start_idx - 1]) {
+            start_idx -= 1;
+        }
+
+        // Expand right
+        let mut end_idx = char_idx;
+        while end_idx + 1 < chars.len() && is_word_char(chars[end_idx + 1]) {
+            end_idx += 1;
+        }
+
+        // Map back to columns
+        let c0 = prefix[start_idx];
+        let c1 = prefix[end_idx + 1].saturating_sub(1);
+
+        self.sel_anchor = Some((abs, c0 as u16));
+        self.sel_focus = Some((abs, c1 as u16));
+        self.sel_ranges.clear();
+        self.sel_ranges.push(((abs, c0 as u16), (abs, c1 as u16)));
+
+        let extracted = self.extract_selection_text();
+        if extracted.is_empty() {
+            None
+        } else {
+            Some(extracted)
+        }
+    }
+
     /// Feed bytes to vt100 and capture scrolled-off lines into history.
     ///
     /// We detect scroll by diffing the screen before/after a `process`, which
@@ -371,11 +448,12 @@ impl TermBuffer {
         if !self.prev.is_empty() {
             let k = detect_scroll(&self.prev, &curr);
             for line in self.prev.iter().take(k) {
-                self.history.push(line.clone());
+                self.history.push_back(line.clone());
             }
-            if self.history.len() > MAX_HISTORY {
-                let drop = self.history.len() - MAX_HISTORY;
-                self.history.drain(0..drop);
+            // Bounded queue: evict oldest lines from the front. O(1) per line on
+            // a VecDeque ring buffer (vs. O(n) shift on a Vec).
+            while self.history.len() > MAX_HISTORY {
+                self.history.pop_front();
             }
         }
         self.prev = curr;
@@ -391,6 +469,12 @@ impl TermBuffer {
             (s.alternate_screen(), r, c, cr, cc)
         };
 
+        // Snapshot highlight config so the (possibly cached) highlight calls
+        // inside the render loop don't re-borrow `self` while the screen holds
+        // an immutable borrow.
+        let preset = self.output_highlight;
+        let rules = self.custom_highlight_rules.clone();
+
         // --- Live view (also alt-screen): render the current grid -----------
         if is_alt || self.view_offset == 0 {
             let mut spans = Vec::new();
@@ -399,20 +483,24 @@ impl TermBuffer {
             let s = self.parser.screen();
             for r in 0..rows {
                 let (plain, runs, _wrapped) = build_row(s, r, cols);
-                let runs = if is_alt {
-                    runs
+                let runs: Arc<Vec<HistSpan>> = if is_alt {
+                    Arc::new(runs)
                 } else {
-                    highlight_plain_output(
+                    cached_highlight(
+                        &mut self.hl_cache,
+                        &mut self.hl_cache_version,
+                        &mut self.hl_version,
+                        preset,
+                        &rules,
+                        &plain,
                         runs,
-                        self.output_highlight,
-                        &self.custom_highlight_rules,
                     )
                 };
                 if !runs.is_empty() {
                     last_content = r as i32;
                 }
-                for hs in runs {
-                    spans.extend(render_term_span(&hs, r as i32, self.is_dark));
+                for hs in &*runs {
+                    spans.extend(render_term_span(hs, r as i32, self.is_dark));
                 }
                 displayed.push(plain.trim_end().to_string());
             }
@@ -458,12 +546,16 @@ impl TermBuffer {
             } else {
                 &live[idx - hist_len]
             };
-            let runs = highlight_plain_output(
+            let runs = cached_highlight(
+                &mut self.hl_cache,
+                &mut self.hl_cache_version,
+                &mut self.hl_version,
+                preset,
+                &rules,
+                &line.0,
                 line.1.clone(),
-                self.output_highlight,
-                &self.custom_highlight_rules,
             );
-            for hs in &runs {
+            for hs in &*runs {
                 spans.extend(render_term_span(hs, d as i32, self.is_dark));
             }
             displayed.push(line.0.trim_end().to_string());

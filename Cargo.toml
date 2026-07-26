@@ -134,3 +134,27 @@ debug = 1
 
 [profile.dev.package."*"]
 opt-level = 1
+
+# ── Wayland native drag-and-drop (file drop) ───────────────────────────────
+# Official winit (incl. 0.30.x and the latest release) does NOT receive
+# file drag-and-drop on Wayland — its Wayland backend never registers a
+# `wl_data_device` drop target, so the compositor shows the no-drop cursor
+# (🚫) and `WEvent::DroppedFile` never fires (rust-windowing/winit#1881,
+# still open). This patch swaps winit 0.30.13 for the IndigoCarmine fork
+# ("winit 0.30.13 fork with native Wayland drag-and-drop (file drop)
+# support", branch `wayland-native-dnd`), which adds exactly that. Same
+# version, same API, so it satisfies i-slint-backend-winit's `winit = "0.30"`
+# requirement with no other code changes; the existing `WEvent::DroppedFile`
+# handler in src/app.rs then uploads the dropped file to the active session's
+# current SFTP directory on Wayland too.
+#
+# NOTE: this pulls winit from a third-party git repo instead of crates.io.
+# Pin to a commit (`rev = "…"`) if you want a reproducible, non-moving build.
+[patch.crates-io]
+winit = { git = "https://github.com/IndigoCarmine/winit", branch = "wayland-native-dnd" }
+# The winit fork above vendors its own `dpi` crate (0.1.1). Without also
+# patching `dpi`, muda (pulled in by i-slint-backend-winit) keeps the crates.io
+# `dpi` (0.1.2), so `winit::dpi::Position` and `muda::dpi::Position` become two
+# distinct types and i-slint-backend-winit's muda glue fails to compile. Point
+# `dpi` at the same fork so every crate shares one `dpi` version.
+dpi = { git = "https://github.com/IndigoCarmine/winit", branch = "wayland-native-dnd" }
