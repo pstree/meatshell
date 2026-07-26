@@ -378,7 +378,6 @@ export component InterfacePanel inherits Rectangle {
     in-out property <string> webdav-status;
     in-out property <bool> download-always-ask;
     in-out property <bool> welcome-as-sidebar;
-    in-out property <bool> quick-commands-as-sidebar;
     in-out property <bool> update-check-enabled;
     in-out property <float> wallpaper-overlay;   // frosted-panel opacity 0.30-1.00
     // Active wallpaper id: "" / "builtin:light" / "builtin:dark" / a file path.
@@ -416,7 +415,6 @@ export component InterfacePanel inherits Rectangle {
     callback webdav-download();
     callback set-download-always-ask(bool);
     callback set-welcome-as-sidebar(bool);
-    callback set-quick-commands-as-sidebar(bool);
     callback set-update-check-enabled(bool);   // startup new-version check (#184)
     callback persist-wallpaper-overlay(float);   // save the overlay opacity
     callback set-wallpaper(string);    // none / builtin selection
@@ -1112,23 +1110,10 @@ export component InterfacePanel inherits Rectangle {
                     desc: root.lang-en
                         ? "Takes effect on next launch; handy on low-spec jump hosts."
                         : "下次启动生效;低配跳板机上可减少常驻面板开销。";
+                    show-divider: false;
                     Switch {
                         on: root.collapse-sftp-default;
                         toggled(v) => { root.collapse-sftp-default = v; root.set-collapse-sftp-default(v); }
-                    }
-                }
-                SettingRow {
-                    label: root.lang-en ? "Quick commands as a sidebar" : "快捷命令作为侧栏";
-                    desc: root.lang-en
-                        ? "Allows the quick-command popup to be dragged to a window edge. After docking, use the sidebar or its collapsed icon."
-                        : "允许把快捷命令弹窗拖到窗口边缘；停靠后通过侧栏或收起图标使用。";
-                    show-divider: false;
-                    Switch {
-                        on: root.quick-commands-as-sidebar;
-                        toggled(v) => {
-                            root.quick-commands-as-sidebar = v;
-                            root.set-quick-commands-as-sidebar(v);
-                        }
                     }
                 }
             }

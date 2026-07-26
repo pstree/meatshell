@@ -44,7 +44,13 @@ struct TermBuffer {
     /// Shift extends it from its anchor while Ctrl adds another range.
     sel_ranges: Vec<((usize, u16), (usize, u16))>,
     /// Session scrollback: lines that have scrolled off the top (oldest first).
-    history: Vec<Line>,
+    ///
+    /// Modeled as a bounded message queue — each scrolled-off line is one
+    /// message. A `VecDeque` ring buffer makes head eviction O(1); a plain
+    /// `Vec` with `drain(0..n)` shifts the whole ~100k-line backlog on every
+    /// batch, which is O(n²) under a firehose (`tail -n 1000000`) and was the
+    /// main source of stutter (#perf).
+    history: VecDeque<Line>,
     /// Previous frame's grid lines, for scroll-off detection.
     prev: Vec<Line>,
     /// Scrollback view offset in lines (0 = live bottom).
@@ -62,6 +68,21 @@ struct TermBuffer {
     /// match — the way FinalShell rewraps on resize (#169). Only the most recent
     /// `RAW_CAP` bytes are kept; scrollback older than that won't reflow.
     raw: std::collections::VecDeque<u8>,
+    /// Highlight cache: maps a rendered line's plain text to its highlighted
+    /// runs so re-rendered lines (scrollback, still frames) skip the expensive
+    /// highlight scan (#perf). Keyed by plain-text hash because history
+    /// lines are stable while their indices can shift on truncation.
+    hl_version: u64,
+    hl_cache_version: u64,
+    hl_cache: HashMap<u64, Arc<Vec<HistSpan>>>,
+    /// Set by a Ctrl+C keystroke. While set, the shell pump thread discards
+    /// *large* `Output` batches (a real firehose, e.g. `tail -n 1000000`) so the
+    /// terminal stops scrolling instead of replaying the whole pre-read stream.
+    /// Small batches — the `^C` echo and the shell's fresh prompt that the
+    /// keystroke itself produces — are kept, so repeated Ctrl+C at an idle prompt
+    /// still shows a newline. The flag is cleared when a small batch is seen
+    /// (end of the flood), so the post-interrupt prompt is never dropped.
+    interrupt_drop: AtomicBool,
 }
 
 /// How much of the byte stream we retain per tab for resize-reflow (#169).
@@ -70,6 +91,18 @@ const RAW_CAP: usize = 2 * 1024 * 1024;
 /// Max bytes merged into one Output event before starting a fresh chunk (#209).
 /// Keeps a single UI callback from spending hundreds of ms in vt100 ingest.
 const OUTPUT_MERGE_BYTE_CAP: usize = 64 * 1024;
+/// Max terminal output the pump thread ingests before it forces a UI repaint
+/// and blocks on it. Paces a firehose (e.g. `tail -n 1000000`) to the render
+/// rate so the view scrolls smoothly instead of teleporting to the end, and
+/// lets the UI thread release `bufs` between frames (less render lock
+/// contention). ~2 screens of typical output.
+const INGEST_FRAME_BUDGET: usize = 64 * 1024;
+/// Output-batch size (bytes) above which a Ctrl+C-interrupting pump treats the
+/// batch as a sustained firehose and discards it. Kept far above a shell's
+/// `^C` echo + fresh prompt (typically < 1 KiB) so repeated Ctrl+C at an idle
+/// prompt still shows a newline, while `tail -n 1000000` batches (MB-scale) are
+/// dropped to stop the scroll.
+const CTRL_C_DROP_THRESHOLD: usize = 32 * 1024;
 
 /// Minimal CSI-final-byte rewriter state (persists across read chunks).
 #[derive(Clone, Copy, PartialEq)]
@@ -143,13 +176,13 @@ fn highlight_color_index(color: &str) -> u8 {
 }
 
 /// Max UI renders per second for a tab under sustained output (#209).
-const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Per-tab terminal buffer — each tab has its own lock so a burst of output on
 /// one session (e.g. `unzip` listing thousands of files) doesn't block keyboard
 /// input on another (#209).
 type TermBufferHandle = Arc<Mutex<TermBuffer>>;
-type TermBuffers = Arc<Mutex<HashMap<String, TermBufferHandle>>>;
+type TermBuffers = Arc<Mutex<HashMap<String, TermBuffer>>>;
 
 /// Coalesces render requests so a firehose of output schedules at most one UI
 /// flush at a time per tab, throttled to ~30 fps (#209).
@@ -157,6 +190,10 @@ struct TabRenderGate {
     scheduled: AtomicBool,
     pending: AtomicBool,
     last_render: Mutex<std::time::Instant>,
+    /// Monotonic counter bumped by the UI thread after each actual repaint of
+    /// this tab. The pump thread waits on it to pace a firehose to the render
+    /// rate (smooth scroll instead of teleporting, #perf).
+    rendered: std::sync::atomic::AtomicU64,
 }
 
 impl TabRenderGate {
@@ -165,29 +202,18 @@ impl TabRenderGate {
             scheduled: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             last_render: Mutex::new(std::time::Instant::now() - RENDER_MIN_INTERVAL),
+            rendered: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
 
 type RenderGates = Arc<Mutex<HashMap<String, Arc<TabRenderGate>>>>;
 
-fn term_buf(bufs: &TermBuffers, tab_id: &str) -> Option<TermBufferHandle> {
-    bufs.lock().unwrap().get(tab_id).cloned()
-}
-
-fn with_term_buf<R>(
-    bufs: &TermBuffers,
-    tab_id: &str,
-    f: impl FnOnce(&mut TermBuffer) -> R,
-) -> Option<R> {
-    let h = term_buf(bufs, tab_id)?;
-    let mut guard = h.lock().unwrap();
-    Some(f(&mut guard))
-}
-
 fn ingest_terminal_output(bufs: &TermBuffers, tab_id: &str, chunk: &[u8]) {
-    if let Some(h) = term_buf(bufs, tab_id) {
-        h.lock().unwrap().ingest(chunk);
+    if let Ok(mut map) = bufs.lock() {
+        if let Some(buf) = map.get_mut(tab_id) {
+            buf.ingest(chunk);
+        }
     }
 }
 
@@ -327,6 +353,29 @@ fn request_tab_render(
     });
 }
 
+/// Block the pump thread until the UI has actually repainted `tab_id` at least
+/// once since we last observed its render counter — i.e. pace this pump to the
+/// render rate. A firehose (`tail -n 1000000`) is thus throttled to ~the frame
+/// rate and the view advances smoothly instead of jumping to the end. The wait
+/// is bounded so a hidden/background tab can never stall the pump (#perf).
+fn wait_ui_render(gates: &RenderGates, tab_id: &str) {
+    let load = || {
+        gates
+            .lock()
+            .ok()
+            .and_then(|m| {
+                m.get(tab_id)
+                    .map(|g| g.rendered.load(std::sync::atomic::Ordering::Acquire))
+            })
+            .unwrap_or(0)
+    };
+    let prev = load();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    while load() == prev && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// UI-thread entry: honour the throttle, then render. Timer must be created
 /// here — not on pump threads (#209).
 fn run_coalesced_tab_render(
@@ -379,6 +428,7 @@ fn do_tab_render_flush(
         if visible_tab_ids(&win).contains(tab_id) {
             rebuild_tab_display(&win, bufs, tab_id);
             *gate.last_render.lock().unwrap() = std::time::Instant::now();
+            gate.rendered.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -1052,27 +1102,15 @@ pub fn run() -> Result<()> {
         let collapse_sftp = s.collapse_sftp_default();
         let sidebar_dock = s.sidebar_dock();
         let welcome_as_sidebar = s.welcome_as_sidebar();
-        let quick_commands_as_sidebar = s.quick_commands_as_sidebar();
-        let quick_panel_open = quick_commands_as_sidebar && s.quick_panel_open();
-        let quick_panel_collapsed = s.quick_panel_collapsed();
-        let quick_panel_dock = s.quick_panel_dock();
         let welcome_sidebar_dock = s.welcome_sidebar_dock();
         let mut sidebar_collapsed = s.sidebar_collapsed().unwrap_or(collapse_sidebar);
-        let mut welcome_collapsed = s.welcome_collapsed().unwrap_or(false);
+        let welcome_collapsed = s.welcome_collapsed().unwrap_or(false);
         if welcome_as_sidebar
             && sidebar_dock == welcome_sidebar_dock
             && !sidebar_collapsed
             && !welcome_collapsed
         {
             sidebar_collapsed = true;
-        }
-        if quick_panel_open && !quick_panel_collapsed {
-            if sidebar_dock == quick_panel_dock {
-                sidebar_collapsed = true;
-            }
-            if welcome_as_sidebar && welcome_sidebar_dock == quick_panel_dock {
-                welcome_collapsed = true;
-            }
         }
         window.set_collapse_sidebar_default(collapse_sidebar);
         window.set_collapse_sftp_default(collapse_sftp);
@@ -1083,12 +1121,6 @@ pub fn run() -> Result<()> {
         window.set_sftp_panel_width(s.sftp_panel_width());
         window.set_sftp_panel_height(s.sftp_panel_height());
         window.set_sftp_dock(s.sftp_dock().into());
-        window.set_quick_commands_as_sidebar(quick_commands_as_sidebar);
-        window.set_quick_panel_open(quick_panel_open);
-        window.set_quick_panel_collapsed(quick_panel_collapsed);
-        window.set_quick_panel_width(s.quick_panel_width());
-        window.set_quick_panel_height(s.quick_panel_height());
-        window.set_quick_panel_dock(quick_panel_dock.into());
         window.set_welcome_as_sidebar(welcome_as_sidebar);
         window.set_welcome_sidebar_width(s.welcome_sidebar_width());
         window.set_welcome_sidebar_dock(welcome_sidebar_dock.into());
@@ -1112,14 +1144,6 @@ pub fn run() -> Result<()> {
         window.on_set_collapse_sidebar_default(move |v| {
             let mut s = store.borrow_mut();
             s.set_collapse_sidebar_default(v);
-            let _ = s.save();
-        });
-    }
-    {
-        let store = store.clone();
-        window.on_set_quick_commands_as_sidebar(move |v| {
-            let mut s = store.borrow_mut();
-            s.set_quick_commands_as_sidebar(v);
             let _ = s.save();
         });
     }
@@ -2412,6 +2436,34 @@ pub fn run() -> Result<()> {
                     // Moving a maximized frameless window between mixed-DPI
                     // monitors can leave Win11 reporting "maximized" while the
                     // native rectangle/render surface still has the old size.
+                    #[cfg(target_os = "linux")]
+                    {
+                        // On Linux the compositor often reports scale_factor()==1.0
+                        // when the window is first created, then delivers the real
+                        // fractional scale (1.25/1.5/2.0) once the window lands on its
+                        // monitor. If the render surface isn't rebuilt for the new DPI,
+                        // the layout is drawn into a surface sized for the old scale
+                        // while the native window is physically larger — content shifts
+                        // to the top-left and the edge resize grips (Slint MouseAreas)
+                        // land at the wrong position. Re-requesting the current logical
+                        // size makes winit recompute physical = logical*scale and Slint
+                        // rebuild the surface + re-run layout at the correct DPI.
+                        // When physical already equals logical*scale this is a no-op, so
+                        // it self-corrects only the desynced case and never loops.
+                        if let Some(win) = weak.upgrade() {
+                            win.window().with_winit_window(|ww| {
+                                let scale = ww.scale_factor().max(0.01);
+                                let physical = ww.inner_size();
+                                let logical =
+                                    physical.to_logical::<f64>(scale);
+                                let _ = ww.request_inner_size(
+                                    i_slint_backend_winit::winit::dpi::LogicalSize::new(
+                                        logical.width, logical.height,
+                                    ),
+                                );
+                            });
+                        }
+                    }
                     refresh_revealed_main_window(weak.clone());
                 }
                 WEvent::Resized(size) => {
@@ -2794,8 +2846,8 @@ fn terminal_wheel_hit(
         return None;
     }
 
-    let h = term_buf(bufs, &active)?;
-    let guard = h.lock().ok()?;
+    let h = bufs.lock().ok()?;
+    let guard = h.get(&active)?;
     let screen = guard.parser.screen();
     let (rows, cols) = screen.size();
     let cell_w = (term_w / cols.max(1) as f32).max(1.0);
@@ -2890,32 +2942,6 @@ fn app_content_area(win: &AppWindow) -> LogicalRect {
         &side_dock,
         side_take,
     );
-    if win.get_quick_panel_open() {
-        let quick_dock = win.get_quick_panel_dock().to_string();
-        let quick_merged = win.get_quick_panel_collapsed()
-            && ((win.get_welcome_as_sidebar()
-                && win.get_welcome_collapsed()
-                && win.get_welcome_sidebar_dock().as_str() == quick_dock.as_str())
-                || (win.get_sidebar_collapsed() && side_dock.as_str() == quick_dock.as_str()));
-        if quick_merged {
-            return area;
-        }
-        let quick_take = if win.get_quick_panel_collapsed() {
-            36.0
-        } else if quick_dock == "left" || quick_dock == "right" {
-            win.get_quick_panel_width() + 4.0
-        } else {
-            win.get_quick_panel_height() + 4.0
-        };
-        shrink_edge(
-            &mut area.x,
-            &mut area.y,
-            &mut area.w,
-            &mut area.h,
-            &quick_dock,
-            quick_take,
-        );
-    }
     area
 }
 
@@ -3072,7 +3098,34 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: std::path
 }
 
 #[cfg(not(windows))]
-fn handle_file_drop(_win: &AppWindow, _sftp_handles: &SftpHandles, _path: std::path::PathBuf) {}
+fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: std::path::PathBuf) {
+    let active = win.get_active_tab_id().to_string();
+    if active == "welcome" {
+        return;
+    }
+    let dir = active_sftp_path(win, &active);
+    if dir.is_empty() {
+        return;
+    }
+    let sync = win.get_sync_input() && win.get_sync_upload_enabled();
+    let other_dirs = if sync { terminal_sftp_paths(win) } else { HashMap::new() };
+    if let Ok(handles) = sftp_handles.lock() {
+        if let Some(h) = handles.get(&active) {
+            h.upload(path.clone(), dir);
+        }
+        if sync {
+            for (id, h) in handles.iter() {
+                if id == &active {
+                    continue;
+                }
+                if let Some(d) = other_dirs.get(id).filter(|d| !d.is_empty()) {
+                    h.upload(path.clone(), d.clone());
+                }
+            }
+        }
+        win.set_download_open(true);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Model helpers
@@ -3238,7 +3291,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
         last_used: "".into(),
         group: group.into(),
         group_header: group.into(),
-        collapsed: false,
+        collapsed: true,
     };
 
     let mut rows: Vec<SessionInfo> = Vec::new();
@@ -3286,7 +3339,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
                     } else {
                         "".into()
                     },
-                    collapsed: false,
+                    collapsed: true,
                 });
             }
         }
@@ -4358,7 +4411,7 @@ fn wire_session_callbacks(
             };
             bufs.lock().unwrap().insert(
                 tab_id.clone(),
-                Arc::new(Mutex::new(TermBuffer {
+                TermBuffer {
                     parser: vt100::Parser::new(24, 80, 5000),
                     find_query: String::new(),
                     is_dark: is_dark_now,
@@ -4367,13 +4420,17 @@ fn wire_session_callbacks(
                     sel_anchor: None,
                     sel_focus: None,
                     sel_ranges: Vec::new(),
-                    history: Vec::new(),
+                    history: VecDeque::new(),
                     prev: Vec::new(),
                     view_offset: 0,
                     displayed_text: Vec::new(),
                     csi_state: CsiState::Normal,
                     raw: std::collections::VecDeque::new(),
-                })),
+                    hl_version: 0,
+                    hl_cache_version: 0,
+                    hl_cache: HashMap::new(),
+                    interrupt_drop: AtomicBool::new(false),
+                },
             );
             render_gates
                 .lock()
@@ -4588,6 +4645,44 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                     }
                 }
 
+                // Ctrl+C interrupt handling. Once a Ctrl+C is sent, large output
+                // batches (a real firehose, e.g. `tail -n 1000000`) are discarded
+                // so the terminal stops scrolling instead of replaying the whole
+                // pre-read stream. Small batches — the `^C` echo and the shell's
+                // fresh prompt that the keystroke itself produces — are kept, so
+                // repeated Ctrl+C at an idle prompt still shows a newline + prompt.
+                // The trigger stays set until a small batch is seen, which marks
+                // the end of the firehose (the process was interrupted).
+                let triggered = bufs_thread
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| {
+                        m.get_mut(&tab_id_pump)
+                            .map(|b| b.interrupt_drop.load(Ordering::SeqCst))
+                    })
+                    .unwrap_or(false);
+                if triggered {
+                    let batch_bytes: usize = drained
+                        .iter()
+                        .map(|e| match e {
+                            SessionEvent::Output(s) => s.len(),
+                            _ => 0,
+                        })
+                        .sum();
+                    if batch_bytes >= CTRL_C_DROP_THRESHOLD {
+                        // Sustained firehose: discard this batch's output only.
+                        drained.retain(|e| !matches!(e, SessionEvent::Output(_)));
+                    } else {
+                        // Small batch = the Ctrl+C echo/prompt (or end of flood):
+                        // keep it and stop discarding.
+                        if let Ok(mut m) = bufs_thread.lock() {
+                            if let Some(b) = m.get_mut(&tab_id_pump) {
+                                b.interrupt_drop.store(false, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                }
+
                 // Run CwdChanged side-effects here (off the UI thread), drop the
                 // swallowed ones, and concatenate runs of Output into a single chunk
                 // so the UI parses + renders the whole burst once.
@@ -4664,12 +4759,31 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 // Ingest terminal output on this pump thread (not the UI thread)
                 // so a firehose can't block keyboard input or repaints (#209).
                 let mut had_output = false;
+                let mut ingested_since_render = 0usize;
                 let mut ui_only: Vec<SessionEvent> = Vec::with_capacity(ui_batch.len());
                 for evt in ui_batch {
                     match evt {
                         SessionEvent::Output(chunk) => {
                             ingest_terminal_output(&bufs_thread, &tab_id_pump, chunk.as_bytes());
                             had_output = true;
+                            ingested_since_render += chunk.len();
+                            // Frame-aligned backpressure: once we've absorbed a
+                            // screenful-ish of output, ask the UI to repaint and
+                            // block until it actually has. This paces a firehose
+                            // to the render rate so the view scrolls smoothly
+                            // instead of teleporting, and lets the UI thread
+                            // release `bufs` between frames (less lock contention,
+                            // #perf).
+                            if ingested_since_render >= INGEST_FRAME_BUDGET {
+                                request_tab_render(
+                                    weak_inner.clone(),
+                                    &tab_id_pump,
+                                    &bufs_thread,
+                                    &render_gates_pump,
+                                );
+                                wait_ui_render(&render_gates_pump, &tab_id_pump);
+                                ingested_since_render = 0;
+                            }
                         }
                         other => ui_only.push(other),
                     }
@@ -5499,11 +5613,6 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
     s.set_sftp_panel_width(win.get_sftp_panel_width());
     s.set_sftp_panel_height(win.get_sftp_panel_height());
     s.set_sftp_dock(win.get_sftp_dock().to_string());
-    s.set_quick_panel_open(win.get_quick_panel_open());
-    s.set_quick_panel_collapsed(win.get_quick_panel_collapsed());
-    s.set_quick_panel_width(win.get_quick_panel_width());
-    s.set_quick_panel_height(win.get_quick_panel_height());
-    s.set_quick_panel_dock(win.get_quick_panel_dock().to_string());
     s.set_welcome_sidebar_width(win.get_welcome_sidebar_width());
     s.set_welcome_sidebar_dock(win.get_welcome_sidebar_dock().to_string());
     s.set_welcome_collapsed(win.get_welcome_collapsed());
@@ -6001,8 +6110,7 @@ fn apply_terminal_resize(
     if let Some(handle) = handles.borrow().get(tab_id) {
         handle.resize(cols, rows);
     }
-    if let Some(h) = term_buf(bufs, tab_id) {
-        let mut buf = h.lock().unwrap();
+    if let Some(buf) = bufs.lock().unwrap().get_mut(tab_id) {
         let (old_rows, old_cols) = buf.parser.screen().size();
         let (new_rows, new_cols) = (rows as u16, cols as u16);
         if (new_rows, new_cols) != (old_rows, old_cols) {
@@ -6026,16 +6134,16 @@ fn apply_terminal_resize(
 /// current vt100 screen (respecting scrollback) and push them to the model.
 /// Used by scroll + selection callbacks (Output has its own equivalent inline).
 fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
-    let data = with_term_buf(bufs, tab_id, |buf| {
+    let data = {
+        let mut map = bufs.lock().unwrap();
+        let Some(buf) = map.get_mut(tab_id) else { return };
         let cols = buf.parser.screen().size().1;
         let b = buf.render(); // also refreshes buf.displayed_text
         let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
         let sel = buf.selection_rects_visible(cols);
         (b, matches, sel)
-    });
-    let Some((b, matches, sel)) = data else {
-        return;
     };
+    let (b, matches, sel) = data;
     let spans = ModelRc::from(Rc::new(VecModel::from(b.spans)));
     let fm = ModelRc::from(Rc::new(VecModel::from(matches)));
     let sm = ModelRc::from(Rc::new(VecModel::from(sel)));
@@ -6077,9 +6185,10 @@ fn theme_pref_is_dark(store: &ConfigStore) -> bool {
 fn apply_dark_mode(window: &AppWindow, bufs: &TermBuffers, dark: bool) {
     window.set_dark_mode(dark);
     {
-        let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
-        for h in handles {
-            h.lock().unwrap().is_dark = dark;
+        let mut map = bufs.lock().unwrap();
+        for buf in map.values_mut() {
+            buf.is_dark = dark;
+            buf.hl_version = buf.hl_version.wrapping_add(1);
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
@@ -6096,9 +6205,9 @@ fn apply_output_highlight(
 ) {
     let mode = OutputHighlightPreset::from_settings(enabled, preset);
     {
-        let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
-        for handle in handles {
-            handle.lock().unwrap().output_highlight = mode;
+        for handle in bufs.lock().unwrap().values_mut() {
+            handle.output_highlight = mode;
+            handle.hl_version = handle.hl_version.wrapping_add(1);
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
@@ -6114,9 +6223,9 @@ fn apply_custom_output_rules(
 ) {
     let compiled = compile_output_rules(rules);
     {
-        let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
-        for handle in handles {
-            handle.lock().unwrap().custom_highlight_rules = compiled.clone();
+        for handle in bufs.lock().unwrap().values_mut() {
+            handle.custom_highlight_rules = compiled.clone();
+            handle.hl_version = handle.hl_version.wrapping_add(1);
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
@@ -6528,10 +6637,48 @@ fn apply_session_event_to_window(
             update_terminal(&|t| t.status = status.clone().into());
         }
         SessionEvent::Output(chunk) => {
-            // Synthetic Output (disconnect hint, editor error, …) — rare, already
-            // on the UI thread. Live shell output is ingested on the pump thread.
-            ingest_terminal_output(bufs, tab_id, chunk.as_bytes());
-            run_coalesced_tab_render(&win.as_weak(), tab_id, bufs, gates);
+            // Feed raw bytes into the vt100 parser. vt100 correctly handles
+            // cursor movement, \r + line-redraw (readline), \x1b[K (erase to
+            // EOL), alternate-screen switching, and all VT100/xterm sequences.
+            // We then split the rendered screen at cursor_position() so Slint
+            // can insert the blinking "█" at the exact cursor cell.
+            let built = {
+                let mut map = bufs.lock().unwrap();
+                if let Some(buf) = map.get_mut(tab_id) {
+                    // Capture scrolled-off lines into history, then render the
+                    // current view (live or scrolled-back).
+                    buf.ingest(chunk.as_bytes());
+                    let cols = buf.parser.screen().size().1;
+                    let b = buf.render(); // refreshes buf.displayed_text
+                    let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
+                    let sel = buf.selection_rects_visible(cols);
+                    Some((b, matches, sel))
+                } else {
+                    None
+                }
+            };
+            if let Some((b, matches, sel)) = built {
+                let spans_model: ModelRc<TermSpan> =
+                    ModelRc::from(std::rc::Rc::new(VecModel::from(b.spans)));
+                let matches_model: ModelRc<TermMatch> =
+                    ModelRc::from(std::rc::Rc::new(VecModel::from(matches)));
+                let sel_model: ModelRc<TermMatch> =
+                    ModelRc::from(std::rc::Rc::new(VecModel::from(sel)));
+                let (cur_row, cur_col, rows_used, is_alt) =
+                    (b.cursor_row, b.cursor_col, b.rows_used, b.is_alt);
+                let (smax, soff) = (b.scroll_max, b.scroll_offset);
+                update_terminal(&|t| {
+                    t.spans = spans_model.clone();
+                    t.cursor_row = cur_row;
+                    t.cursor_col = cur_col;
+                    t.rows_used = rows_used;
+                    t.is_alt_screen = is_alt;
+                    t.find_matches = matches_model.clone();
+                    t.selection = sel_model.clone();
+                    t.scroll_max = smax;
+                    t.scroll_offset = soff;
+                });
+            }
         }
         SessionEvent::Connected => {
             update_tab(&|t| t.connected = true);
@@ -6709,12 +6856,21 @@ fn apply_session_event_to_window(
         } => {
             if error.is_empty() {
                 // Open the built-in viewer/editor (#70).
-                win.set_editor_line_numbers(line_numbers_for(&content).into());
+                // Normalise line endings to `\n` (#81): Slint's TextInput treats
+                // `\r` and `\n` as separate breaks, so a CRLF (or lone CR) file
+                // renders double-spaced against the gutter's line count.
+                let editor_content = content
+                    .replace('\t', "    ")
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n");
+                win.set_editor_line_numbers(line_numbers_for(&editor_content).into());
                 win.set_editor_path(path.into());
                 win.set_editor_name(name.into());
-                win.set_editor_content(content.into());
+                win.set_editor_content(editor_content.clone().into());
+                update_editor_text_layers(&win, &editor_content);
                 win.set_editor_readonly(!edit);
                 win.set_editor_dirty(false);
+                win.set_editor_find_visible(false);
                 win.set_editor_open(true);
             } else {
                 // Couldn't open as text. The SFTP status line alone is easy to
@@ -8490,6 +8646,25 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
         window.on_editor_recount(move |text: SharedString| {
             if let Some(w) = weak.upgrade() {
                 w.set_editor_line_numbers(line_numbers_for(text.as_str()).into());
+                update_editor_text_layers(&w, text.as_str());
+            }
+        });
+    }
+
+    // Replace any tab characters with 4 spaces (Slint's TextInput can't
+    // render 0x09 — it shows as a tofu box). Called from edited so the
+    // cursor briefly sits on the tab then immediately lands on spaces.
+    {
+        let weak = window.as_weak();
+        window.on_editor_replace_tabs(move || {
+            if let Some(w) = weak.upgrade() {
+                let content = w.get_editor_content().to_string();
+                if !content.contains('\t') { return; }
+                let new = content.replace('\t', "    ");
+                let line_numbers = line_numbers_for(&new);
+                w.set_editor_content(new.clone().into());
+                w.set_editor_line_numbers(line_numbers.into());
+                update_editor_text_layers(&w, &new);
             }
         });
     }
@@ -8521,18 +8696,90 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
         let weak = window.as_weak();
         window.on_close_editor(move || {
             let Some(w) = weak.upgrade() else { return };
-            if !w.get_editor_readonly() && w.get_editor_dirty() {
-                let path = w.get_editor_path().to_string();
-                let content = w.get_editor_content().to_string();
-                let tab_id = w.get_active_tab_id().to_string();
-                if let Ok(handles) = sftp_handles.lock() {
-                    if let Some(h) = handles.get(&tab_id) {
-                        h.write_text(path, content);
-                    }
-                }
-            }
             w.set_editor_open(false);
             w.set_editor_dirty(false);
+            w.set_editor_find_visible(false);
+        });
+    }
+
+    // --- Editor find / replace (Ctrl+F) --------------------------------------
+    // Slint can't search strings or measure UTF-8 byte length, so the heavy
+    // lifting lives here. The find panel stores match offsets + current index
+    // in Slint; Rust only (a) computes matches, (b) measures byte length, and
+    // (c) performs the actual text mutation for Replace / Replace All.
+
+    // Pure: every byte offset where `query` occurs in `text` (ascending).
+    {
+        let weak = window.as_weak();
+        window.on_editor_search_matches(
+            move |text: SharedString, query: SharedString| {
+                let _ = &weak; // weak kept for symmetry with other handlers
+                ModelRc::from(Rc::new(VecModel::from(editor_find_offsets(
+                    text.as_str(),
+                    query.as_str(),
+                ))))
+            },
+        );
+    }
+
+    // Pure: UTF-8 byte length of a string. Used by Slint to set the selection
+    // end on the TextInput (selection offsets are byte-based in Slint).
+    {
+        window.on_editor_byte_length_of(move |s: SharedString| {
+            s.as_str().len() as i32
+        });
+    }
+
+    // Pure: zero-based visual line index for a byte offset. Slint uses this to
+    // center the ScrollView on the active find match.
+    {
+        window.on_editor_line_index_at(move |text: SharedString, offset: i32| {
+            editor_line_index_at(text.as_str(), offset) as i32
+        });
+    }
+
+    // Pure: number of logical lines in the text (newlines + 1). Slint divides
+    // the TextInput's `preferred-height` by this to measure the *actual* line
+    // height, which the find-scroll math needs to be exact (a hardcoded
+    // multiplier like `font-size * 1.35` drifts with the line index and lands
+    // on the wrong line — or scrolls the match off-screen — for deep matches).
+    {
+        window.on_editor_line_count(move |text: SharedString| {
+            text.as_str().split('\n').count().max(1) as i32
+        });
+    }
+
+    // Replace every occurrence of the query with `replacement`. Uses Rust's
+    // `str::replace` (handles non-overlapping matches identically to the find
+    // loop). After writing the new content back, Slint refreshes the search.
+    {
+        let weak = window.as_weak();
+        window.on_editor_replace_all(move |replacement: SharedString| {
+            let Some(w) = weak.upgrade() else { return };
+            if w.get_editor_readonly() {
+                return;
+            }
+            let query = w.get_editor_find_query().to_string();
+            if query.is_empty() {
+                return;
+            }
+            let content = w.get_editor_content().to_string();
+            let new_content = content.replace(query.as_str(), replacement.as_str());
+            if new_content == content {
+                return;
+            }
+            w.set_editor_content(new_content.into());
+            w.set_editor_dirty(true);
+            let current_content = w.get_editor_content();
+            w.set_editor_line_numbers(
+                line_numbers_for(current_content.as_str()).into(),
+            );
+            update_editor_text_layers(&w, current_content.as_str());
+            // After replace-all all intended occurrences are gone.  Clear the
+            // selection so the user doesn't see a spurious highlight on any
+            // incidental matches inside the replacement text.
+            w.set_editor_current_match(-1);
+            w.set_editor_highlight_trigger(w.get_editor_highlight_trigger() + 1);
         });
     }
 }
@@ -8605,13 +8852,15 @@ fn wire_key_input(
         let store_rc = store.clone();
         let weak = window.as_weak();
         window.on_run_command(
-            move |tab_id: SharedString, cmd: SharedString, to_all: bool| {
+            move |tab_id: SharedString, cmd: SharedString, to_all: bool, send_enter: bool| {
                 let line = cmd.trim_end().to_string();
                 if line.is_empty() {
                     return;
                 }
                 let mut bytes = line.clone().into_bytes();
-                bytes.push(b'\n');
+                if send_enter {
+                    bytes.push(b'\n');
+                }
                 {
                     let h = handles_rc.borrow();
                     if to_all {
@@ -8874,6 +9123,26 @@ fn wire_key_input(
             }
         });
     }
+    // Toggle send_enter on a quick command (#55).
+    {
+        let store_rc = store.clone();
+        let weak = window.as_weak();
+        let collapsed = collapsed_quick_groups.clone();
+        window.on_toggle_send_enter(move |index: i32| {
+            {
+                let mut s = store_rc.borrow_mut();
+                let mut v = s.quick_commands().to_vec();
+                if let Some(c) = v.get_mut(index as usize) {
+                    c.send_enter = !c.send_enter;
+                }
+                s.set_quick_commands(v);
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_quick_commands(quick_cmd_model(&store_rc.borrow(), &collapsed.borrow()));
+            }
+        });
+    }
     // Quick-group create / rename (#55).
     {
         let store_rc = store.clone();
@@ -8957,8 +9226,8 @@ fn wire_key_input(
                     }
                     // Fresh screen: new parser, cleared history/selection.
                     {
-                        if let Some(h) = term_buf(&ctx.bufs, tab_id.as_str()) {
-                            let mut b = h.lock().unwrap();
+                        let mut map = ctx.bufs.lock().unwrap();
+                        if let Some(b) = map.get_mut(tab_id.as_str()) {
                             let (rows, cols) = b.parser.screen().size();
                             b.parser = vt100::Parser::new(rows, cols, 5000);
                             b.history.clear();
@@ -8991,14 +9260,17 @@ fn wire_key_input(
             // Check whether the remote PTY switched to application cursor mode
             // (DECCKM, set by nano/vim via \x1b[?1h). In that mode the terminal
             // must send \x1bOA/B/C/D instead of \x1b[A/B/C/D.
-            let app_cursor = if let Some(h) = term_buf(&bufs, tab_id.as_str()) {
-                let mut b = h.lock().unwrap();
-                // Typing snaps the view back to the live bottom so the
-                // user always sees what they're entering.
-                b.view_offset = 0;
-                b.parser.screen().application_cursor()
-            } else {
-                false
+            let app_cursor = {
+                let mut map = bufs.lock().unwrap();
+                match map.get_mut(tab_id.as_str()) {
+                    Some(b) => {
+                        // Typing snaps the view back to the live bottom so the
+                        // user always sees what they're entering.
+                        b.view_offset = 0;
+                        b.parser.screen().application_cursor()
+                    }
+                    None => false,
+                }
             };
             // Never log the raw key string — it can be a password character
             // (#15). redact_key keeps control codes but masks printable text.
@@ -9192,6 +9464,17 @@ fn wire_key_input(
             }
 
             let bytes = key_to_pty_bytes(key.as_str(), ctrl, alt, app_cursor);
+            // Ctrl+C (0x03): mark this tab's output backlog for discard so a
+            // firehose stops scrolling immediately once the process is
+            // interrupted, instead of replaying the entire pre-read stream.
+            if bytes.as_slice() == [0x03] {
+                if let Ok(mut map) = bufs.lock() {
+                    if let Some(b) = map.get_mut(tab_id.as_str()) {
+                        b.interrupt_drop.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+
             // Log only the length — never the keystroke bytes, which can be
             // password characters (#15).
             tracing::debug!(
@@ -9289,19 +9572,22 @@ fn wire_key_input(
     {
         let bufs = bufs.clone();
         window.on_copy_terminal_text(move |tab_id: SharedString| {
-            let text = term_buf(&bufs, tab_id.as_str())
-                .map(|h| {
-                    let buf = h.lock().unwrap();
-                    // Copy the drag-selection when there is one, else the
-                    // whole displayed screen.
-                    let sel = buf.extract_selection_text();
-                    if sel.is_empty() {
-                        buf.displayed_text.join("\n")
-                    } else {
-                        sel
+            let text = {
+                let map = bufs.lock().unwrap();
+                match map.get(tab_id.as_str()) {
+                    Some(buf) => {
+                        // Copy the drag-selection when there is one, else the
+                        // whole displayed screen.
+                        let sel = buf.extract_selection_text();
+                        if sel.is_empty() {
+                            buf.displayed_text.join("\n")
+                        } else {
+                            sel
+                        }
                     }
-                })
-                .unwrap_or_default();
+                    None => String::new(),
+                }
+            };
             // Run the clipboard write on a dedicated OS thread.  arboard's
             // Windows backend opens the clipboard and pumps Win32 messages;
             // doing that on the Slint/winit event-loop thread re-enters the
@@ -9387,12 +9673,11 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_clear_terminal(move |tab_id: SharedString| {
             let tid = tab_id.to_string();
-            if let Some(h) = term_buf(&bufs_clear, &tid) {
-                let mut buf = h.lock().unwrap();
+            if let Some(buf) = bufs_clear.lock().unwrap().get_mut(&tid) {
                 let (rows, cols) = buf.parser.screen().size();
                 buf.parser = vt100::Parser::new(rows, cols, 5000);
                 buf.find_query.clear();
-                buf.history = Vec::new(); // recycle the session scrollback
+                buf.history = VecDeque::new(); // recycle the session scrollback
                 buf.prev = Vec::new();
                 buf.view_offset = 0;
                 buf.sel_anchor = None;
@@ -9426,17 +9711,22 @@ fn wire_key_input(
         window.on_find_query_changed(move |tab_id: SharedString, query: SharedString| {
             let tid = tab_id.to_string();
             let q = query.to_string();
-            let (matches, jumped) = with_term_buf(&bufs_find, &tid, |buf| {
-                buf.find_query = q.clone();
-                let mut matches = compute_find_matches(&buf.displayed_text, &q);
-                let jumped = matches.is_empty() && buf.scroll_to_first_find_match(&q);
-                if jumped {
-                    buf.render();
-                    matches = compute_find_matches(&buf.displayed_text, &q);
+            let (matches, jumped) = {
+                let mut map = bufs_find.lock().unwrap();
+                if let Some(buf) = map.get_mut(&tid) {
+                    buf.find_query = q.clone();
+                    let mut matches = compute_find_matches(&buf.displayed_text, &q);
+                    let jumped = matches.is_empty() && buf.scroll_to_first_find_match(&q);
+                    if jumped {
+                        buf.render();
+                        matches = compute_find_matches(&buf.displayed_text, &q);
+                    }
+                    (matches, jumped)
+                } else {
+                    (Vec::new(), false)
                 }
-                (matches, jumped)
-            })
-            .unwrap_or_default();
+            };
+
             if let Some(win) = weak.upgrade() {
                 if jumped {
                     rebuild_tab_display(&win, &bufs_find, &tid);
@@ -9456,13 +9746,15 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_terminal_scroll(move |tab_id: SharedString, delta: i32| {
             let tid = tab_id.to_string();
-            with_term_buf(&bufs_scroll, &tid, |buf| {
+            {
+                let mut map = bufs_scroll.lock().unwrap();
+                let Some(buf) = map.get_mut(&tid) else { return };
                 // Scroll within our own session scrollback (history lines above
                 // the live screen).  Offset 0 = live bottom.
                 let max_off = buf.history.len() as i64;
                 let cur = buf.view_offset as i64;
                 buf.view_offset = (cur + delta as i64).clamp(0, max_off) as usize;
-            });
+            }
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_scroll, &tid);
             }
@@ -9480,8 +9772,9 @@ fn wire_key_input(
         let handles_wheel = handles.clone();
         window.on_terminal_wheel(move |tab_id: SharedString, dir: i32, col: i32, row: i32| {
             let tid = tab_id.to_string();
-            let bytes = term_buf(&bufs_wheel, &tid).map(|h| {
-                let buf = h.lock().unwrap();
+            let bytes = {
+                let map = bufs_wheel.lock().unwrap();
+                let Some(buf) = map.get(&tid) else { return };
                 let screen = buf.parser.screen();
                 if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
                     // 1-based cell under the cursor, clamped to the screen.
@@ -9513,8 +9806,8 @@ fn wire_key_input(
                     };
                     one.repeat(3)
                 }
-            });
-            if let (Some(bytes), Some(h)) = (bytes, handles_wheel.borrow().get(&tid)) {
+            };
+            if let Some(h) = handles_wheel.borrow().get(&tid) {
                 h.send_raw(bytes);
             }
         });
@@ -9526,10 +9819,12 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_terminal_scroll_to(move |tab_id: SharedString, offset: i32| {
             let tid = tab_id.to_string();
-            with_term_buf(&bufs_scroll, &tid, |buf| {
+            {
+                let mut map = bufs_scroll.lock().unwrap();
+                let Some(buf) = map.get_mut(&tid) else { return };
                 let max_off = buf.history.len() as i64;
                 buf.view_offset = (offset as i64).clamp(0, max_off) as usize;
-            });
+            }
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_scroll, &tid);
             }
@@ -9540,30 +9835,23 @@ fn wire_key_input(
     {
         let bufs_sel = bufs.clone();
         let weak = window.as_weak();
-        window.on_term_select_start(move |tab_id: SharedString, row: i32, col: i32, ctrl: bool, shift: bool| {
+        window.on_term_select_start(move |tab_id: SharedString, row: i32, col: i32| {
             let tid = tab_id.to_string();
-            with_term_buf(&bufs_sel, &tid, |buf| {
+            {
+                let mut map = bufs_sel.lock().unwrap();
+                let Some(buf) = map.get_mut(&tid) else { return };
                 let (rows, cols) = buf.parser.screen().size();
                 let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
                 let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
                 // Anchor + focus in absolute scrollback coordinates.
                 let abs = buf.vis_to_abs(r);
                 let point = (abs, c);
-                if ctrl && !shift {
-                    buf.sel_ranges.push((point, point));
-                } else if shift && !buf.sel_ranges.is_empty() {
-                    let anchor = buf.sel_ranges.last().map(|range| range.0).unwrap_or(point);
-                    if let Some(range) = buf.sel_ranges.last_mut() {
-                        *range = (anchor, point);
-                    }
-                } else {
-                    buf.sel_ranges.clear();
-                    buf.sel_ranges.push((point, point));
-                }
+                buf.sel_ranges.clear();
+                buf.sel_ranges.push((point, point));
                 let (anchor, focus) = buf.sel_ranges.last().copied().unwrap_or((point, point));
                 buf.sel_anchor = Some(anchor);
                 buf.sel_focus = Some(focus);
-            });
+            }
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_sel, &tid);
             }
@@ -9574,7 +9862,9 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_term_select_update(move |tab_id: SharedString, row: i32, col: i32| {
             let tid = tab_id.to_string();
-            with_term_buf(&bufs_sel, &tid, |buf| {
+            {
+                let mut map = bufs_sel.lock().unwrap();
+                let Some(buf) = map.get_mut(&tid) else { return };
                 let (rows, cols) = buf.parser.screen().size();
                 let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
                 let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
@@ -9585,7 +9875,7 @@ fn wire_key_input(
                         range.1 = (abs, c);
                     }
                 }
-            });
+            }
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_sel, &tid);
             }
@@ -9598,7 +9888,9 @@ fn wire_key_input(
             let tid = tab_id.to_string();
             // Extract the selected text; a zero-area selection (a plain click)
             // is cleared instead of copied.
-            let text = with_term_buf(&bufs_sel, &tid, |buf| {
+            let text = {
+                let mut map = bufs_sel.lock().unwrap();
+                let Some(buf) = map.get_mut(&tid) else { return };
                 let extracted = buf.extract_selection_text();
                 if extracted.is_empty() {
                     // Zero-area selection (a plain click) → clear it.
@@ -9609,14 +9901,34 @@ fn wire_key_input(
                 } else {
                     Some(extracted)
                 }
-            })
-            .flatten();
+            };
             match text {
                 Some(t) if !t.is_empty() => {
                     // Auto-copy on release (select-to-copy, PuTTY style).
                     std::thread::spawn(move || clipboard_set_text(t));
                 }
                 _ => {}
+            }
+            if let Some(win) = weak.upgrade() {
+                rebuild_tab_display(&win, &bufs_sel, &tid);
+            }
+        });
+    }
+    {
+        let bufs_sel = bufs.clone();
+        let weak = window.as_weak();
+        window.on_term_select_word(move |tab_id: SharedString, row: i32, col: i32| {
+            let tid = tab_id.to_string();
+            let text = {
+                let mut map = bufs_sel.lock().unwrap();
+                let Some(buf) = map.get_mut(&tid) else { return };
+                let (rows, cols) = buf.parser.screen().size();
+                let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
+                let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
+                buf.select_word_at(r, c)
+            };
+            if let Some(t) = text {
+                std::thread::spawn(move || clipboard_set_text(t));
             }
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_sel, &tid);
@@ -9632,11 +9944,9 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_term_select_autoscroll(move |tab_id: SharedString, dir: i32| {
             let tid = tab_id.to_string();
-            let Some(h) = term_buf(&bufs_sel, &tid) else {
-                return;
-            };
             {
-                let mut buf = h.lock().unwrap();
+                let mut map = bufs_sel.lock().unwrap();
+                let Some(buf) = map.get_mut(&tid) else { return };
                 // No scrollback on the alternate screen (vim/btop own the view).
                 if buf.parser.screen().alternate_screen() {
                     return;
@@ -10046,6 +10356,25 @@ fn redact_key(key: &str) -> String {
 /// when true the four arrow keys must use SS3 sequences (`\x1bOA`…) instead
 /// of the default CSI sequences (`\x1b[A`…).  Full-screen apps like nano and
 /// vim set this mode on startup.
+fn update_editor_text_layers(win: &AppWindow, content: &str) {
+    let mut comment_lines = Vec::new();
+    let mut normal_lines = Vec::new();
+
+    for line in content.split('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            comment_lines.push(line);
+            normal_lines.push("");
+        } else {
+            comment_lines.push("");
+            normal_lines.push(line);
+        }
+    }
+
+    win.set_editor_comment_text(comment_lines.join("\n").into());
+    win.set_editor_normal_text(normal_lines.join("\n").into());
+}
+
 /// Build the editor's line-number gutter text: "1\n2\n…\nN", one number per line
 /// of `content`, matching its (newline-separated) line count (#81).
 fn line_numbers_for(content: &str) -> String {
@@ -10059,6 +10388,32 @@ fn line_numbers_for(content: &str) -> String {
         let _ = write!(s, "{i}");
     }
     s
+}
+
+/// Every byte offset where `query` occurs in `text` (ascending, non-overlapping).
+/// Used by the editor's find/replace panel — Slint has no string-search op so
+/// the search runs here and the offsets are returned to Slint for highlighting.
+fn editor_find_offsets(text: &str, query: &str) -> Vec<i32> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut offsets = Vec::new();
+    let mut start = 0;
+    while let Some(idx) = text[start..].find(query) {
+        let abs = start + idx;
+        offsets.push(abs as i32);
+        start = abs + query.len();
+    }
+    offsets
+}
+
+fn editor_line_index_at(text: &str, offset: i32) -> usize {
+    let offset = offset.max(0) as usize;
+    let end = offset.min(text.len());
+    text.as_bytes()[..end]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
 }
 
 /// Write `text` to the system clipboard. Call from a dedicated thread, never the
@@ -10279,17 +10634,12 @@ fn encode_pasted_text(text: &str, bracketed: bool) -> Vec<u8> {
 }
 
 fn terminal_uses_bracketed_paste(bufs: &TermBuffers, tab_id: &str) -> bool {
-    let buffer = bufs
-        .lock()
-        .ok()
-        .and_then(|buffers| buffers.get(tab_id).cloned());
-    buffer
-        .and_then(|buffer| {
-            buffer
-                .lock()
-                .ok()
-                .map(|buffer| buffer.parser.screen().bracketed_paste())
-        })
+    let Ok(guard) = bufs.lock() else {
+        return false;
+    };
+    guard
+        .get(tab_id)
+        .map(|buffer| buffer.parser.screen().bracketed_paste())
         .unwrap_or(false)
 }
 
@@ -10516,6 +10866,21 @@ struct BuiltScreen {
     /// offset (0 = live bottom), for the terminal scrollbar (#103).
     scroll_max: i32,
     scroll_offset: i32,
+}
+
+/// Pre-computed output that bypasses vt100 processing on the UI thread.
+/// The pump thread calls ingest + render, then sends only the results
+/// through invoke_from_event_loop — Slint only has to rebuild VecModels.
+struct PreBuiltOutput {
+    spans: Vec<TermSpan>,
+    cursor_row: i32,
+    cursor_col: i32,
+    rows_used: i32,
+    is_alt: bool,
+    scroll_max: i32,
+    scroll_offset: i32,
+    matches: Vec<TermMatch>,
+    sel: Vec<TermMatch>,
 }
 
 /// One coloured run within a line (its grid row is assigned at render time).
@@ -10807,39 +11172,91 @@ fn text_cell_width(text: &str) -> i32 {
         .sum()
 }
 
+/// Pre-compiled alternation of all uppercase log-level words. One regex scan
+/// replaces the previous N `match_indices` passes (one per word), which was the
+/// dominant cost inside `highlight_plain_output` on hot output paths.
+const LEVELS: [(&str, u8); 10] = [
+    ("CRITICAL", 9),
+    ("WARNING", 11),
+    ("ERROR", 9),
+    ("FATAL", 9),
+    ("PANIC", 9),
+    ("TRACE", 8),
+    ("DEBUG", 8),
+    ("NOTICE", 14),
+    ("INFO", 14),
+    ("WARN", 11),
+];
+
+/// Pre-compiled alternation of uppercase DevOps state words.
+const STATES: [(&str, u8); 15] = [
+    ("UNHEALTHY", 9),
+    ("SUCCEEDED", 10),
+    ("SUCCESS", 10),
+    ("FAILURE", 9),
+    ("FAILED", 9),
+    ("TIMEOUT", 9),
+    ("DENIED", 9),
+    ("DEGRADED", 11),
+    ("RETRYING", 11),
+    ("PENDING", 11),
+    ("HEALTHY", 10),
+    ("READY", 10),
+    ("PASSED", 10),
+    ("RETRY", 11),
+    ("FAIL", 9),
+];
+
+/// Word-boundary-anchored regex matching any log-level word in one left-to-right
+/// pass. Equivalent to the old per-word `match_indices` loop but ~10x cheaper.
+fn level_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        let pat = LEVELS
+            .iter()
+            .map(|(w, _)| regex::escape(w))
+            .collect::<Vec<_>>()
+            .join("|");
+        // NB: the `regex` crate does not support look-around, so word
+        // boundaries are enforced by `ascii_word_boundary` at each match site
+        // rather than via `(?<!...)`/`(?!...)`.
+        regex::Regex::new(&pat).unwrap()
+    })
+}
+
+/// Same as [`level_re`] but for DevOps state words.
+fn devops_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        let pat = STATES
+            .iter()
+            .map(|(w, _)| regex::escape(w))
+            .collect::<Vec<_>>()
+            .join("|");
+        // NB: the `regex` crate does not support look-around, so word
+        // boundaries are enforced by `ascii_word_boundary` at each match site.
+        regex::Regex::new(&pat).unwrap()
+    })
+}
+
 /// Return `(byte_start, byte_end, xterm_256_index)` for a log severity marker.
 fn log_level_marker(text: &str, max_chars: usize) -> Option<(usize, usize, u8)> {
-    const LEVELS: [(&str, u8); 10] = [
-        ("CRITICAL", 9),
-        ("WARNING", 11),
-        ("ERROR", 9),
-        ("FATAL", 9),
-        ("PANIC", 9),
-        ("TRACE", 8),
-        ("DEBUG", 8),
-        ("NOTICE", 14),
-        ("INFO", 14),
-        ("WARN", 11),
-    ];
-
     let bytes = text.as_bytes();
-    let mut best: Option<(usize, usize, u8)> = None;
-    for (word, colour) in LEVELS {
-        for (start, _) in text.match_indices(word) {
-            if text[..start].chars().count() >= max_chars
-                || !ascii_word_boundary(bytes, start, start + word.len())
-            {
-                continue;
-            }
-            let candidate = (start, start + word.len(), colour);
-            if best.map_or(true, |current| start < current.0) {
-                best = Some(candidate);
-            }
-            break;
+    let re = level_re();
+    let mut from = 0;
+    while let Some(m) = re.find_at(text, from) {
+        let start = m.start();
+        let end = m.end();
+        if ascii_word_boundary(bytes, start, end)
+            && text[..start].chars().count() < max_chars
+        {
+            let colour = LEVELS
+                .iter()
+                .find(|(w, _)| *w == m.as_str())
+                .map(|(_, c)| *c)?;
+            return Some((start, end, colour));
         }
-    }
-    if best.is_some() {
-        return best;
+        from = end;
     }
 
     // Structured logging commonly emits `level=error`, `level: warn`, or
@@ -10902,42 +11319,22 @@ fn output_highlight_marker(
 /// Additional deployment/operations states used by the DevOps preset. The list
 /// intentionally avoids ambiguous short words such as OK/UP/DOWN.
 fn devops_marker(text: &str, max_chars: usize) -> Option<(usize, usize, u8)> {
-    const STATES: [(&str, u8); 15] = [
-        ("UNHEALTHY", 9),
-        ("SUCCEEDED", 10),
-        ("SUCCESS", 10),
-        ("FAILURE", 9),
-        ("FAILED", 9),
-        ("TIMEOUT", 9),
-        ("DENIED", 9),
-        ("DEGRADED", 11),
-        ("RETRYING", 11),
-        ("PENDING", 11),
-        ("HEALTHY", 10),
-        ("READY", 10),
-        ("PASSED", 10),
-        ("RETRY", 11),
-        ("FAIL", 9),
-    ];
-
     let bytes = text.as_bytes();
-    let mut best: Option<(usize, usize, u8)> = None;
-    for (word, colour) in STATES {
-        for (start, _) in text.match_indices(word) {
-            if text[..start].chars().count() >= max_chars
-                || !ascii_word_boundary(bytes, start, start + word.len())
-            {
-                continue;
-            }
-            let candidate = (start, start + word.len(), colour);
-            if best.map_or(true, |current| start < current.0) {
-                best = Some(candidate);
-            }
-            break;
+    let re = devops_re();
+    let mut from = 0;
+    while let Some(m) = re.find_at(text, from) {
+        let start = m.start();
+        let end = m.end();
+        if ascii_word_boundary(bytes, start, end)
+            && text[..start].chars().count() < max_chars
+        {
+            let colour = STATES
+                .iter()
+                .find(|(w, _)| *w == m.as_str())
+                .map(|(_, c)| *c)?;
+            return Some((start, end, colour));
         }
-    }
-    if best.is_some() {
-        return best;
+        from = end;
     }
 
     let lower = text.to_ascii_lowercase();
@@ -10985,6 +11382,47 @@ fn ascii_word_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
         .get(start.wrapping_sub(1))
         .map_or(true, |b| !is_word(*b))
         && bytes.get(end).map_or(true, |b| !is_word(*b))
+}
+
+/// Cap on cached highlighted lines; beyond this the cache is dropped wholesale
+/// (rare — only on very long, varied scrollback) to bound memory.
+const HL_CACHE_CAP: usize = 8192;
+
+/// Stable hash of a rendered line's plain text, used as the highlight-cache key.
+fn plain_key(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Return highlighted runs for `plain`, reusing a prior computation when the same
+/// line (same plain text, same highlight config `version`) was rendered before.
+/// `cache_version` tracks the version the cache was built under; whenever the
+/// highlight config changes (`version` bumps) the cache is cleared once.
+fn cached_highlight(
+    cache: &mut HashMap<u64, Arc<Vec<HistSpan>>>,
+    cache_version: &mut u64,
+    version: &mut u64,
+    preset: OutputHighlightPreset,
+    rules: &[CompiledOutputRule],
+    plain: &str,
+    runs: Vec<HistSpan>,
+) -> Arc<Vec<HistSpan>> {
+    if *cache_version != *version {
+        cache.clear();
+        *cache_version = *version;
+    }
+    let key = plain_key(plain);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    let computed = highlight_plain_output(runs, preset, rules);
+    let rc = Arc::new(computed);
+    if cache.len() < HL_CACHE_CAP {
+        cache.insert(key, rc.clone());
+    }
+    rc
 }
 
 /// Detect how many lines scrolled off the top between two screen snapshots by
@@ -11213,6 +11651,79 @@ impl TermBuffer {
         out
     }
 
+    fn select_word_at(&mut self, vis_row: u16, vis_col: u16) -> Option<String> {
+        let abs = self.vis_to_abs(vis_row);
+        let s = self.parser.screen();
+        let (rows, cols) = s.size();
+        let line_str = if abs < self.history.len() {
+            self.history[abs].0.clone()
+        } else {
+            let live_row_idx = abs - self.history.len();
+            if live_row_idx < rows as usize {
+                build_row(s, live_row_idx as u16, cols).0
+            } else {
+                return None;
+            }
+        };
+
+        let chars: Vec<char> = line_str.chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+        let prefix = cell_prefix(&chars);
+        let char_idx = char_at_cell_start(&prefix, vis_col as usize);
+        if char_idx >= chars.len() {
+            return None;
+        }
+
+        let is_word_char = |c: char| {
+            c.is_alphanumeric()
+                || c == '_'
+                || c == '-'
+                || c == '.'
+                || c == '/'
+                || c == '\\'
+                || c == '~'
+                || c == '@'
+                || c == ':'
+                || c == '+'
+                || c == '$'
+                || c == '%'
+        };
+
+        if !is_word_char(chars[char_idx]) {
+            return None;
+        }
+
+        // Expand left
+        let mut start_idx = char_idx;
+        while start_idx > 0 && is_word_char(chars[start_idx - 1]) {
+            start_idx -= 1;
+        }
+
+        // Expand right
+        let mut end_idx = char_idx;
+        while end_idx + 1 < chars.len() && is_word_char(chars[end_idx + 1]) {
+            end_idx += 1;
+        }
+
+        // Map back to columns
+        let c0 = prefix[start_idx];
+        let c1 = prefix[end_idx + 1].saturating_sub(1);
+
+        self.sel_anchor = Some((abs, c0 as u16));
+        self.sel_focus = Some((abs, c1 as u16));
+        self.sel_ranges.clear();
+        self.sel_ranges.push(((abs, c0 as u16), (abs, c1 as u16)));
+
+        let extracted = self.extract_selection_text();
+        if extracted.is_empty() {
+            None
+        } else {
+            Some(extracted)
+        }
+    }
+
     /// Feed bytes to vt100 and capture scrolled-off lines into history.
     ///
     /// We detect scroll by diffing the screen before/after a `process`, which
@@ -11377,11 +11888,12 @@ impl TermBuffer {
         if !self.prev.is_empty() {
             let k = detect_scroll(&self.prev, &curr);
             for line in self.prev.iter().take(k) {
-                self.history.push(line.clone());
+                self.history.push_back(line.clone());
             }
-            if self.history.len() > MAX_HISTORY {
-                let drop = self.history.len() - MAX_HISTORY;
-                self.history.drain(0..drop);
+            // Bounded queue: evict oldest messages from the front. O(1) per
+            // line on a VecDeque ring buffer (vs. O(n) shift on a Vec).
+            while self.history.len() > MAX_HISTORY {
+                self.history.pop_front();
             }
         }
         self.prev = curr;
@@ -11390,12 +11902,18 @@ impl TermBuffer {
     /// Render the terminal grid for the current scrollback `view_offset`
     /// (0 = live).  Caches the displayed plain text for find/selection.
     fn render(&mut self) -> BuiltScreen {
-        let (is_alt, rows, cols, cur_row, cur_col) = {
-            let s = self.parser.screen();
-            let (r, c) = s.size();
-            let (cr, cc) = s.cursor_position();
-            (s.alternate_screen(), r, c, cr, cc)
-        };
+    let (is_alt, rows, cols, cur_row, cur_col) = {
+        let s = self.parser.screen();
+        let (r, c) = s.size();
+        let (cr, cc) = s.cursor_position();
+        (s.alternate_screen(), r, c, cr, cc)
+    };
+
+    // Snapshot highlight config so the (possibly cached) highlight calls
+    // inside the render loop don't re-borrow `self` while `s` holds
+    // an immutable borrow.
+    let preset = self.output_highlight;
+    let rules = self.custom_highlight_rules.clone();
 
         // --- Live view (also alt-screen): render the current grid -----------
         if is_alt || self.view_offset == 0 {
@@ -11405,20 +11923,24 @@ impl TermBuffer {
             let s = self.parser.screen();
             for r in 0..rows {
                 let (plain, runs, _wrapped) = build_row(s, r, cols);
-                let runs = if is_alt {
-                    runs
+                let runs: Arc<Vec<HistSpan>> = if is_alt {
+                    Arc::new(runs)
                 } else {
-                    highlight_plain_output(
+                    cached_highlight(
+                        &mut self.hl_cache,
+                        &mut self.hl_cache_version,
+                        &mut self.hl_version,
+                        preset,
+                        &rules,
+                        &plain,
                         runs,
-                        self.output_highlight,
-                        &self.custom_highlight_rules,
                     )
                 };
                 if !runs.is_empty() {
                     last_content = r as i32;
                 }
-                for hs in runs {
-                    spans.extend(render_term_span(&hs, r as i32, self.is_dark));
+                for hs in &*runs {
+                    spans.extend(render_term_span(hs, r as i32, self.is_dark));
                 }
                 displayed.push(plain.trim_end().to_string());
             }
@@ -11464,12 +11986,16 @@ impl TermBuffer {
             } else {
                 &live[idx - hist_len]
             };
-            let runs = highlight_plain_output(
+            let runs = cached_highlight(
+                &mut self.hl_cache,
+                &mut self.hl_cache_version,
+                &mut self.hl_version,
+                preset,
+                &rules,
+                &line.0,
                 line.1.clone(),
-                self.output_highlight,
-                &self.custom_highlight_rules,
             );
-            for hs in &runs {
+            for hs in &*runs {
                 spans.extend(render_term_span(hs, d as i32, self.is_dark));
             }
             displayed.push(line.0.trim_end().to_string());
@@ -12260,6 +12786,10 @@ mod selection_tests {
             displayed_text: Vec::new(),
             csi_state: CsiState::Normal,
             raw: std::collections::VecDeque::new(),
+            hl_version: 0,
+            hl_cache_version: 0,
+            hl_cache: HashMap::new(),
+            interrupt_drop: AtomicBool::new(false),
         }
     }
 
@@ -12329,12 +12859,12 @@ mod selection_tests {
     #[test]
     fn extract_joins_soft_wrapped_rows() {
         let mut buf = make_buf(5, 10, &[], &["x"], 0);
-        buf.history = vec![
+        buf.history = VecDeque::from(vec![
             wrapped_hist_line("0123456789"),
             wrapped_hist_line("abcdefghij"),
             hist_line("klmnop"),
             hist_line("next"),
-        ];
+        ]);
         buf.sel_anchor = Some((0, 0));
         buf.sel_focus = Some((3, 9));
         assert_eq!(

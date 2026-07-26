@@ -21,7 +21,7 @@ import { Welcome, SessionInfo } from "welcome.slint";
 import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton, DockExpandButton, IconButton, ToolStrip } from "widgets.slint";
-import { TerminalView, TermSpan, TermMatch, QuickCmd, QuickDockPanel } from "terminal_view.slint";
+import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint";
 import { SftpEntry, SftpTreeNode, TunnelInfo } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
 import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
@@ -287,6 +287,8 @@ export component AppWindow inherits Window {
     in-out property <length> sidebar-width: 220px;
     in-out property <length> sidebar-height: 240px;
     property <bool> sidebar-dragging;            // splitter being dragged
+    property <length> sidebar-drag-start-x;      // mouse-x at drag start
+    property <length> sidebar-drag-start-y;      // mouse-y at drag start
     callback persist-sidebar-width(float /* logical px */);
 
     // --- Panel docking (resource sidebar; SFTP follows in a later phase) ----
@@ -314,14 +316,6 @@ export component AppWindow inherits Window {
             : 0px)
         + ((root.welcome-as-sidebar && root.welcome-sidebar-dock == "right")
             ? root.welcome-sidebar-taken
-            : 0px)
-        + ((root.quick-panel-open && root.quick-panel-dock == "right")
-            ? (root.quick-panel-collapsed
-                ? ((root.welcome-as-sidebar && root.welcome-collapsed
-                        && root.welcome-sidebar-dock == "right")
-                    || (root.sidebar-collapsed && root.sidebar-dock == "right")
-                    ? 0px : 36px)
-                : root.quick-panel-width + 4px)
             : 0px);
     property <length> toolbar-y-off:
         (root.sidebar-dock == "top"
@@ -329,14 +323,6 @@ export component AppWindow inherits Window {
             : 0px)
         + ((root.welcome-as-sidebar && root.welcome-sidebar-dock == "top")
             ? root.welcome-sidebar-taken
-            : 0px)
-        + ((root.quick-panel-open && root.quick-panel-dock == "top")
-            ? (root.quick-panel-collapsed
-                ? ((root.welcome-as-sidebar && root.welcome-collapsed
-                        && root.welcome-sidebar-dock == "top")
-                    || (root.sidebar-collapsed && root.sidebar-dock == "top")
-                    ? 0px : 36px)
-                : root.quick-panel-height + 4px)
             : 0px);
     property <length> toolbar-y:
         (root.custom-titlebar ? 43px : 5px + root.titlebar-inset) + root.toolbar-y-off;
@@ -365,19 +351,9 @@ export component AppWindow inherits Window {
     in property <[SysInfoRow]> sys-filesystem-rows;
     // Command bar (#55): quick commands + history, fed from Rust.
     in property <[QuickCmd]> quick-commands;
-    in-out property <bool> quick-commands-as-sidebar: false;
-    callback set-quick-commands-as-sidebar(bool);
-    in-out property <bool> quick-panel-open: false;
-    in-out property <bool> quick-panel-collapsed: false;
-    in-out property <length> quick-panel-width: 260px;
-    in-out property <length> quick-panel-height: 220px;
-    in-out property <string> quick-panel-dock: "right";
-    property <string> quick-external-command;
-    property <bool> quick-external-send-enter;
-    property <int> quick-external-sequence;
     in property <[string]> command-history;          // oldest first (newest last, #113)
     in property <[string]> history-view;             // filtered dropdown list (#101)
-    callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */);
+    callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */, bool /* send-enter */);
     callback copy-text(string);                 // copy a history command (#96)
     callback delete-history(int /* index */);   // remove a history entry (#96)
     callback delete-history-cmd(string /* cmd */);   // remove a history entry by command (#101)
@@ -394,6 +370,7 @@ export component AppWindow inherits Window {
     callback edit-quick-command(int /* index */);
     callback duplicate-quick-command(int /* index */);
     callback move-quick-command(int /* index */, string /* group */);
+    callback toggle-send_enter(int /* index */);
     callback toggle-quick-group(string /* group */);  // collapse/expand a group (#55)
     // Quick-command group management (mirror session groups) (#55).
     in-out property <bool> qcg-open: false;           // group name dialog open
@@ -608,9 +585,28 @@ export component AppWindow inherits Window {
     in-out property <bool> editor-readonly;   // view = true, edit = false
     in-out property <bool> editor-dirty: false; // edited since load
     in-out property <string> editor-line-numbers; // newline-joined "1..N" from Rust (#81)
+    in-out property <string> editor-comment-text: "";
+    in-out property <string> editor-normal-text: "";
     callback save-file();                     // Ctrl+S / Save button (edit only)
     callback close-editor();                  // X / Esc; uploads if dirty
     callback editor-recount(string);          // rebuild line numbers after an edit
+    callback editor-replace-tabs();            // replace 0x09 with 4 spaces (#144)
+
+    // --- Editor find / replace (Ctrl+F) ----------------------------------
+    in-out property <bool>   editor-find-visible: false;
+    in-out property <string> editor-find-query: "";
+    in-out property <string> editor-replace-query: "";
+    in-out property <[int]>  editor-match-offsets: [];
+    in-out property <int>    editor-current-match: -1;
+    in-out property <string> editor-find-status: "";
+    in-out property <int>    editor-highlight-trigger: 0;
+    in-out property <int>    editor-find-focus-trigger: 0;
+    pure callback editor-search-matches(string, string) -> [int];
+    pure callback editor-byte-length-of(string) -> int;
+    pure callback editor-line-index-at(string, int) -> int;
+    pure callback editor-line-count(string) -> int;
+    callback editor-replace-all(string);
+
     // Editor card geometry: draggable by its title bar, resizable from the
     // bottom-right grip (same absolute-position pattern as the Interface
     // dialog). Defaults centre the card; user drags/resizes override them.
@@ -814,10 +810,11 @@ export component AppWindow inherits Window {
     callback terminal-wheel(string, int, int, int);
     callback terminal-scroll-to(string /* tab-id */, int /* offset */); // scrollbar drag (#103)
     // Drag-selection lifecycle (grid row/col coordinates).
-    callback term-select-start(string /* tab-id */, int /* row */, int /* col */, bool /* ctrl */, bool /* shift */);
+    callback term-select-start(string /* tab-id */, int /* row */, int /* col */);
     callback term-select-update(string /* tab-id */, int /* row */, int /* col */);
     callback term-select-end(string /* tab-id */);
     callback term-select-autoscroll(string /* tab-id */, int /* dir */);
+    callback term-select-word(string /* tab-id */, int /* row */, int /* col */);
 
     // Immersive wallpaper layer — painted behind everything, filling the window.
     // Panels/terminal frost over it (see Theme.frost). Only present when active.
@@ -910,76 +907,23 @@ export component AppWindow inherits Window {
         property <length> welcome-size: (root.welcome-as-sidebar && !root.welcome-collapsed) ? root.welcome-sidebar-width : 0px;
         property <length> welcome-taken: welcome-strip + welcome-size + sidebar-outside-strip;
         property <bool> welcome-horizontal: root.welcome-sidebar-horizontal;
+        property <length> strip-w: (root.welcome-as-sidebar && root.welcome-collapsed) ? 36px : 0px;
+        property <length> welcome-w: (root.welcome-as-sidebar && !root.welcome-collapsed) ? root.welcome-sidebar-width : 0px;
         property <bool> welcome-sidebar-dragging;
         property <bool> combine-collapsed-tools:
             root.welcome-as-sidebar && root.welcome-collapsed
             && root.sidebar-collapsed && root.sidebar-dock == root.welcome-sidebar-dock;
-        // A collapsed quick-command sidebar joins an existing collapsed strip
-        // on the same edge. Only when no such strip exists does it reserve its
-        // own outermost 36px slot (#215).
-        property <bool> quick-merge-welcome:
-            root.quick-panel-open && root.quick-panel-collapsed
-            && root.welcome-as-sidebar && root.welcome-collapsed
-            && root.quick-panel-dock == root.welcome-sidebar-dock;
-        property <bool> quick-merge-sidebar:
-            root.quick-panel-open && root.quick-panel-collapsed
-            && !dock-area.quick-merge-welcome && root.sidebar-collapsed
-            && root.quick-panel-dock == root.sidebar-dock;
-        property <length> quick-outer-strip:
-            root.quick-panel-open && root.quick-panel-collapsed
-                && !dock-area.quick-merge-welcome && !dock-area.quick-merge-sidebar
-                ? 36px : 0px;
-        property <bool> quick-outer-horizontal:
-            root.quick-panel-dock == "left" || root.quick-panel-dock == "right";
-        property <length> quick-left:
-            root.quick-panel-dock == "left" ? dock-area.quick-outer-strip : 0px;
-        property <length> quick-right:
-            root.quick-panel-dock == "right" ? dock-area.quick-outer-strip : 0px;
-        property <length> quick-top:
-            root.quick-panel-dock == "top" ? dock-area.quick-outer-strip : 0px;
-        property <length> quick-bottom:
-            root.quick-panel-dock == "bottom" ? dock-area.quick-outer-strip : 0px;
-
-        if dock-area.quick-outer-strip > 0px : ToolStrip {
-            x: root.quick-panel-dock == "right" ? parent.width - parent.quick-outer-strip : 0px;
-            y: root.quick-panel-dock == "bottom" ? parent.height - parent.quick-outer-strip : 0px;
-            width: parent.quick-outer-horizontal ? parent.quick-outer-strip : parent.width;
-            height: parent.quick-outer-horizontal ? parent.height : parent.quick-outer-strip;
-            dock-edge: root.quick-panel-dock;
-            glyph: "\u{E3E7}";
-            tooltip: @tr("Quick commands");
-            expand => {
-                root.quick-panel-collapsed = false;
-                if (root.sidebar-dock == root.quick-panel-dock) {
-                    root.sidebar-collapsed = true;
-                    root.set-sidebar-collapsed(true);
-                }
-                if (root.welcome-as-sidebar
-                        && root.welcome-sidebar-dock == root.quick-panel-dock) {
-                    root.welcome-collapsed = true;
-                    root.set-welcome-collapsed(true);
-                }
-            }
-        }
 
         // Collapsed welcome → a thin left icon strip (click the icon to re-open).
         if root.welcome-as-sidebar && root.welcome-collapsed : ToolStrip {
-            x: root.welcome-sidebar-dock == "right"
-                ? parent.width - parent.quick-right - parent.welcome-strip
-                : root.welcome-sidebar-dock == "left" ? parent.quick-left : parent.quick-left;
-            y: root.welcome-sidebar-dock == "bottom"
-                ? parent.height - parent.quick-bottom - parent.welcome-strip
-                : root.welcome-sidebar-dock == "top" ? parent.quick-top : parent.quick-top;
-            width: parent.welcome-horizontal ? parent.welcome-strip
-                : parent.width - parent.quick-left - parent.quick-right;
-            height: parent.welcome-horizontal
-                ? parent.height - parent.quick-top - parent.quick-bottom : parent.welcome-strip;
+            x: root.welcome-sidebar-dock == "right" ? parent.width - parent.welcome-strip : 0px;
+            y: root.welcome-sidebar-dock == "bottom" ? parent.height - parent.welcome-strip : 0px;
+            width: parent.welcome-horizontal ? parent.welcome-strip : parent.width;
+            height: parent.welcome-horizontal ? parent.height : parent.welcome-strip;
             dock-edge: root.welcome-sidebar-dock;
             glyph: "\u{E88A}";   // session list / welcome
-            show-second: parent.combine-collapsed-tools || parent.quick-merge-welcome;
-            second-glyph: parent.combine-collapsed-tools ? "\u{E871}" : "\u{E3E7}";
-            show-third: parent.combine-collapsed-tools && parent.quick-merge-welcome;
-            third-glyph: "\u{E3E7}";
+            show-second: parent.combine-collapsed-tools;
+            second-glyph: "\u{E871}";   // dashboard — resource panel
             expand => {
                 root.welcome-collapsed = false;
                 root.set-welcome-collapsed(false);
@@ -987,65 +931,39 @@ export component AppWindow inherits Window {
                     root.sidebar-collapsed = true;
                     root.set-sidebar-collapsed(true);
                 }
-                if (root.quick-panel-open
-                        && root.quick-panel-dock == root.welcome-sidebar-dock) {
-                    root.quick-panel-collapsed = true;
-                }
             }
             expand-second => {
-                if (parent.combine-collapsed-tools) {
-                    root.sidebar-collapsed = false;
-                    root.set-sidebar-collapsed(false);
-                    if (root.quick-panel-open && root.quick-panel-dock == root.sidebar-dock) {
-                        root.quick-panel-collapsed = true;
-                    }
-                } else {
-                    root.quick-panel-collapsed = false;
-                }
+                root.sidebar-collapsed = false;
+                root.set-sidebar-collapsed(false);
             }
-            expand-third => { root.quick-panel-collapsed = false; }
         }
 
         if dock-area.sidebar-strip-outside : ToolStrip {
-            x: root.welcome-sidebar-dock == "right"
-                ? parent.width - parent.quick-right - parent.sidebar-outside-strip
-                : root.welcome-sidebar-dock == "left" ? parent.quick-left : parent.quick-left;
-            y: root.welcome-sidebar-dock == "bottom"
-                ? parent.height - parent.quick-bottom - parent.sidebar-outside-strip
-                : root.welcome-sidebar-dock == "top" ? parent.quick-top : parent.quick-top;
-            width: parent.welcome-horizontal ? parent.sidebar-outside-strip
-                : parent.width - parent.quick-left - parent.quick-right;
-            height: parent.welcome-horizontal
-                ? parent.height - parent.quick-top - parent.quick-bottom : parent.sidebar-outside-strip;
+            x: root.welcome-sidebar-dock == "right" ? parent.width - parent.sidebar-outside-strip : 0px;
+            y: root.welcome-sidebar-dock == "bottom" ? parent.height - parent.sidebar-outside-strip : 0px;
+            width: parent.welcome-horizontal ? parent.sidebar-outside-strip : parent.width;
+            height: parent.welcome-horizontal ? parent.height : parent.sidebar-outside-strip;
             dock-edge: root.welcome-sidebar-dock;
             glyph: "\u{E871}";
-            show-second: parent.quick-merge-sidebar;
-            second-glyph: "\u{E3E7}";
             expand => {
                 root.sidebar-collapsed = false;
                 root.set-sidebar-collapsed(false);
                 root.welcome-collapsed = true;
                 root.set-welcome-collapsed(true);
-                if (root.quick-panel-open && root.quick-panel-dock == root.sidebar-dock) {
-                    root.quick-panel-collapsed = true;
-                }
             }
-            expand-second => { root.quick-panel-collapsed = false; }
         }
 
         // Welcome / session list, to the right of the icon strip. Hidden when
         // collapsed — its icon stays in the strip; clicking it re-opens.
         if root.welcome-as-sidebar && !root.welcome-collapsed : Rectangle {
-            x: root.welcome-sidebar-dock == "right" ? parent.width - parent.quick-right - parent.sidebar-outside-strip - parent.welcome-size
-             : root.welcome-sidebar-dock == "left" ? parent.quick-left + parent.sidebar-outside-strip
-             : parent.quick-left;
-            y: root.welcome-sidebar-dock == "bottom" ? parent.height - parent.quick-bottom - parent.sidebar-outside-strip - parent.welcome-size
-             : root.welcome-sidebar-dock == "top" ? parent.quick-top + parent.sidebar-outside-strip
-             : parent.quick-top;
-            width: parent.welcome-horizontal ? parent.welcome-size
-                : parent.width - parent.quick-left - parent.quick-right;
-            height: parent.welcome-horizontal
-                ? parent.height - parent.quick-top - parent.quick-bottom : parent.welcome-size;
+            x: root.welcome-sidebar-dock == "right" ? parent.width - parent.sidebar-outside-strip - parent.welcome-size
+             : root.welcome-sidebar-dock == "left" ? parent.sidebar-outside-strip
+             : 0px;
+            y: root.welcome-sidebar-dock == "bottom" ? parent.height - parent.sidebar-outside-strip - parent.welcome-size
+             : root.welcome-sidebar-dock == "top" ? parent.sidebar-outside-strip
+             : 0px;
+            width: parent.welcome-horizontal ? parent.welcome-size : parent.width;
+            height: parent.welcome-horizontal ? parent.height : parent.welcome-size;
             background: Theme.bg-panel;
             clip: true;
             Welcome {
@@ -1070,9 +988,6 @@ export component AppWindow inherits Window {
                         if (root.sidebar-dock == root.dock-target) {
                             root.sidebar-collapsed = true;
                             root.set-sidebar-collapsed(true);
-                        }
-                        if (root.quick-panel-open && root.quick-panel-dock == root.dock-target) {
-                            root.quick-panel-collapsed = true;
                         }
                         root.persist-welcome-sidebar-dock(root.welcome-sidebar-dock);
                     }
@@ -1109,16 +1024,14 @@ export component AppWindow inherits Window {
 
         // Drag the welcome sidebar's right edge to resize it (v0.5 M3b).
         if root.welcome-as-sidebar && !root.welcome-collapsed : Rectangle {
-            x: root.welcome-sidebar-dock == "left" ? parent.quick-left + parent.sidebar-outside-strip + parent.welcome-size - 2px
-             : root.welcome-sidebar-dock == "right" ? parent.width - parent.quick-right - parent.sidebar-outside-strip - parent.welcome-size - 2px
-             : parent.quick-left;
-            y: root.welcome-sidebar-dock == "top" ? parent.quick-top + parent.sidebar-outside-strip + parent.welcome-size - 2px
-             : root.welcome-sidebar-dock == "bottom" ? parent.height - parent.quick-bottom - parent.sidebar-outside-strip - parent.welcome-size - 2px
-             : parent.quick-top;
-            width: parent.welcome-horizontal ? 4px
-                : parent.width - parent.quick-left - parent.quick-right;
-            height: parent.welcome-horizontal
-                ? parent.height - parent.quick-top - parent.quick-bottom : 4px;
+            x: root.welcome-sidebar-dock == "left" ? parent.sidebar-outside-strip + parent.welcome-size - 2px
+             : root.welcome-sidebar-dock == "right" ? parent.width - parent.sidebar-outside-strip - parent.welcome-size - 2px
+             : 0px;
+            y: root.welcome-sidebar-dock == "top" ? parent.sidebar-outside-strip + parent.welcome-size - 2px
+             : root.welcome-sidebar-dock == "bottom" ? parent.height - parent.sidebar-outside-strip - parent.welcome-size - 2px
+             : 0px;
+            width: parent.welcome-horizontal ? 4px : parent.width;
+            height: parent.welcome-horizontal ? parent.height : 4px;
             background: ws-split-ta.has-hover || dock-area.welcome-sidebar-dragging
                 ? Theme.accent : transparent;
             ws-split-ta := TouchArea {
@@ -1158,16 +1071,10 @@ export component AppWindow inherits Window {
         // Everything except the welcome strip/sidebar — the resource panel,
         // splitter and the central tab/pane content — sits to the right of them.
         rest := Rectangle {
-        x: (root.welcome-sidebar-dock == "left" ? parent.welcome-taken : 0px)
-            + parent.quick-left;
-        y: (root.welcome-sidebar-dock == "top" ? parent.welcome-taken : 0px)
-            + parent.quick-top;
-        width: parent.width
-            - (parent.welcome-horizontal ? parent.welcome-taken : 0px)
-            - parent.quick-left - parent.quick-right;
-        height: parent.height
-            - (!parent.welcome-horizontal ? parent.welcome-taken : 0px)
-            - parent.quick-top - parent.quick-bottom;
+        x: root.welcome-sidebar-dock == "left" ? parent.welcome-taken : 0px;
+        y: root.welcome-sidebar-dock == "top" ? parent.welcome-taken : 0px;
+        width: parent.welcome-horizontal ? parent.width - parent.welcome-taken : parent.width;
+        height: parent.welcome-horizontal ? parent.height : parent.height - parent.welcome-taken;
         // Sidebar extent along its docked axis. When collapsed it shrinks to the
         // 36px ToolStrip icon bar (M5) instead of 0 + a floating button; the 4px
         // splitter is gone while collapsed.
@@ -1236,9 +1143,6 @@ export component AppWindow inherits Window {
                         root.welcome-collapsed = true;
                         root.set-welcome-collapsed(true);
                     }
-                    if (root.quick-panel-open && root.quick-panel-dock == root.dock-target) {
-                        root.quick-panel-collapsed = true;
-                    }
                     root.persist-sidebar-dock(root.sidebar-dock);
                 }
                 root.panel-dragging = false;
@@ -1259,8 +1163,6 @@ export component AppWindow inherits Window {
             height: root.sidebar-horizontal ? parent.height : parent.sb-h;
             dock-edge: root.sidebar-dock;
             glyph: "\u{E871}";   // dashboard — resource panel
-            show-second: dock-area.quick-merge-sidebar;
-            second-glyph: "\u{E3E7}";
             expand => {
                 root.sidebar-collapsed = false;
                 root.set-sidebar-collapsed(false);
@@ -1268,11 +1170,7 @@ export component AppWindow inherits Window {
                     root.welcome-collapsed = true;
                     root.set-welcome-collapsed(true);
                 }
-                if (root.quick-panel-open && root.quick-panel-dock == root.sidebar-dock) {
-                    root.quick-panel-collapsed = true;
-                }
             }
-            expand-second => { root.quick-panel-collapsed = false; }
         }
 
         // Splitter — drag to resize the sidebar. Orientation + which dimension it
@@ -1297,6 +1195,8 @@ export component AppWindow inherits Window {
                 pointer-event(ev) => {
                     if (ev.kind == PointerEventKind.down) {
                         root.sidebar-dragging = true;
+                        root.sidebar-drag-start-x = self.mouse-x;
+                        root.sidebar-drag-start-y = self.mouse-y;
                     } else if (ev.kind == PointerEventKind.up) {
                         root.sidebar-dragging = false;
                         root.persist-sidebar-width(root.sidebar-width / 1px);
@@ -1335,30 +1235,11 @@ export component AppWindow inherits Window {
         // sidebar is carved off its docked edge. Clipped so the terminal / SFTP
         // panel can never bleed (visually or for clicks) onto a panel docked on
         // the bottom or right (#dock).
-        quick-area := Rectangle {
+        central := Rectangle {
             x: root.sidebar-dock == "left" ? parent.sb-w + parent.sp : 0px;
             y: root.sidebar-dock == "top"  ? parent.sb-h + parent.sp : 0px;
             width:  root.sidebar-horizontal ? parent.width - parent.sb-w - parent.sp : parent.width;
             height: root.sidebar-horizontal ? parent.height : parent.height - parent.sb-h - parent.sp - parent.bottom-strip-h;
-            clip: true;
-            property <bool> quick-horizontal:
-                root.quick-panel-dock == "left" || root.quick-panel-dock == "right";
-            property <length> quick-w:
-                root.quick-panel-open && !root.quick-panel-collapsed ? root.quick-panel-width : 0px;
-            property <length> quick-h:
-                root.quick-panel-open && !root.quick-panel-collapsed ? root.quick-panel-height : 0px;
-            property <length> quick-sp:
-                root.quick-panel-open && !root.quick-panel-collapsed ? 4px : 0px;
-
-            central := Rectangle {
-            x: root.quick-panel-open && !root.quick-panel-collapsed && root.quick-panel-dock == "left"
-                ? parent.quick-w + parent.quick-sp : 0px;
-            y: root.quick-panel-open && !root.quick-panel-collapsed && root.quick-panel-dock == "top"
-                ? parent.quick-h + parent.quick-sp : 0px;
-            width: root.quick-panel-open && !root.quick-panel-collapsed && parent.quick-horizontal
-                ? parent.width - parent.quick-w - parent.quick-sp : parent.width;
-            height: root.quick-panel-open && !root.quick-panel-collapsed && !parent.quick-horizontal
-                ? parent.height - parent.quick-h - parent.quick-sp : parent.height;
             clip: true;
             // Split-pane area (v0.5): panes tile this rect; each pane has its own
             // tab strip + active terminal / welcome. Rust flattens the split tree
@@ -1500,52 +1381,26 @@ export component AppWindow inherits Window {
                     sftp-available: term.sftp-available;
                     tunnels: term.tunnels;
                     quick-commands: root.quick-commands;
-                    quick-sidebar-enabled: root.quick-commands-as-sidebar;
-                    quick-panel-docked: root.quick-panel-open;
-                    quick-external-command: root.quick-external-command;
-                    quick-external-send-enter: root.quick-external-send-enter;
-                    quick-external-sequence: root.quick-external-sequence;
                     command-history: root.command-history;
                     history-view: root.history-view;
-                    run-command(cmd, all) => { root.run-command(term.id, cmd, all); }
+                    run-command(cmd, all, ae) => { root.run-command(term.id, cmd, all, ae); }
                     copy-text(t) => { root.copy-text(t); }
                     delete-history(i) => { root.delete-history(i); }
                     delete-history-cmd(c) => { root.delete-history-cmd(c); }
                     search-history(q) => { root.search-history(q); }
-                    manage-quick-commands() => {
+                    manage-quick-commands(g) => {
                         root.qcm-name = "";
                         root.qcm-command = "";
-                        root.qcm-group = "";
+                        root.qcm-group = g;
                         root.qcm-edit-index = -1;
                         root.quick-cmd-manage-open = true;
-                    }
-                    quick-dock-drag-move(ax, ay) => {
-                        root.panel-dragging = true;
-                        root.drag-nx = (ax - dock-area.absolute-position.x) / dock-area.width;
-                        root.drag-ny = (ay - dock-area.absolute-position.y) / dock-area.height;
-                    }
-                    quick-dock-drag-end() => {
-                        if (root.dock-target != "") {
-                            root.quick-panel-dock = root.dock-target;
-                            root.quick-panel-open = true;
-                            root.quick-panel-collapsed = false;
-                            if (root.sidebar-dock == root.dock-target) {
-                                root.sidebar-collapsed = true;
-                                root.set-sidebar-collapsed(true);
-                            }
-                            if (root.welcome-as-sidebar
-                                    && root.welcome-sidebar-dock == root.dock-target) {
-                                root.welcome-collapsed = true;
-                                root.set-welcome-collapsed(true);
-                            }
-                        }
-                        root.panel-dragging = false;
                     }
                     toggle-quick-group(g) => { root.toggle-quick-group(g); }
                     edit-quick-command(i) => { root.edit-quick-command(i); }
                     duplicate-quick-command(i) => { root.duplicate-quick-command(i); }
                     delete-quick-command(i) => { root.delete-quick-command(i); }
                     move-quick-command(i, g) => { root.move-quick-command(i, g); }
+                    toggle-send_enter(i) => { root.toggle-send_enter(i); }
                     new-quick-group() => { root.qcg-orig = ""; root.qcg-name = ""; root.qcg-open = true; }
                     rename-quick-group(g) => { root.qcg-orig = g; root.qcg-name = g; root.qcg-open = true; }
                     delete-quick-group(g) => { root.delete-quick-group(g); }
@@ -1618,10 +1473,11 @@ export component AppWindow inherits Window {
                     terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
                     terminal-wheel(d, c, r) => { root.terminal-wheel(term.id, d, c, r); }
                     terminal-scroll-to(o) => { root.terminal-scroll-to(term.id, o); }
-                    select-start(r, c, ctrl, shift) => { root.term-select-start(term.id, r, c, ctrl, shift); }
-                    select-update(r, c) => { root.term-select-update(term.id, r, c); }
-                    select-end() => { root.term-select-end(term.id); }
-                    select-autoscroll(dir) => { root.term-select-autoscroll(term.id, dir); }
+                    select-start(tab-id, r, c) => { root.term-select-start(tab-id, r, c); }
+                    select-update(tab-id, r, c) => { root.term-select-update(tab-id, r, c); }
+                    select-end(tab-id) => { root.term-select-end(tab-id); }
+                    select-autoscroll(tab-id, dir) => { root.term-select-autoscroll(tab-id, dir); }
+                    select-word(tab-id, r, c) => { root.term-select-word(tab-id, r, c); }
                 }
 
                 // Windows may show the terminal model being reconstructed when
@@ -1674,91 +1530,6 @@ export component AppWindow inherits Window {
                 border-radius: Theme.radius-sm;
             }
             }
-        }
-
-        if root.quick-panel-open && !root.quick-panel-collapsed : QuickDockPanel {
-            x: root.quick-panel-dock == "right" ? parent.width - parent.quick-w : 0px;
-            y: root.quick-panel-dock == "bottom" ? parent.height - parent.quick-h : 0px;
-            width: parent.quick-horizontal ? parent.quick-w : parent.width;
-            height: parent.quick-horizontal ? parent.height : parent.quick-h;
-            commands: root.quick-commands;
-            dock-edge: root.quick-panel-dock;
-            activate(command, send-enter) => {
-                root.quick-external-command = command;
-                root.quick-external-send-enter = send-enter;
-                root.quick-external-sequence += 1;
-            }
-            toggle-group(group) => { root.toggle-quick-group(group); }
-            manage => {
-                root.qcm-name = "";
-                root.qcm-command = "";
-                root.qcm-group = "";
-                root.qcm-edit-index = -1;
-                root.quick-cmd-manage-open = true;
-            }
-            close => { root.quick-panel-collapsed = true; }
-            dock-drag-move(ax, ay) => {
-                root.panel-dragging = true;
-                root.drag-nx = (ax - dock-area.absolute-position.x) / dock-area.width;
-                root.drag-ny = (ay - dock-area.absolute-position.y) / dock-area.height;
-            }
-            dock-drag-end => {
-                if (root.dock-target != "") {
-                    root.quick-panel-dock = root.dock-target;
-                    if (root.sidebar-dock == root.dock-target) {
-                        root.sidebar-collapsed = true;
-                        root.set-sidebar-collapsed(true);
-                    }
-                    if (root.welcome-as-sidebar
-                            && root.welcome-sidebar-dock == root.dock-target) {
-                        root.welcome-collapsed = true;
-                        root.set-welcome-collapsed(true);
-                    }
-                }
-                root.panel-dragging = false;
-            }
-        }
-
-        Rectangle {
-            visible: root.quick-panel-open && !root.quick-panel-collapsed;
-            x: root.quick-panel-dock == "left" ? parent.quick-w
-             : root.quick-panel-dock == "right" ? parent.width - parent.quick-w - 4px
-             : 0px;
-            y: root.quick-panel-dock == "top" ? parent.quick-h
-             : root.quick-panel-dock == "bottom" ? parent.height - parent.quick-h - 4px
-             : 0px;
-            width: parent.quick-horizontal ? 4px : parent.width;
-            height: parent.quick-horizontal ? parent.height : 4px;
-            background: quick-split-ta.has-hover ? Theme.accent : Theme.border-subtle;
-            quick-split-ta := TouchArea {
-                x: quick-area.quick-horizontal ? -4px : 0px;
-                y: quick-area.quick-horizontal ? 0px : -4px;
-                width: quick-area.quick-horizontal ? 12px : parent.width;
-                height: quick-area.quick-horizontal ? parent.height : 12px;
-                mouse-cursor: quick-area.quick-horizontal ? ew-resize : ns-resize;
-                moved => {
-                    if (self.pressed) {
-                        if (quick-area.quick-horizontal) {
-                            root.quick-panel-width = clamp(
-                                root.quick-panel-dock == "right"
-                                    ? quick-area.width - ((self.absolute-position.x + self.mouse-x)
-                                        - quick-area.absolute-position.x)
-                                    : (self.absolute-position.x + self.mouse-x)
-                                        - quick-area.absolute-position.x,
-                                180px, max(200px, quick-area.width - 240px));
-                        } else {
-                            root.quick-panel-height = clamp(
-                                root.quick-panel-dock == "bottom"
-                                    ? quick-area.height - ((self.absolute-position.y + self.mouse-y)
-                                        - quick-area.absolute-position.y)
-                                    : (self.absolute-position.y + self.mouse-y)
-                                        - quick-area.absolute-position.y,
-                                120px, max(140px, quick-area.height - 160px));
-                        }
-                    }
-                }
-            }
-        }
         }
         }
 
@@ -1942,6 +1713,81 @@ export component AppWindow inherits Window {
     // --- Built-in file viewer / editor (#70) ------------------------------
     // View = read-only (selectable/copyable); Edit = writable, Ctrl+S or the
     // Save button uploads, and closing uploads any unsaved changes.
+
+    // Deferred search + highlight: `editor-open-find()` sets `editor-find-visible`
+    // first, then a Timer runs the search + highlight outside Slint's
+    // binding-evaluation pass (otherwise creating the find panel and bumping
+    // `editor-highlight-trigger` in the same pass freezes the UI).
+    property <bool> editor-pending-open: false;
+    Timer {
+        interval: 0ms;
+        running: root.editor-pending-open;
+        triggered => {
+            root.editor-pending-open = false;
+            root.editor-search-refresh();
+            root.editor-find-focus-trigger = root.editor-find-focus-trigger + 1;
+            root.editor-highlight-trigger = root.editor-highlight-trigger + 1;
+        }
+    }
+
+    // Recompute match offsets when content changes (Replace, typing, etc.).
+    changed editor-content => {
+        if (root.editor-find-visible) {
+            root.editor-search-refresh();
+        }
+    }
+
+    function editor-update-status() {
+        if (root.editor-match-offsets.length == 0) {
+            root.editor-find-status = @tr("0 / 0");
+        } else {
+            root.editor-find-status =
+                (root.editor-current-match + 1) + " / " + root.editor-match-offsets.length;
+        }
+    }
+
+    function editor-search-refresh() {
+        root.editor-match-offsets =
+            root.editor-search-matches(root.editor-content, root.editor-find-query);
+        let n = root.editor-match-offsets.length;
+        if (n == 0) {
+            root.editor-current-match = -1;
+        } else if (root.editor-current-match >= n) {
+            root.editor-current-match = n - 1;
+        } else if (root.editor-current-match < 0) {
+            root.editor-current-match = 0;
+        }
+        root.editor-update-status();
+    }
+
+    function editor-find-next() {
+        let n = root.editor-match-offsets.length;
+        if (n == 0) { return; }
+        let next = root.editor-current-match + 1;
+        root.editor-current-match = next >= n ? 0 : next;
+        root.editor-update-status();
+        root.editor-highlight-trigger = root.editor-highlight-trigger + 1;
+    }
+
+    function editor-find-prev() {
+        let n = root.editor-match-offsets.length;
+        if (n == 0) { return; }
+        let prev = root.editor-current-match - 1 + n;
+        root.editor-current-match = prev >= n ? prev - n : prev;
+        root.editor-update-status();
+        root.editor-highlight-trigger = root.editor-highlight-trigger + 1;
+    }
+
+    function editor-open-find() {
+        root.editor-find-visible = true;
+        root.editor-pending-open = true;
+    }
+
+    function editor-close-find() {
+        root.editor-find-visible = false;
+        root.editor-highlight-trigger = root.editor-highlight-trigger + 1;
+    }
+
     if root.editor-open : Rectangle {
         // Modal backdrop; clicking it does NOT close (avoids losing edits to a
         // stray click) — use the close button or Esc. Also swallow wheel events
@@ -1962,18 +1808,63 @@ export component AppWindow inherits Window {
                     root.save-file();
                     return accept;
                 }
+                if (e.text == "f" && (e.modifiers.control)) {
+                    root.editor-open-find();
+                    return accept;
+                }
                 if (e.text == Key.Escape) {
+                    if (root.editor-find-visible) {
+                        root.editor-close-find();
+                        return accept;
+                    }
                     root.close-editor();
                     return accept;
                 }
                 return reject;
+            }
+            // Mirror of root.editor-highlight-trigger; bumping the root
+            // property fires this `changed` handler, which re-selects the
+            // current match in the TextInput.
+            property <int> hl-trigger: root.editor-highlight-trigger;
+            changed hl-trigger => {
+                self.editor-highlight-current();
+            }
+
+            function editor-highlight-current() {
+                if (root.editor-current-match < 0
+                    || root.editor-current-match >= root.editor-match-offsets.length) {
+                    edit-input.clear-selection();
+                    return;
+                }
+                let off = root.editor-match-offsets[root.editor-current-match];
+                let len = root.editor-byte-length-of(root.editor-find-query);
+                edit-input.set-selection-offsets(off, off + len);
+                self.editor-scroll-to-offset(off);
+            }
+
+            function editor-scroll-to-offset(offset: int) {
+                let line-index = root.editor-line-index-at(root.editor-content, offset);
+                // Measure the *actual* line height instead of guessing
+                // `font-size * 1.35`: the real value comes from the font's
+                // metrics and differs per font, so a fixed multiplier drifts
+                // with the line index and scrolls deep matches to the wrong
+                // place (or off-screen). Divide the TextInput's full content
+                // height by the line count for an exact, drift-free value.
+                let n-lines = root.editor-line-count(root.editor-content);
+                let line-height = edit-input.preferred-height / max(1, n-lines);
+                // The text starts `edit-input.y` px down inside the scroll
+                // content (8px padding), so include that offset.
+                let match-y = edit-input.y + line-index * line-height;
+                let target-top = max(0px, match-y - max(0px, ed-scroll.visible-height / 2 - line-height));
+                let min-y = min(0px, ed-scroll.visible-height - ed-scroll.viewport-height);
+                ed-scroll.viewport-y = max(min-y, min(0px, -target-top));
             }
             Rectangle {
                 x: root.ed-x;
                 y: root.ed-y;
                 width: root.ed-w;
                 height: root.ed-h;
-                background: Theme.bg-panel;
+                background: Theme.bg-elevated;
                 border-radius: Theme.radius-md;
                 border-width: 1px;
                 border-color: Theme.border-strong;
@@ -2022,7 +1913,7 @@ export component AppWindow inherits Window {
                                 color: Theme.text-primary;
                                 font-size: Theme.fs-md;
                                 font-weight: 600;
-                                font-family: Theme.ui-font-family;
+                                font-family: Theme.font-mono;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
                                 overflow: elide;
@@ -2054,6 +1945,181 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 1px; background: Theme.border-subtle; }
 
+                    // Find / replace panel (Ctrl+F): slides in below the title
+                    // bar when toggled. Find works in view mode too; replace
+                    // buttons are disabled for read-only files.
+                    if root.editor-find-visible : Rectangle {
+                        height: 92px;
+                        background: Theme.bg-panel-alt;
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 6px;
+
+                            // --- Find row --------------------------------------
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    border-width: 1px;
+                                    border-color: find-input.has-focus ? Theme.accent : Theme.border-strong;
+                                    background: Theme.bg-root;
+                                    find-input := TextInput {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        text <=> root.editor-find-query;
+                                        single-line: true;
+                                        font-size: Theme.fs-sm;
+                                        font-family: Theme.ui-font-family;
+                                        color: Theme.text-primary;
+                                        vertical-alignment: center;
+                                        property <int> focus-trigger: root.editor-find-focus-trigger;
+                                        changed focus-trigger => { self.focus(); }
+                                        edited => {
+                                            root.editor-search-refresh();
+                                            root.editor-highlight-trigger =
+                                                root.editor-highlight-trigger + 1;
+                                        }
+                                        key-pressed(e) => {
+                                            if (e.text == Key.Return) {
+                                                if (e.modifiers.shift) {
+                                                    root.editor-find-prev();
+                                                } else {
+                                                    root.editor-find-next();
+                                                }
+                                                return accept;
+                                            }
+                                            if (e.text == Key.Escape) {
+                                                root.editor-close-find();
+                                                return accept;
+                                            }
+                                            return reject;
+                                        }
+                                    }
+                                }
+                                Text {
+                                    width: 56px;
+                                    text: root.editor-find-status;
+                                    color: Theme.text-secondary;
+                                    font-size: Theme.fs-xs;
+                                    font-family: Theme.ui-font-family;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                }
+                                Rectangle {
+                                    width: 28px; height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    background: find-prev-ta.has-hover ? Theme.bg-hover : transparent;
+                                    find-prev-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.editor-find-prev(); }
+                                    }
+                                    Text {
+                                        text: "\u{E5CB}";
+                                        font-family: "Material Icons";
+                                        color: Theme.text-secondary;
+                                        font-size: Theme.fs-md;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Rectangle {
+                                    width: 28px; height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    background: find-next-ta.has-hover ? Theme.bg-hover : transparent;
+                                    find-next-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.editor-find-next(); }
+                                    }
+                                    Text {
+                                        text: "\u{E5CC}";
+                                        font-family: "Material Icons";
+                                        color: Theme.text-secondary;
+                                        font-size: Theme.fs-md;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Rectangle {
+                                    width: 28px; height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    background: find-close-ta.has-hover ? Theme.bg-hover : transparent;
+                                    find-close-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => {
+                                            root.editor-close-find();
+                                            edit-input.focus();
+                                        }
+                                    }
+                                    Text {
+                                        text: "\u{E5CD}";
+                                        font-family: "Material Icons";
+                                        color: Theme.text-secondary;
+                                        font-size: Theme.fs-md;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            // --- Replace row -----------------------------------
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    border-width: 1px;
+                                    border-color: replace-input.has-focus ? Theme.accent : Theme.border-strong;
+                                    background: Theme.bg-root;
+                                    replace-input := TextInput {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        text <=> root.editor-replace-query;
+                                        single-line: true;
+                                        font-size: Theme.fs-sm;
+                                        font-family: Theme.ui-font-family;
+                                        color: Theme.text-primary;
+                                        vertical-alignment: center;
+                                        key-pressed(e) => {
+                                            if (e.text == Key.Escape) {
+                                                root.editor-close-find();
+                                                return accept;
+                                            }
+                                            return reject;
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    width: 100px; height: 26px;
+                                    border-radius: Theme.radius-sm;
+                                    border-width: 1px;
+                                    border-color: Theme.border-subtle;
+                                    background: replall-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated;
+                                    replall-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        enabled: !root.editor-readonly
+                                            && root.editor-match-offsets.length > 0;
+                                        clicked => {
+                                            root.editor-replace-all(root.editor-replace-query);
+                                        }
+                                    }
+                                    Text {
+                                        text: @tr("Replace All");
+                                        color: (root.editor-readonly
+                                            || root.editor-match-offsets.length == 0)
+                                            ? Theme.text-muted : Theme.text-primary;
+                                        font-size: Theme.fs-sm;
+                                        font-family: Theme.ui-font-family;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Text area: a line-number gutter on the left + the editor.
                     // word-wrap is OFF so one logical line == one display line and
                     // the numbers line up (long lines scroll horizontally); the
@@ -2072,6 +2138,12 @@ export component AppWindow inherits Window {
                                     x: 0;
                                     y: ed-scroll.viewport-y + 8px;
                                     width: parent.width - 6px;
+                                    // Match the editor text's full content height so every
+                                    // line number exists to scroll into view. Without this
+                                    // the Text is clamped to the visible area and the lower
+                                    // numbers never appear as you scroll down (#81).
+                                    height: edit-input.preferred-height;
+                                    vertical-alignment: top;
                                     text: root.editor-line-numbers;
                                     horizontal-alignment: right;
                                     font-family: Theme.ui-font-family;
@@ -2083,6 +2155,47 @@ export component AppWindow inherits Window {
                             ed-scroll := ScrollView {
                                 viewport-width: max(self.visible-width, edit-input.preferred-width + 16px);
                                 viewport-height: max(self.visible-height, edit-input.preferred-height + 16px);
+
+                                // Comment text layer (rendered behind the text input)
+                                Text {
+                                    x: edit-input.x;
+                                    y: edit-input.y;
+                                    width: edit-input.width;
+                                    height: edit-input.height;
+                                    text: root.editor-comment-text;
+                                    color: Theme.success;
+                                    font-family: Theme.ui-font-family;
+                                    font-size: Theme.fs-md;
+                                    wrap: no-wrap;
+                                }
+
+                                // Normal text layer (rendered behind the text input)
+                                Text {
+                                    x: edit-input.x;
+                                    y: edit-input.y;
+                                    width: edit-input.width;
+                                    height: edit-input.height;
+                                    text: root.editor-normal-text;
+                                    color: Theme.text-primary;
+                                    font-family: Theme.ui-font-family;
+                                    font-size: Theme.fs-md;
+                                    wrap: no-wrap;
+                                }
+
+                                // Track cursor position and blink state for custom cursor rendering
+                                private property <length> ed-cursor-x: 0px;
+                                private property <length> ed-cursor-y: 0px;
+                                private property <bool> ed-cursor-visible: true;
+
+                                // Timer for cursor blinking
+                                ed-cursor-blink-timer := Timer {
+                                    interval: 500ms;
+                                    running: edit-input.has-focus && !root.editor-readonly;
+                                    triggered => {
+                                        ed-cursor-visible = !ed-cursor-visible;
+                                    }
+                                }
+
                                 edit-input := TextInput {
                                     x: 8px;
                                     y: 8px;
@@ -2092,12 +2205,35 @@ export component AppWindow inherits Window {
                                     read-only: root.editor-readonly;
                                     single-line: false;
                                     wrap: no-wrap;
-                                    color: Theme.text-primary;
+                                    color: Theme.text-primary.with-alpha(0.01);
+                                    selection-background-color: Theme.accent;
+                                    selection-foreground-color: white;
                                     font-family: Theme.ui-font-family;
                                     font-size: Theme.fs-md;
-                                    edited => { root.editor-dirty = true; root.editor-recount(root.editor-content); }
+                                    edited => {
+                                        root.editor-dirty = true;
+                                        root.editor-recount(root.editor-content);
+                                        root.editor-replace-tabs();
+                                    }
+                                    cursor-position-changed(pos) => {
+                                        ed-cursor-x = pos.x;
+                                        ed-cursor-y = pos.y;
+                                    }
                                 }
-                            }
+
+                                // Custom cursor (since TextInput's color is nearly transparent)
+                                Rectangle {
+                                    visible: edit-input.has-focus && !root.editor-readonly;
+                                    x: edit-input.x + ed-cursor-x;
+                                    y: edit-input.y + ed-cursor-y;
+                                    width: 2px;
+                                    height: edit-input.font-size * 1.2;
+                                    background: Theme.text-primary;
+                                    opacity: ed-cursor-visible ? 1 : 0;
+                                    animate x { duration: 50ms; }
+                                    animate y { duration: 50ms; }
+                                    animate opacity { duration: 100ms; }
+                                }                            }
                         }
                     }
                 }
@@ -3111,7 +3247,7 @@ export component AppWindow inherits Window {
             y: (parent.height - self.height) / 2;
             width: 340px;
             height: 168px;
-            background: Theme.bg-panel;
+            background: Theme.bg-elevated;
             border-radius: Theme.radius-md;
             border-width: 1px;
             border-color: Theme.border-strong;
@@ -3905,7 +4041,6 @@ export component AppWindow inherits Window {
                     webdav-status <=> root.webdav-status;
                     download-always-ask <=> root.download-always-ask;
                     welcome-as-sidebar <=> root.welcome-as-sidebar;
-                    quick-commands-as-sidebar <=> root.quick-commands-as-sidebar;
                     update-check-enabled <=> root.update-check-enabled;
                     wallpaper-overlay <=> root.wallpaper-overlay;
                     current-wallpaper: root.current-wallpaper;
@@ -3943,14 +4078,6 @@ export component AppWindow inherits Window {
                     webdav-download => { root.webdav-download(); }
                     set-download-always-ask(v) => { root.set-download-always-ask(v); }
                     set-welcome-as-sidebar(v) => { root.set-welcome-as-sidebar(v); }
-                    set-quick-commands-as-sidebar(v) => {
-                        root.quick-commands-as-sidebar = v;
-                        if (!v) {
-                            root.quick-panel-open = false;
-                            root.quick-panel-collapsed = false;
-                        }
-                        root.set-quick-commands-as-sidebar(v);
-                    }
                     set-update-check-enabled(v) => { root.set-update-check-enabled(v); }
                     persist-wallpaper-overlay(v) => { root.persist-wallpaper-overlay(v); }
                 }
