@@ -444,7 +444,7 @@ export component InterfacePanel inherits Rectangle {
                     active: root.ifd-page == "font";
                     clicked => { root.ifd-page = "font"; }
                 }
-                if root.is-windows || Theme.is-mac : NavItem {
+                NavItem {
                     icon: "\u{E1B1}"; label: root.lang-en ? "Rendering" : "渲染";
                     active: root.ifd-page == "renderer";
                     clicked => { root.ifd-page = "renderer"; }

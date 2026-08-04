@@ -3144,6 +3144,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
         group: group.into(),
         group_header: group.into(),
         collapsed: true,
+        builtin: false,
     };
 
     let mut rows: Vec<SessionInfo> = Vec::new();
@@ -3159,6 +3160,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
             group: "system".into(),
             group_header: if i == 0 { "system".into() } else { "".into() },
             collapsed: true,
+            builtin: true,
         });
     }
     for group in &display_groups {
@@ -3192,6 +3194,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
                         "".into()
                     },
                     collapsed: true,
+                    builtin: false,
                 });
             }
         }

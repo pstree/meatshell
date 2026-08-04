@@ -5,6 +5,26 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ## [Unreleased]
 
+## [0.6.10] - 2026-08-05
+
+- **修复关闭“欢迎页设为侧栏”时闪退（#323）。** 欢迎页在侧栏与标签页之间切换时，分屏模型现在会延迟到下一次界面事件循环再刷新，并跳过尺寸和内容均未变化的重复更新，避免 Windows 下递归重建界面导致当前进程及后续启动闪退。
+- **Fix crashes when disabling “Welcome page as sidebar” (#323).** Switching the welcome page between sidebar and tab mode now defers pane-model rebuilding to the next UI event-loop turn and skips unchanged model updates, preventing recursive UI reconstruction on Windows during the toggle and subsequent launches.
+
+- **修复快速连接中重复的 system 分组和空白右键菜单（#324）。** 内置 `system` 与隐式 `default` 现在统一视为保留分组，不再出现在服务器的“移动到”目标中，也无法通过新建、重命名、编辑或导入写入；新建或重命名为已有分组时会保留弹窗并提示“分组已存在”。升级时会自动把旧版本误放进 `system` 的服务器迁回 `default`。内置终端行改用显式标记识别，普通服务器不会再因组名碰撞而隐藏右键操作。
+- **Fix duplicate system groups and empty context menus in Quick Connect (#324).** The built-in `system` and implicit `default` groups are now reserved across move, create, rename, edit, and import paths. Creating or renaming to an existing group keeps the dialog open and reports that the group already exists. Existing servers accidentally filed under `system` are migrated back to `default`, while explicit built-in-row markers prevent ordinary servers from losing their context-menu actions due to a group-name collision.
+
+- **回复终端状态与设备属性查询（#328）。** 远端程序发送 DSR 状态/光标位置查询或 DA1 主设备属性查询时，MeatShell 现在会立即向 PTY 返回对应的状态、CPR 光标坐标或保守的 VT100 能力标识；查询序列即使被拆分到多个 SSH 输出块也能正确识别，依赖终端握手的交互式程序不再等待超时或卡死。
+- **Respond to terminal status and device-attribute queries (#328).** MeatShell now immediately returns status, CPR cursor coordinates, or a conservative VT100 identity when remote programs issue DSR or primary DA1 queries. Split query sequences are recognized across SSH output chunks, preventing interactive applications that rely on terminal handshakes from timing out or hanging.
+
+- **修复内置编辑器打开大文件时崩溃，并调整历史命令排序（#331）。** 内置查看/编辑现在采用有界读取，并在文件超过 512 KB、行数过多或存在超长单行时安全拒绝并引导使用外部打开/编辑；历史命令弹窗改为从新到旧显示，同时保留输入框 ↑/↓ 的原有回溯顺序。
+- **Prevent large-file editor crashes and reorder command history (#331).** Built-in viewing/editing now uses bounded reads and safely redirects files over 512 KB, excessive line counts, or exceptionally long lines to external tools. The history popup now lists newest commands first while preserving the input field's existing ↑/↓ recall order.
+
+- **修复 zsh 中 Home 和 End 按键无效（#329）。** 远端 shell 启用应用光标模式时，Home/End 现在会像方向键一样改用对应的 SS3 控制序列，恢复 oh-my-zsh/ZLE 中的行首和行尾移动。
+- **Fix Home and End keys in zsh (#329).** When the remote shell enables application cursor mode, Home/End now use their corresponding SS3 sequences like the arrow keys, restoring beginning/end-of-line movement in oh-my-zsh/ZLE.
+
+- **Linux 支持选择界面渲染器（#330）。** “设置 → 界面 → 渲染”现在可选择自动、GPU 与软件模式，默认继续使用 Slint 自动选择；设置在重启 MeatShell 后生效，`SLINT_BACKEND` 环境变量仍具有最高优先级。
+- **Select the UI renderer on Linux (#330).** Settings → Interface → Rendering now offers Automatic, GPU, and Software modes while retaining Slint's automatic selection by default. Changes apply after restarting MeatShell, and `SLINT_BACKEND` keeps the highest priority.
+
 ## [0.6.9] - 2026-07-31
 
 ### OpenWrt SSH shell integration fix / OpenWrt SSH shell 集成修复

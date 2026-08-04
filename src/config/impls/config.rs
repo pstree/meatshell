@@ -1055,12 +1055,23 @@ impl ConfigStore {
 
     /// Missing and invalid Windows values deliberately use software so upgrades
     /// preserve the high-DPI/VM compatibility from #224.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     pub fn renderer_mode(&self) -> &str {
         match self.cache.renderer_mode.as_str() {
             "auto" => "auto",
             "gpu" => "gpu",
             _ => "software",
+        }
+    }
+
+    /// Linux previously used Slint's automatic renderer selection and had no
+    /// settings entry. Keep that behaviour for existing configurations.
+    #[cfg(target_os = "linux")]
+    pub fn renderer_mode(&self) -> &str {
+        match self.cache.renderer_mode.as_str() {
+            "gpu" => "gpu",
+            "software" => "software",
+            _ => "auto",
         }
     }
 
@@ -1072,12 +1083,21 @@ impl ConfigStore {
         };
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     pub fn set_renderer_mode(&mut self, mode: String) {
         self.cache.renderer_mode = match mode.as_str() {
             "auto" => "auto".into(),
             "gpu" => "gpu".into(),
             _ => "software".into(),
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn set_renderer_mode(&mut self, mode: String) {
+        self.cache.renderer_mode = match mode.as_str() {
+            "gpu" => "gpu".into(),
+            "software" => "software".into(),
+            _ => "auto".into(),
         };
     }
 
