@@ -9,7 +9,7 @@
 //! plain lists the UI renders directly with `for`. Any structural change (split,
 //! close, move a tab, drag a splitter) mutates the tree and re-flattens.
 
-use super::layout_struct::{Dir, Layout, Leaf, Node, PaneRect, SplitterRect};
+use super::types::{Dir, Layout, Leaf, Node, PaneRect, SplitterRect};
 
 /// Visible thickness of a splitter handle, in px.
 pub const SPLITTER: f32 = 6.0;
@@ -60,6 +60,25 @@ impl Layout {
     }
     pub fn leaf_mut(&mut self, id: u64) -> Option<&mut Leaf> {
         find_leaf_mut(&mut self.root, id)
+    }
+
+    /// Select the next or previous tab in the focused pane, wrapping at both
+    /// ends. Returns the newly active tab, or `None` when there is nothing to
+    /// cycle.
+    pub fn cycle_focused_tab(&mut self, reverse: bool) -> Option<String> {
+        let focused = self.focused;
+        let leaf = self.leaf_mut(focused)?;
+        if leaf.tabs.len() <= 1 {
+            return None;
+        }
+        let next = match leaf.tabs.iter().position(|tab| tab == &leaf.active) {
+            Some(current) if reverse => current.checked_sub(1).unwrap_or(leaf.tabs.len() - 1),
+            Some(current) => (current + 1) % leaf.tabs.len(),
+            None if reverse => leaf.tabs.len() - 1,
+            None => 0,
+        };
+        leaf.active = leaf.tabs[next].clone();
+        Some(leaf.active.clone())
     }
 
     /// The leaf that currently owns tab `tab_id`, if any.
@@ -437,6 +456,19 @@ mod tests {
             (0.0, 0.0, 1000.0, 600.0)
         );
         assert!(panes[0].focused);
+    }
+
+    #[test]
+    fn cycles_focused_tabs_in_both_directions_with_wraparound() {
+        let mut layout = Layout::new(
+            vec!["welcome".into(), "a".into(), "b".into()],
+            "welcome".into(),
+        );
+
+        assert_eq!(layout.cycle_focused_tab(false).as_deref(), Some("a"));
+        assert_eq!(layout.cycle_focused_tab(false).as_deref(), Some("b"));
+        assert_eq!(layout.cycle_focused_tab(false).as_deref(), Some("welcome"));
+        assert_eq!(layout.cycle_focused_tab(true).as_deref(), Some("b"));
     }
 
     #[test]

@@ -5,8 +5,54 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-07-31
+
+### OpenWrt SSH shell integration fix / OpenWrt SSH shell 集成修复
+
+- **修复 OpenWrt SSH 登录时泄露并卡在 shell 集成初始化命令的问题（#314、#317）。** 连接现在先通过独立的非交互 SSH 通道识别远端 shell，只向真正支持该集成的 Bash/Zsh 会话发送提示符钩子；BusyBox ash、fish 与未知 shell 不再收到 `test -z \"$FISH_VERSION\" ...` 长命令。
+- **Prevent shell-integration setup from leaking or hanging OpenWrt SSH sessions (#314, #317).** MeatShell now identifies the remote shell through a separate non-interactive SSH channel and sends the prompt hook only to Bash/Zsh; BusyBox ash, fish, and unknown shells no longer receive the long `test -z \"$FISH_VERSION\" ...` command.
+
 ### 修复 / Fixed
 
+- **修复终端粘贴、命令框、光标、选区与回滚历史问题（#319）。** 括号粘贴现在也会把 Windows CRLF 规范化为单个终端换行，命令框保留多行 heredoc 的原始换行；Vim/nano 的竖线光标不再右移，事件积压时真实 Backspace 不再被实时键状态误判，按键时会恢复光标可见；普通单击不再复制字符，`ESC[3J` 同时清除 MeatShell 自己维护的回滚与重放缓存。
+- **修复 macOS 下 `Ctrl+X` 在 nano 中错误打开搜索的问题（#312）。** Slint 在 macOS 上会先把单独按下的物理 Control 键报告为控制键标记，再发送组合键字符；程序现在会在平台事件边界过滤该标记，只把随后的真实 `Ctrl+X` 控制字符发送到 PTY，同时保持 Command 应用快捷键与其他平台行为不变。
+- **改善超大终端输出的渐进显示与响应性（#311）。** 持续输出现在按累计字节预算、在完整输出块边界提交 UI 快照，并用可等待的请求代次消除丢失通知和重复渲染；当事件积压过大或夹有连接状态事件时会优先追赶队列，避免节奏等待造成内存增长或延迟 `Connected` / `Closed`。隐藏标签、标签关闭及事件循环退出均不会让输出泵固定空等。
+
+---
+
+### Fixed
+
+- **Fix terminal paste, command bar, cursor, selection, and scrollback behavior (#319).** Bracketed paste now normalizes Windows CRLF to one terminal newline, while the command bar preserves multiline heredocs. Vim/nano bar cursors no longer shift right, genuine Backspace events survive delayed dispatch, keyboard input restores cursor visibility, plain clicks no longer copy a character, and `ESC[3J` clears MeatShell's own scrollback and replay buffers.
+- **Fix `Ctrl+X` opening search instead of exiting nano on macOS (#312).** Slint reports a standalone physical Control press as a modifier marker on macOS before delivering the chord character. MeatShell now filters that marker at the platform event boundary and forwards only the real `Ctrl+X` control character to the PTY, without changing Command shortcuts or other platforms.
+- **Improve progressive rendering and responsiveness under very large terminal output (#311).** Sustained output now commits UI snapshots at complete output-chunk boundaries after a cumulative byte budget, while generation-based wait tickets eliminate lost notifications and redundant renders. A large event backlog or pending connection-state event switches to catch-up mode so pacing cannot inflate memory use or delay `Connected` / `Closed`; hidden tabs, tab closure, and event-loop shutdown no longer cause repeated timeout waits.
+
+### 改进 / Changed
+
+- **快速连接分组默认收起并记住展开状态。** 首次启动时快速连接中的系统与会话目录保持收起；用户展开或收起目录后会立即保存该状态，刷新会话列表及重启应用后仍保持原样。
+
+### 性能 / Performance
+
+- **提升终端鼠标拖选文字的响应速度。** 拖动选区时只刷新轻量选区图层，不再为每次鼠标移动重新生成整块终端文本与样式，长回滚记录下也能即时显示选中内容。
+
+---
+
+### Changed
+
+- **Default Quick Connect groups to collapsed and remember their state.** System and session folders start collapsed, while later expand/collapse choices are saved immediately and survive session-list refreshes and application restarts.
+
+### Performance
+
+- **Improve terminal text-selection responsiveness.** Dragging now refreshes only the lightweight selection overlay instead of rebuilding all terminal text and styling for every mouse movement, keeping selection immediate with long scrollback histories.
+
+## [0.6.8] - 2026-07-26
+
+### 改进 / Changed
+
+- **Windows MSI 会沿用已有安装目录并创建桌面快捷方式（#293）。** 安装程序会优先读取 MeatShell 记录的目录，并可通过旧版主程序组件位置迁移 v0.6.5-v0.6.7 的自定义安装路径；全新安装仍默认使用 `Program Files`。MSI 安装时还会在当前用户桌面创建 MeatShell 快捷方式，卸载时一并移除。
+
+### 修复 / Fixed
+
+- **修复内置壁纸覆盖已保存浅色/深色主题的问题。** 启动时恢复内置壁纸不再根据壁纸亮度强制切换主题，用户选择的浅色或深色模式会在重启后保留；仅在用户主动选择内置壁纸时应用其推荐主题。
 - **修复新建 Telnet 会话的默认端口（#303）。** 从 SSH 或串口切换到 Telnet 时，端口现在会从 SSH 默认值 `22` 自动调整为 Telnet 标准端口 `23`；切回 SSH 时恢复为 `22`，非默认端口保持不变。
 - **修复 AUR 发布工作流校验失败。** 发布步骤现在通过作业环境变量判断所需的 AUR 仓库 Secret 是否完整配置，避免在 `if` 条件中直接引用不受支持的 `secrets` 上下文而导致工作流无法运行。
 - **修复手动产物构建的版本校验。** 从分支手动运行 Release 工作流时改为根据 `Cargo.toml` 校验二进制版本，不再把分支名误当成版本号；手动构建仍只上传工作流产物，不创建 GitHub Release。
@@ -14,12 +60,47 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ---
 
+### Changed
+
+- **Preserve the existing Windows MSI install location and add a desktop shortcut (#293).** Setup now prefers MeatShell's recorded directory and can migrate custom v0.6.5-v0.6.7 locations from the legacy executable component; clean installs still default to Program Files. MSI installs also create a MeatShell shortcut on the current user's desktop and remove it during uninstall.
+
 ### Fixed
 
+- **Preserve the saved light/dark theme when restoring a built-in wallpaper.** Startup no longer forces a theme from the built-in wallpaper's luminance, so the user's light or dark preference survives a restart. The recommended paired theme is applied only when the user actively selects a built-in wallpaper.
 - **Use the standard Telnet port for new sessions (#303).** Switching from SSH or Serial to Telnet now changes the SSH default `22` to the standard Telnet port `23`; switching back to SSH restores `22`, while non-default ports are preserved.
 - **Fix AUR publishing workflow validation.** The publishing step now checks the required AUR repository secrets through job environment variables, avoiding the unsupported direct use of the `secrets` context in an `if` condition that prevented the workflow from running.
 - **Fix version verification for manually dispatched artifact builds.** Release workflow runs started from a branch now verify the binary against the package version in `Cargo.toml` instead of treating the branch name as a version. Manual builds continue to upload workflow artifacts without creating a GitHub Release.
 - **Fix the Ctrl modifier remaining active after switching the Windows IME with `Ctrl+Space` (#309).** When Microsoft IME labels a Ctrl release as `VK_PROCESSKEY`, the application now uses the retained left/right physical Ctrl identity to deliver the matching release to Slint. Normal terminal Ctrl shortcuts and other operating systems are unaffected.
+
+### 新增 / Added
+
+- **macOS 支持在设置中选择界面渲染器。** “设置 → 界面 → 渲染”现在在 macOS 上提供 FemtoVG 和 Skia 两种后端，遇到文字缺失或显示异常时可以直接切换，重启 MeatShell 后生效；`SLINT_BACKEND` 环境变量仍优先于界面设置。
+- **支持使用快捷键循环切换标签页（#294）。** `Ctrl+Tab` 切换到当前分栏的下一个标签页，`Ctrl+Shift+Tab` 切换到上一个，并在首尾循环；macOS 使用物理 Control 键。快捷键面板新增“标签页”分组并列出两项操作。
+
+### 修复 / Fixed
+
+- **修复 SSH 内部初始化命令污染远端历史（#289）。** Shell integration 初始化完成后会主动清理当前初始化项及旧版本残留，不再依赖远端是否启用 `HISTCONTROL=ignorespace`；迟到回显过滤也只在连接初始化阶段生效，切换标签页后按上键不会再召回内部命令、清空终端行或破坏首屏内容。
+- **修复 SSH 会话中 Bash 历史命令重绘错位（#289）。** 隐藏 shell integration 初始化命令后会主动复位并清空当前终端行，使本地 VT 光标与远端 PTY 重新同步；在 Debian 等桌面系统中使用上下方向键浏览历史时，提示符和命令不再相互重叠或依次拼接。
+
+### 性能 / Performance
+
+- **优化大容量终端回滚历史（#290）。** 终端历史缓冲改用双端队列；超过 100,000 行上限时从队首逐行回收，不再通过 `Vec::drain` 搬移全部剩余记录，持续输出大量内容时的裁剪开销更加稳定。
+
+---
+
+### Added
+
+- **Select the UI renderer from Settings on macOS.** Settings → Interface → Rendering now offers the FemtoVG and Skia backends on macOS, allowing users to switch when text is missing or rendered incorrectly. Changes apply after restarting MeatShell, and `SLINT_BACKEND` continues to override the saved setting.
+- **Add keyboard shortcuts for cycling tabs (#294).** `Ctrl+Tab` selects the next tab in the focused pane, while `Ctrl+Shift+Tab` selects the previous one, wrapping at both ends; macOS uses the physical Control key. The shortcuts panel now includes both actions in a dedicated Tabs section.
+
+### Fixed
+
+- **Prevent SSH shell setup from polluting remote history (#289).** Shell integration now removes both its current initialization entry and leftovers from older versions from Bash history instead of relying on the remote `HISTCONTROL=ignorespace` setting. Late-echo filtering is limited to connection setup, so pressing Up after switching tabs no longer recalls internal commands, clears terminal rows, or damages the initial screen.
+- **Fix misaligned Bash history repainting in SSH sessions (#289).** After hiding the shell-integration setup command, MeatShell now resets and clears the current terminal row to resynchronize the local VT cursor with the remote PTY. Browsing history with the arrow keys on Debian and other desktops no longer overlaps the prompt or appends recalled commands beside one another.
+
+### Performance
+
+- **Optimize large terminal scrollback histories (#290).** The terminal history buffer now uses a double-ended queue. Once the 100,000-line cap is reached, old rows are reclaimed from the front without shifting every retained row through `Vec::drain`, keeping pruning costs stable during sustained high-volume output.
 
 ## [0.6.7] - 2026-07-25
 

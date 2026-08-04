@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 
-use super::terminal_struct::TabRenderGate;
+use super::types::TabRenderGate;
 
 impl TabRenderGate {
     pub(crate) fn new(min_interval: std::time::Duration) -> Self {

@@ -131,6 +131,18 @@ impl TermBuffer {
 
     /// Extract the selected text from the combined buffer (whole selection,
     /// even the parts currently scrolled out of view).
+    pub(crate) fn selection_has_extent(&self) -> bool {
+        if self.sel_ranges.is_empty() {
+            return matches!(
+                (self.sel_anchor, self.sel_focus),
+                (Some(anchor), Some(focus)) if anchor != focus
+            );
+        }
+        self.sel_ranges
+            .iter()
+            .any(|(anchor, focus)| anchor != focus)
+    }
+
     pub(crate) fn extract_selection_text(&self) -> String {
         let ranges = if self.sel_ranges.is_empty() {
             match (self.sel_anchor, self.sel_focus) {
@@ -300,6 +312,25 @@ impl TermBuffer {
         // Retain the (post-rewrite) stream, capped, so a resize can replay it at
         // the new width and reflow already-printed output (#169).
         self.raw.extend(bytes.iter().copied());
+        // CSI 3 J means "erase saved lines". The vt100 crate clears its own
+        // scrollback, but MeatShell maintains a separate rendered history and a
+        // raw replay stream for resize reflow. Drop both sides of that history,
+        // including when the CSI sequence was split across SSH reads (#319).
+        let erase_saved_through = {
+            let raw = self.raw.make_contiguous();
+            raw.windows(4)
+                .rposition(|window| window == b"\x1b[3J")
+                .map(|position| position + 4)
+        };
+        if let Some(end) = erase_saved_through {
+            self.raw.drain(..end);
+            self.history.clear();
+            self.prev.clear();
+            self.view_offset = 0;
+            self.sel_anchor = None;
+            self.sel_focus = None;
+            self.sel_ranges.clear();
+        }
         self.cap_raw();
         self.feed_batched(&bytes);
     }
@@ -450,8 +481,6 @@ impl TermBuffer {
             for line in self.prev.iter().take(k) {
                 self.history.push_back(line.clone());
             }
-            // Bounded queue: evict oldest lines from the front. O(1) per line on
-            // a VecDeque ring buffer (vs. O(n) shift on a Vec).
             while self.history.len() > MAX_HISTORY {
                 self.history.pop_front();
             }
@@ -469,12 +498,6 @@ impl TermBuffer {
             (s.alternate_screen(), r, c, cr, cc)
         };
 
-        // Snapshot highlight config so the (possibly cached) highlight calls
-        // inside the render loop don't re-borrow `self` while the screen holds
-        // an immutable borrow.
-        let preset = self.output_highlight;
-        let rules = self.custom_highlight_rules.clone();
-
         // --- Live view (also alt-screen): render the current grid -----------
         if is_alt || self.view_offset == 0 {
             let mut spans = Vec::new();
@@ -490,8 +513,8 @@ impl TermBuffer {
                         &mut self.hl_cache,
                         &mut self.hl_cache_version,
                         &mut self.hl_version,
-                        preset,
-                        &rules,
+                        self.output_highlight,
+                        &self.custom_highlight_rules,
                         &plain,
                         runs,
                     )
@@ -500,7 +523,7 @@ impl TermBuffer {
                     last_content = r as i32;
                 }
                 for hs in &*runs {
-                    spans.extend(render_term_span(hs, r as i32, self.is_dark));
+                    spans.extend(render_term_span(&hs, r as i32, self.is_dark));
                 }
                 displayed.push(plain.trim_end().to_string());
             }
@@ -550,8 +573,8 @@ impl TermBuffer {
                 &mut self.hl_cache,
                 &mut self.hl_cache_version,
                 &mut self.hl_version,
-                preset,
-                &rules,
+                self.output_highlight,
+                &self.custom_highlight_rules,
                 &line.0,
                 line.1.clone(),
             );

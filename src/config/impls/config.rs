@@ -323,9 +323,11 @@ fn default_wallpaper() -> String {
 }
 
 /// Bump when `migrate_defaults` gains a new one-time default-layout change.
-pub const DEFAULTS_REV: u32 = 2;
+pub const DEFAULTS_REV: u32 = 3;
 
-const DEFAULT_WALLPAPER_TRANSPARENCY: f32 = 0.38;
+const PREVIOUS_DEFAULT_WALLPAPER_TRANSPARENCY: f32 = 0.38;
+const PREVIOUS_DEFAULT_WALLPAPER_OVERLAY: f32 = 1.0 - PREVIOUS_DEFAULT_WALLPAPER_TRANSPARENCY;
+const DEFAULT_WALLPAPER_TRANSPARENCY: f32 = 0.15;
 const DEFAULT_WALLPAPER_OVERLAY: f32 = 1.0 - DEFAULT_WALLPAPER_TRANSPARENCY;
 
 fn normalize_hex_color(value: &str) -> Option<String> {
@@ -338,7 +340,7 @@ fn normalize_hex_color(value: &str) -> Option<String> {
 
 /// A brand-new config (no file yet, or the old one was corrupt). Seeds the
 /// new-user default layout (#new-user-defaults): ms wallpaper, welcome page as
-/// a left sidebar, resource panel docked right, 38% wallpaper transparency, and
+/// a left sidebar, resource panel docked right, 15% wallpaper transparency, and
 /// marks the migration done so it isn't re-applied.
 fn fresh_config() -> ConfigFile {
     ConfigFile {
@@ -372,7 +374,7 @@ fn migrate_defaults(cfg: &mut ConfigFile) -> bool {
         if cfg.wallpaper == "builtin:tech" {
             cfg.wallpaper = "builtin:miku".to_string();
         }
-        // Overlay still unset (0 = "use the 0.86 default") -> v0.5 default.
+        // Overlay still unset -> current default.
         if cfg.wallpaper_overlay <= 0.0 {
             cfg.wallpaper_overlay = DEFAULT_WALLPAPER_OVERLAY;
         }
@@ -388,7 +390,14 @@ fn migrate_defaults(cfg: &mut ConfigFile) -> bool {
     // rev 2: settings show wallpaper transparency, while rev 1 accidentally
     // stored the default as panel alpha 0.38, so it displayed as ~62%.
     if cfg.defaults_rev < 2
-        && (cfg.wallpaper_overlay - DEFAULT_WALLPAPER_TRANSPARENCY).abs() < 0.005
+        && (cfg.wallpaper_overlay - PREVIOUS_DEFAULT_WALLPAPER_TRANSPARENCY).abs() < 0.005
+    {
+        cfg.wallpaper_overlay = DEFAULT_WALLPAPER_OVERLAY;
+    }
+    // rev 3: reduce the default transparency from 38% to 15%. Only advance
+    // users still on the previous default; preserve every custom slider value.
+    if cfg.defaults_rev < 3
+        && (cfg.wallpaper_overlay - PREVIOUS_DEFAULT_WALLPAPER_OVERLAY).abs() < 0.005
     {
         cfg.wallpaper_overlay = DEFAULT_WALLPAPER_OVERLAY;
     }
@@ -622,8 +631,8 @@ pub struct ConfigFile {
     /// Theme preference: "system" (default) | "dark" | "light".
     #[serde(default)]
     pub theme_pref: String,
-    /// Windows renderer preference: software (compatibility default), auto
-    /// (let Slint try GPU and fall back), or gpu (force FemtoVG/OpenGL) (#280).
+    /// Platform renderer preference. Windows uses software/auto/gpu; macOS uses
+    /// femtovg/skia. Missing or foreign-platform values use the platform default.
     #[serde(default)]
     pub renderer_mode: String,
     /// Terminal font family. Empty = the built-in default ("Meatshell Mono").
@@ -664,6 +673,11 @@ pub struct ConfigFile {
     /// not stored here.
     #[serde(default)]
     pub groups: Vec<String>,
+    /// Quick Connect folders that were collapsed when the UI was last used.
+    /// `None` is a legacy/new config and starts with every folder collapsed;
+    /// `Some([])` means the user explicitly expanded every folder.
+    #[serde(default)]
+    pub collapsed_session_groups: Option<Vec<String>>,
     /// Stored inverted ("don't follow") so both serde and the Default derive
     /// yield `false` = the feature defaults to ON: the SFTP panel follows the
     /// terminal's cd (OSC 7) unless the user opts out in Interface settings.
@@ -748,8 +762,8 @@ pub struct ConfigFile {
     /// None means the user has not explicitly collapsed/expanded it yet.
     #[serde(default)]
     pub welcome_collapsed: Option<bool>,
-    /// Frosted-panel opacity over a wallpaper (0.40–1.00); user-adjustable via the
-    /// Interface › Wallpaper opacity slider. 0 = use the 0.86 default (v0.5).
+    /// Frosted-panel opacity over a wallpaper (0.30–1.00); user-adjustable via the
+    /// Interface › Wallpaper opacity slider. 0 = use the current default.
     #[serde(default)]
     pub wallpaper_overlay: f32,
     /// Settings-panel font scale, percent (80–160). 0 = 100% default (v0.5).
@@ -1030,8 +1044,18 @@ impl ConfigStore {
         self.cache.theme_pref = pref;
     }
 
-    /// Windows renderer preference. Missing and invalid values deliberately use
-    /// software so upgrades preserve the high-DPI/VM compatibility from #224.
+    /// Renderer preference for the current platform.
+    #[cfg(target_os = "macos")]
+    pub fn renderer_mode(&self) -> &str {
+        match self.cache.renderer_mode.as_str() {
+            "skia" => "skia",
+            _ => "femtovg",
+        }
+    }
+
+    /// Missing and invalid Windows values deliberately use software so upgrades
+    /// preserve the high-DPI/VM compatibility from #224.
+    #[cfg(not(target_os = "macos"))]
     pub fn renderer_mode(&self) -> &str {
         match self.cache.renderer_mode.as_str() {
             "auto" => "auto",
@@ -1040,6 +1064,15 @@ impl ConfigStore {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn set_renderer_mode(&mut self, mode: String) {
+        self.cache.renderer_mode = match mode.as_str() {
+            "skia" => "skia".into(),
+            _ => "femtovg".into(),
+        };
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn set_renderer_mode(&mut self, mode: String) {
         self.cache.renderer_mode = match mode.as_str() {
             "auto" => "auto".into(),
@@ -1385,7 +1418,7 @@ impl ConfigStore {
         let a = self.cache.wallpaper_overlay;
         // Floor lowered 0.40 -> 0.30 so more see-through panels are reachable.
         if a <= 0.0 {
-            0.86
+            DEFAULT_WALLPAPER_OVERLAY
         } else {
             a.clamp(0.30, 1.0)
         }
@@ -1529,6 +1562,46 @@ impl ConfigStore {
         &self.cache.groups
     }
 
+    pub fn collapsed_session_groups(&self) -> Option<&[String]> {
+        self.cache.collapsed_session_groups.as_deref()
+    }
+
+    /// Remember a Quick Connect folder's open/closed state. On the first
+    /// interaction, materialise the default-collapsed state for every existing
+    /// folder so expanding one folder does not accidentally expand the rest.
+    pub fn set_session_group_collapsed(&mut self, name: &str, collapsed: bool) {
+        if self.cache.collapsed_session_groups.is_none() {
+            let mut groups = vec!["system".to_string()];
+            if self
+                .cache
+                .sessions
+                .iter()
+                .any(|session| session.group.is_empty())
+            {
+                groups.push("default".to_string());
+            }
+            groups.extend(self.cache.groups.iter().cloned());
+            groups.extend(
+                self.cache
+                    .sessions
+                    .iter()
+                    .filter(|session| !session.group.is_empty())
+                    .map(|session| session.group.clone()),
+            );
+            groups.sort();
+            groups.dedup();
+            self.cache.collapsed_session_groups = Some(groups);
+        }
+
+        let groups = self.cache.collapsed_session_groups.as_mut().unwrap();
+        groups.retain(|group| group != name);
+        if collapsed {
+            groups.push(name.to_string());
+            groups.sort();
+            groups.dedup();
+        }
+    }
+
     /// Create an empty group. Ignores blank names, the reserved "default", and
     /// duplicates.
     pub fn add_group(&mut self, name: String) {
@@ -1537,7 +1610,12 @@ impl ConfigStore {
             return;
         }
         if !self.cache.groups.iter().any(|g| g == &n) {
-            self.cache.groups.push(n);
+            self.cache.groups.push(n.clone());
+            if let Some(groups) = &mut self.cache.collapsed_session_groups {
+                groups.push(n);
+                groups.sort();
+                groups.dedup();
+            }
         }
     }
 
@@ -1545,6 +1623,9 @@ impl ConfigStore {
     /// only offers delete on empty groups, but we clear sessions defensively.
     pub fn remove_group(&mut self, name: &str) {
         self.cache.groups.retain(|g| g != name);
+        if let Some(groups) = &mut self.cache.collapsed_session_groups {
+            groups.retain(|group| group != name);
+        }
         for s in &mut self.cache.sessions {
             if s.group == name {
                 s.group.clear();
@@ -1564,6 +1645,15 @@ impl ConfigStore {
             if s.group == old {
                 s.group = n.clone();
             }
+        }
+        if let Some(groups) = &mut self.cache.collapsed_session_groups {
+            for group in groups.iter_mut() {
+                if group == old {
+                    *group = n.clone();
+                }
+            }
+            groups.sort();
+            groups.dedup();
         }
         self.cache.groups.sort();
         self.cache.groups.dedup();
@@ -1808,6 +1898,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn renderer_mode_preserves_compatibility_default_and_validates() {
         let mut store = temp_store();
         assert_eq!(store.renderer_mode(), "software");
@@ -1821,6 +1912,48 @@ mod tests {
 
         store.cache = serde_json::from_str("{}").expect("legacy config must deserialize");
         assert_eq!(store.renderer_mode(), "software");
+    }
+
+    #[test]
+    fn quick_connect_groups_default_collapsed_and_remember_expansion() {
+        let mut store = temp_store();
+        store.cache.groups = vec!["production".into(), "staging".into()];
+        store.cache.sessions.push(Session {
+            group: "production".into(),
+            ..sample_session("server")
+        });
+
+        assert!(store.collapsed_session_groups().is_none());
+        store.set_session_group_collapsed("production", false);
+
+        let collapsed = store.collapsed_session_groups().unwrap();
+        assert!(!collapsed.iter().any(|group| group == "production"));
+        assert!(collapsed.iter().any(|group| group == "staging"));
+        assert!(collapsed.iter().any(|group| group == "system"));
+
+        store.set_session_group_collapsed("production", true);
+        assert!(store
+            .collapsed_session_groups()
+            .unwrap()
+            .iter()
+            .any(|group| group == "production"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn renderer_mode_uses_macos_backends_and_validates() {
+        let mut store = temp_store();
+        assert_eq!(store.renderer_mode(), "femtovg");
+
+        store.set_renderer_mode("skia".into());
+        assert_eq!(store.renderer_mode(), "skia");
+        store.set_renderer_mode("femtovg".into());
+        assert_eq!(store.renderer_mode(), "femtovg");
+        store.set_renderer_mode("unexpected".into());
+        assert_eq!(store.renderer_mode(), "femtovg");
+
+        store.cache = serde_json::from_str("{}").expect("legacy config must deserialize");
+        assert_eq!(store.renderer_mode(), "femtovg");
     }
 
     #[test]
@@ -1901,7 +2034,9 @@ mod tests {
     #[test]
     fn wallpaper_defaults_to_ms_but_keeps_explicit_choice() {
         // Fresh install (no file).
-        assert_eq!(fresh_config().wallpaper, "builtin:ms");
+        let fresh = fresh_config();
+        assert_eq!(fresh.wallpaper, "builtin:ms");
+        assert!((fresh.wallpaper_overlay - 0.85).abs() < f32::EPSILON);
         // User upgrading from before the feature: JSON without the key.
         let cfg: ConfigFile = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.wallpaper, "builtin:tech");
@@ -1919,6 +2054,25 @@ mod tests {
         };
         assert!(!migrate_defaults(&mut cfg));
         assert_eq!(cfg.wallpaper, "builtin:miku");
+    }
+
+    #[test]
+    fn wallpaper_transparency_default_migrates_without_overwriting_custom_value() {
+        let mut old_default = ConfigFile {
+            wallpaper_overlay: PREVIOUS_DEFAULT_WALLPAPER_OVERLAY,
+            defaults_rev: 2,
+            ..ConfigFile::default()
+        };
+        assert!(migrate_defaults(&mut old_default));
+        assert!((old_default.wallpaper_overlay - 0.85).abs() < f32::EPSILON);
+
+        let mut custom = ConfigFile {
+            wallpaper_overlay: 0.70,
+            defaults_rev: 2,
+            ..ConfigFile::default()
+        };
+        assert!(migrate_defaults(&mut custom));
+        assert!((custom.wallpaper_overlay - 0.70).abs() < f32::EPSILON);
     }
 
     #[test]
