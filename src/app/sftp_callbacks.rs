@@ -631,7 +631,104 @@ pub(super) fn wire_sftp_callbacks(
         window.on_editor_recount(move |text: SharedString| {
             if let Some(w) = weak.upgrade() {
                 w.set_editor_line_numbers(line_numbers_for(text.as_str()).into());
+                update_editor_text_layers(&w, text.as_str());
             }
+        });
+    }
+
+    // Replace any tab characters with 4 spaces (Slint's TextInput can't
+    // render 0x09 — it shows as a tofu box). Called from edited so the
+    // cursor briefly sits on the tab then immediately lands on spaces.
+    {
+        let weak = window.as_weak();
+        window.on_editor_replace_tabs(move || {
+            if let Some(w) = weak.upgrade() {
+                let content = w.get_editor_content().to_string();
+                if !content.contains('\t') {
+                    return;
+                }
+                let new = content.replace('\t', "    ");
+                let line_numbers = line_numbers_for(&new);
+                w.set_editor_content(new.clone().into());
+                w.set_editor_line_numbers(line_numbers.into());
+                update_editor_text_layers(&w, &new);
+            }
+        });
+    }
+
+    // --- Editor find / replace (Ctrl+F) --------------------------------------
+    // Slint can't search strings or measure UTF-8 byte length, so the heavy
+    // lifting lives here. The find panel stores match offsets + current index
+    // in Slint; Rust only (a) computes matches, (b) measures byte length, and
+    // (c) performs the actual text mutation for Replace / Replace All.
+
+    // Pure: every byte offset where `query` occurs in `text` (ascending).
+    {
+        window.on_editor_search_matches(
+            move |text: SharedString, query: SharedString| {
+                ModelRc::from(Rc::new(VecModel::from(editor_find_offsets(
+                    text.as_str(),
+                    query.as_str(),
+                ))))
+            },
+        );
+    }
+
+    // Pure: UTF-8 byte length of a string. Used by Slint to set the selection
+    // end on the TextInput (selection offsets are byte-based in Slint).
+    {
+        window.on_editor_byte_length_of(move |s: SharedString| s.as_str().len() as i32);
+    }
+
+    // Pure: zero-based visual line index for a byte offset. Slint uses this to
+    // center the ScrollView on the active find match.
+    {
+        window.on_editor_line_index_at(move |text: SharedString, offset: i32| {
+            let off = offset.max(0) as usize;
+            text.as_str()[..off.min(text.len())]
+                .bytes()
+                .filter(|&b| b == b'\n')
+                .count() as i32
+        });
+    }
+
+    // Pure: number of logical lines in the text (newlines + 1). Slint divides
+    // the TextInput's `preferred-height` by this to measure the *actual* line
+    // height for the find-scroll math.
+    {
+        window.on_editor_line_count(move |text: SharedString| {
+            text.as_str().split('\n').count().max(1) as i32
+        });
+    }
+
+    // Replace every occurrence of the query with `replacement`. Uses Rust's
+    // `str::replace` (handles non-overlapping matches identically to the find
+    // loop). After writing the new content back, Slint refreshes the search.
+    {
+        let weak = window.as_weak();
+        window.on_editor_replace_all(move |replacement: SharedString| {
+            let Some(w) = weak.upgrade() else { return };
+            if w.get_editor_readonly() {
+                return;
+            }
+            let query = w.get_editor_find_query().to_string();
+            if query.is_empty() {
+                return;
+            }
+            let content = w.get_editor_content().to_string();
+            let new_content = content.replace(query.as_str(), replacement.as_str());
+            if new_content == content {
+                return;
+            }
+            w.set_editor_content(new_content.into());
+            w.set_editor_dirty(true);
+            let current_content = w.get_editor_content();
+            w.set_editor_line_numbers(line_numbers_for(current_content.as_str()).into());
+            update_editor_text_layers(&w, current_content.as_str());
+            // After replace-all all intended occurrences are gone. Clear the
+            // selection so the user doesn't see a spurious highlight.
+            w.set_editor_current_match(-1);
+            w.set_editor_highlight_trigger(w.get_editor_highlight_trigger() + 1);
         });
     }
 

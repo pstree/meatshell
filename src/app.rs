@@ -5311,6 +5311,45 @@ fn line_numbers_for(content: &str) -> String {
     s
 }
 
+/// Update the built-in editor's syntax-highlighting layers: comment lines
+/// (`#`) go on the green `editor-comment-text` layer, everything else on the
+/// `editor-normal-text` layer (rendered behind the near-transparent TextInput).
+/// (qian branch feature)
+fn update_editor_text_layers(win: &AppWindow, content: &str) {
+    let mut comment_lines = Vec::new();
+    let mut normal_lines = Vec::new();
+    for line in content.split('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            comment_lines.push(line);
+            normal_lines.push("");
+        } else {
+            comment_lines.push("");
+            normal_lines.push(line);
+        }
+    }
+    win.set_editor_comment_text(comment_lines.join("\n").into());
+    win.set_editor_normal_text(normal_lines.join("\n").into());
+}
+
+/// Every byte offset where `query` occurs in `text` (ascending, non-overlapping).
+/// Used by the editor's find/replace panel — Slint has no string-search op so
+/// the search runs here and the offsets are returned to Slint for highlighting.
+/// (qian branch feature)
+fn editor_find_offsets(text: &str, query: &str) -> Vec<i32> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut offsets = Vec::new();
+    let mut start = 0;
+    while let Some(idx) = text[start..].find(query) {
+        let abs = start + idx;
+        offsets.push(abs as i32);
+        start = abs + query.len();
+    }
+    offsets
+}
+
 /// Write `text` to the system clipboard. Call from a dedicated thread, never the
 /// UI thread (arboard pumps the Win32 message loop / blocks).
 ///
