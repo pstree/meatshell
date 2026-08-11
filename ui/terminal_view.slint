@@ -397,6 +397,16 @@ export component TerminalView inherits Rectangle {
         }
     }
 
+    // Quick-click bar: filling the input box without sending (send-enter=false).
+    // A seq-triggered `changed` handler is used so the bar buttons (siblings of
+    // cmd-input) can set the input text without reaching into cmd-bar's scope.
+    property <string> quick-fill-command: "";
+    property <int> quick-fill-seq: 0;
+    changed quick-fill-seq => {
+        cmd-input.text = root.quick-fill-command;
+        cmd-input.focus();
+    }
+
     background: Theme.term-bg;
     forward-focus: ime-input;
 
@@ -1182,8 +1192,16 @@ export component TerminalView inherits Rectangle {
                             background: qbtn-ta.has-hover ? Theme.accent : Theme.bg-elevated;
                             qbtn-ta := TouchArea {
                                 mouse-cursor: pointer;
-                                // Quick-click button: run the command immediately.
-                                clicked => { root.run-command(q.command, root.send-to-all); }
+                                // Respect send-enter: true → send + execute;
+                                // false → only fill the input box (no trailing Return).
+                                clicked => {
+                                    if (q.send-enter) {
+                                        root.run-command(q.command, root.send-to-all);
+                                    } else {
+                                        root.quick-fill-command = q.command;
+                                        root.quick-fill-seq = root.quick-fill-seq + 1;
+                                    }
+                                }
                             }
                             qbtn-text := Text {
                                 text: q.name;
