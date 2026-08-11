@@ -77,6 +77,38 @@ fn extract_joins_soft_wrapped_rows() {
 }
 
 #[test]
+fn select_word_at_highlights_word_and_returns_text() {
+    let mut buf = make_buf(5, 40, &[], &["hello world foo_bar", ""], 0);
+    // Double-click on 'w' of "world" (grid col 6) on the live first line.
+    let text = buf.select_word_at(0, 6);
+    assert_eq!(text.as_deref(), Some("world"));
+    assert_eq!(buf.sel_ranges, vec![((0, 6), (0, 10))], "sel_ranges: {:?}", buf.sel_ranges);
+    // Double-click on '_' of "foo_bar" — underscore is a word char.
+    // "hello world foo_bar": foo=12-14, _=15, bar=16-18.
+    let text2 = buf.select_word_at(0, 15);
+    assert_eq!(text2.as_deref(), Some("foo_bar"));
+    assert_eq!(buf.sel_ranges, vec![((0, 12), (0, 18))]);
+}
+
+#[test]
+fn select_word_at_blank_returns_none() {
+    let mut buf = make_buf(5, 40, &[], &["hello world", ""], 0);
+    // Double-click on the space (grid col 5).
+    assert_eq!(buf.select_word_at(0, 5), None);
+}
+
+#[test]
+fn select_word_at_scrolled_history_works() {
+    // When the user has scrolled up (view_offset = history length), a
+    // double-click lands on a history line — it must select that word.
+    let mut buf = make_buf(5, 40, &["hello world foo_bar"], &["x", ""], 3);
+    // view_offset=3 means we're scrolled to the top: visible row 0 is history row 0.
+    let text = buf.select_word_at(0, 6);
+    assert_eq!(text.as_deref(), Some("world"));
+    assert_eq!(buf.sel_ranges, vec![((0, 6), (0, 10))], "sel_ranges: {:?}", buf.sel_ranges);
+}
+
+#[test]
 fn highlight_clipped_to_current_view() {
     // Scrolled to the top: a history selection is on-screen and highlighted.
     let mut top = make_buf(5, 20, &["HIST0", "HIST1", "HIST2"], &["LIVE0", "LIVE1"], 3);

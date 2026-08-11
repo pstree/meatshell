@@ -800,6 +800,22 @@ export component TerminalView inherits Rectangle {
                             width: parent.width;
                             height: parent.height;
                             mouse-cursor: text;
+
+                            // Manual double-click detection. Slint's `double-clicked`
+                            // signal isn't reliable alongside a `pointer-event`
+                            // handler on the same TouchArea, so we detect the second
+                            // press ourselves (within 300ms, within ~4px) and select
+                            // the word — skipping the drag-selection start so the
+                            // subsequent release doesn't clear the word selection.
+                            property <bool> dbl-window: false;
+                            property <length> dbl-x: -10000px;
+                            property <length> dbl-y: -10000px;
+                            dbl-timer := Timer {
+                                interval: 300ms;
+                                running: dbl-window;
+                                triggered => { dbl-window = false; }
+                            }
+
                             pointer-event(ev) => {
                                 if (ev.kind == PointerEventKind.down) {
                                     ime-input.focus();
@@ -808,12 +824,32 @@ export component TerminalView inherits Rectangle {
                                         root.ctx-y = self.mouse-y;
                                         ctx-menu.show();
                                     } else if (ev.button == PointerEventButton.left) {
-                                        root.selecting = true;
-                                        root.select-start(
-                                            floor(self.mouse-y / root.cell-h),
-                                            floor(self.mouse-x / root.cell-w),
-                                            ev.modifiers.control,
-                                            ev.modifiers.shift);
+                                        let is-dbl = dbl-window
+                                            && dbl-x <= self.mouse-x + 4px
+                                            && dbl-x >= self.mouse-x - 4px
+                                            && dbl-y <= self.mouse-y + 4px
+                                            && dbl-y >= self.mouse-y - 4px;
+                                        if (is-dbl) {
+                                            // Double-click: select the word; don't
+                                            // start a drag-selection (the up event
+                                            // won't fire select-end either).
+                                            dbl-window = false;
+                                            root.selecting = false;
+                                            root.select-word(
+                                                floor(self.mouse-y / root.cell-h),
+                                                floor(self.mouse-x / root.cell-w));
+                                        } else {
+                                            // Normal single-click: start drag-selection.
+                                            root.selecting = true;
+                                            root.select-start(
+                                                floor(self.mouse-y / root.cell-h),
+                                                floor(self.mouse-x / root.cell-w),
+                                                ev.modifiers.control,
+                                                ev.modifiers.shift);
+                                            dbl-window = true;
+                                            dbl-x = self.mouse-x;
+                                            dbl-y = self.mouse-y;
+                                        }
                                     }
                                 } else if (ev.kind == PointerEventKind.up) {
                                     if (ev.button == PointerEventButton.middle) {
@@ -854,16 +890,6 @@ export component TerminalView inherits Rectangle {
                                     root.terminal-scroll(ev.delta-y > 0 ? 3 : -3);
                                 }
                                 accept
-                            }
-                            // Double-click word selection (qian branch feature).
-                            // This overlay is the topmost terminal hit-layer (it
-                            // swallows click/drag), so the double-click must be
-                            // handled here, not on the covered body-touch below.
-                            double-clicked => {
-                                root.select-word(
-                                    floor(self.mouse-y / root.cell-h),
-                                    floor(self.mouse-x / root.cell-w)
-                                );
                             }
                         }
 
