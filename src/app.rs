@@ -137,14 +137,14 @@ use crate::ssh::{
 };
 use crate::terminal::{
     bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules,
-    encode_command_bar_input, encode_pasted_text, key_to_pty_bytes, paste_requires_large_review,
+    encode_pasted_text, key_to_pty_bytes, paste_requires_large_review,
     should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste, CsiState,
     OutputHighlightPreset, RenderGates, TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
 };
 #[cfg(test)]
 use crate::terminal::{
-    build_row, highlight_plain_output, log_level_marker, normalize_pasted_newlines,
-    text_cell_width, vt_span_colors, CompiledOutputRule, HistSpan, Line,
+    build_row, encode_command_bar_input, highlight_plain_output, log_level_marker,
+    normalize_pasted_newlines, text_cell_width, vt_span_colors, CompiledOutputRule, HistSpan, Line,
 };
 #[cfg(windows)]
 use crate::terminal::c0_letter_key_down;
@@ -4121,10 +4121,15 @@ fn wire_key_input(
         let store_rc = store.clone();
         let weak = window.as_weak();
         window.on_run_command(
-            move |tab_id: SharedString, cmd: SharedString, to_all: bool| {
-                let Some((line, bytes)) = encode_command_bar_input(&cmd) else {
+            move |tab_id: SharedString, cmd: SharedString, to_all: bool, send_enter: bool| {
+                let line = cmd.trim_end().to_string();
+                if line.is_empty() {
                     return;
-                };
+                }
+                let mut bytes = line.clone().into_bytes();
+                if send_enter {
+                    bytes.push(b'\n');
+                }
                 {
                     let h = handles_rc.borrow();
                     if to_all {

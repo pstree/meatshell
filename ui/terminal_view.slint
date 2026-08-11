@@ -308,7 +308,7 @@ export component TerminalView inherits Rectangle {
     // Keyboard-driven selection in the open history dropdown (#140): ↑/↓ move it,
     // Enter runs history-view[history-selected].
     property <int> history-selected: 0;
-    callback run-command(string /* cmd */, bool /* to-all */);
+    callback run-command(string /* cmd */, bool /* to-all */, bool /* send-enter */);
     callback manage-quick-commands();          // open the add/edit/delete dialog
     callback quick-dock-drag-move(length, length);
     callback quick-dock-drag-end();
@@ -389,7 +389,7 @@ export component TerminalView inherits Rectangle {
     changed quick-external-sequence => {
         if (root.active) {
             if (root.quick-external-send-enter) {
-                root.run-command(root.quick-external-command, root.send-to-all);
+                root.run-command(root.quick-external-command, root.send-to-all, true);
             } else {
                 cmd-input.text = root.quick-external-command;
                 cmd-input.focus();
@@ -1195,12 +1195,11 @@ export component TerminalView inherits Rectangle {
                                 // Respect send-enter: true → send + execute;
                                 // false → only fill the input box (no trailing Return).
                                 clicked => {
-                                    if (q.send-enter) {
-                                        root.run-command(q.command, root.send-to-all);
-                                    } else {
-                                        root.quick-fill-command = q.command;
-                                        root.quick-fill-seq = root.quick-fill-seq + 1;
-                                    }
+                                    // Always send to the terminal; send-enter
+                                    // controls whether a trailing Return is
+                                    // appended (execute now) or not (type it
+                                    // without running).
+                                    root.run-command(q.command, root.send-to-all, q.send-enter);
                                 }
                             }
                             qbtn-text := Text {
@@ -1278,13 +1277,13 @@ export component TerminalView inherits Rectangle {
                         single-line: false;
                         // Enter sends; ↑/↓ recall history.
                         accepted => {
-                            root.run-command(self.text, root.send-to-all);
+                            root.run-command(self.text, root.send-to-all, true);
                             self.text = "";
                             root.history-cursor = -1;
                         }
                         key-pressed(e) => {
                             if (e.text == Key.Return && !e.modifiers.shift) {
-                                root.run-command(self.text, root.send-to-all);
+                                root.run-command(self.text, root.send-to-all, true);
                                 self.text = "";
                                 root.history-cursor = -1;
                                 accept
@@ -1400,7 +1399,7 @@ export component TerminalView inherits Rectangle {
                     send-ta := TouchArea {
                         mouse-cursor: pointer;
                         clicked => {
-                            root.run-command(cmd-input.text, root.send-to-all);
+                            root.run-command(cmd-input.text, root.send-to-all, true);
                             cmd-input.text = "";
                             root.history-cursor = -1;
                         }
@@ -1520,7 +1519,7 @@ export component TerminalView inherits Rectangle {
                                         root.selected-quick-group = q.group;
                                         if (q.send-enter) {
                                             // Send + execute (trailing Return).
-                                            root.run-command(q.command, root.send-to-all);
+                                            root.run-command(q.command, root.send-to-all, true);
                                         } else {
                                             // Only fill the input box so it can be
                                             // tweaked before sending (B站 suggestion).
@@ -1711,7 +1710,7 @@ export component TerminalView inherits Rectangle {
                                     hrun := TouchArea {
                                         mouse-cursor: pointer;
                                         clicked => {
-                                            root.run-command(h, root.send-to-all);
+                                            root.run-command(h, root.send-to-all, true);
                                             root.history-open = false;
                                         }
                                     }
@@ -1799,7 +1798,7 @@ export component TerminalView inherits Rectangle {
                                         } else if (e.text == Key.Return) {
                                             if (root.history-view.length > 0
                                                     && root.history-selected < root.history-view.length) {
-                                                root.run-command(root.history-view[root.history-selected], root.send-to-all);
+                                                root.run-command(root.history-view[root.history-selected], root.send-to-all, true);
                                                 root.history-open = false;
                                                 ime-input.focus();
                                             }

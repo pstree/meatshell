@@ -377,7 +377,7 @@ export component AppWindow inherits Window {
     property <int> quick-external-sequence;
     in property <[string]> command-history;          // oldest first (newest last, #113)
     in property <[string]> history-view;             // filtered dropdown, newest first (#101, #331)
-    callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */);
+    callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */, bool /* send-enter */);
     callback copy-text(string);                 // copy a history command (#96)
     callback delete-history(int /* index */);   // remove a history entry (#96)
     callback delete-history-cmd(string /* cmd */);   // remove a history entry by command (#101)
@@ -1541,7 +1541,7 @@ export component AppWindow inherits Window {
                     quick-external-sequence: root.quick-external-sequence;
                     command-history: root.command-history;
                     history-view: root.history-view;
-                    run-command(cmd, all) => { root.run-command(term.id, cmd, all); }
+                    run-command(cmd, all, send-enter) => { root.run-command(term.id, cmd, all, send-enter); }
                     copy-text(t) => { root.copy-text(t); }
                     delete-history(i) => { root.delete-history(i); }
                     delete-history-cmd(c) => { root.delete-history-cmd(c); }
