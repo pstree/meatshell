@@ -54,7 +54,7 @@ export global Theme {
     out property <brush> bg-root:      frost(base-bg-root, max(0.0, root.panel-alpha - 0.44));
     out property <brush> bg-panel:     frost(base-bg-panel, root.panel-alpha);
     out property <brush> bg-panel-alt: frost(base-bg-panel-alt, root.panel-alpha);
-    out property <brush> bg-elevated:  frost(base-bg-elevated, min(1.0, root.panel-alpha + 0.60));
+    out property <brush> bg-elevated:  frost(base-bg-elevated, root.panel-alpha);
     out property <brush> bg-hover:     frost(base-bg-hover, min(1.0, root.panel-alpha + 0.04));
     out property <brush> bg-active:    frost(base-bg-active, min(1.0, root.panel-alpha + 0.08));
     // Settings dialog: 20% less transparent than the other panels so its dense

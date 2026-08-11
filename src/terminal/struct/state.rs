@@ -1,8 +1,15 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::ui::TermSpan;
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CtrlKeySide {
+    Left,
+    Right,
+}
 
 /// Per-terminal state used by normal and alternate-screen rendering.
 pub(crate) struct TermBuffer {
@@ -14,28 +21,25 @@ pub(crate) struct TermBuffer {
     pub(crate) sel_anchor: Option<(usize, u16)>,
     pub(crate) sel_focus: Option<(usize, u16)>,
     pub(crate) sel_ranges: Vec<((usize, u16), (usize, u16))>,
-    /// Session scrollback: lines that have scrolled off the top (oldest first).
-    /// Modeled as a bounded ring buffer so head eviction is O(1); a plain `Vec`
-    /// with `drain(0..n)` shifts the whole backlog on every batch, which is
-    /// O(n²) under a firehose (`tail -n 1000000`) — the main source of stutter.
     pub(crate) history: VecDeque<Line>,
     pub(crate) prev: Vec<Line>,
     pub(crate) view_offset: usize,
     pub(crate) displayed_text: Vec<String>,
     pub(crate) csi_state: CsiState,
+    pub(crate) csi_pending: Vec<u8>,
     pub(crate) raw: VecDeque<u8>,
-    /// Highlight cache: maps a rendered line's plain-text hash to its highlighted
-    /// runs so re-rendered lines (scrollback, still frames) skip the expensive
-    /// highlight scan. `hl_version` bumps whenever the highlight config changes;
-    /// `hl_cache_version` tracks the version the cache was built under so it is
-    /// cleared once on a config change.
-    pub(crate) hl_version: u64,
-    pub(crate) hl_cache_version: u64,
-    pub(crate) hl_cache: HashMap<u64, Arc<Vec<HistSpan>>>,
-    /// Set by a Ctrl+C keystroke. While set, the shell pump thread discards
-    /// *large* `Output` batches (a real firehose, e.g. `tail -n 1000000`) so the
-    /// terminal stops scrolling instead of replaying the whole pre-read stream.
+    /// Ctrl+C was just sent: drop sustained firehose batches until a small
+    /// batch (the ^C echo / fresh prompt) marks the end of the flood.
     pub(crate) interrupt_drop: AtomicBool,
+    /// Highlight-cache version. Bumped whenever the highlight configuration
+    /// (dark mode, preset, custom rules) changes so stale cached lines are
+    /// discarded once. (qian branch feature)
+    pub(crate) hl_version: u64,
+    /// The `hl_version` the current `hl_cache` was built under.
+    pub(crate) hl_cache_version: u64,
+    /// LRU-ish cache of highlighted runs keyed by a stable hash of the plain
+    /// text, bounded by `HL_CACHE_CAP`.
+    pub(crate) hl_cache: HashMap<u64, Arc<Vec<HistSpan>>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -59,17 +63,35 @@ pub(crate) struct CompiledOutputRule {
     pub(crate) ansi_index: u8,
 }
 
-pub(crate) type TermBuffers = Arc<Mutex<HashMap<String, TermBuffer>>>;
+pub(crate) type TermBufferHandle = Arc<Mutex<TermBuffer>>;
+pub(crate) type TermBuffers = Arc<Mutex<HashMap<String, TermBufferHandle>>>;
 
-/// Coalesces render requests for one terminal tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenderWaitResult {
+    Settled,
+    Closed,
+    TimedOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RenderGatePhase {
+    Idle,
+    Scheduled,
+    Flushing,
+}
+
+pub(super) struct RenderGateState {
+    pub(super) requested: u64,
+    pub(super) settled: u64,
+    pub(super) phase: RenderGatePhase,
+    pub(super) closed: bool,
+    pub(super) last_visible_flush: std::time::Instant,
+}
+
+/// Coalesces and acknowledges UI snapshot flushes for one terminal tab.
 pub(crate) struct TabRenderGate {
-    pub(crate) scheduled: AtomicBool,
-    pub(crate) pending: AtomicBool,
-    pub(crate) last_render: Mutex<std::time::Instant>,
-    /// Monotonic counter bumped by the UI thread after each actual repaint of
-    /// this tab. The pump thread waits on it to pace a firehose to the render
-    /// rate (smooth scroll instead of teleporting).
-    pub(crate) rendered: AtomicU64,
+    pub(super) state: Mutex<RenderGateState>,
+    pub(super) settled_cv: Condvar,
 }
 
 pub(crate) type RenderGates = Arc<Mutex<HashMap<String, Arc<TabRenderGate>>>>;

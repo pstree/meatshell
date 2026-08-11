@@ -2,6 +2,8 @@
 use std::sync::OnceLock;
 
 use crate::terminal::TermBuffers;
+#[cfg(any(target_os = "windows", test))]
+use super::state::CtrlKeySide;
 
 /// Normalize clipboard line endings to the single CR byte expected for Enter
 /// by a terminal, including inside bracketed-paste payloads.
@@ -36,12 +38,18 @@ pub(crate) fn encode_pasted_text(text: &str, bracketed: bool) -> Vec<u8> {
 }
 
 pub(crate) fn terminal_uses_bracketed_paste(bufs: &TermBuffers, tab_id: &str) -> bool {
-    let buffer = bufs.lock().ok().and_then(|mut buffers| {
-        buffers
-            .get_mut(tab_id)
-            .map(|buffer| buffer.parser.screen().bracketed_paste())
-    });
-    buffer.unwrap_or(false)
+    let buffer = bufs
+        .lock()
+        .ok()
+        .and_then(|buffers| buffers.get(tab_id).cloned());
+    buffer
+        .and_then(|buffer| {
+            buffer
+                .lock()
+                .ok()
+                .map(|buffer| buffer.parser.screen().bracketed_paste())
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn paste_requires_large_review(text: &str) -> bool {
@@ -64,13 +72,6 @@ pub(crate) fn paste_requires_large_review(text: &str) -> bool {
         index += 1;
     }
     text.chars().count() > COMPACT_CHAR_LIMIT || lines > COMPACT_LINE_LIMIT
-}
-
-#[cfg(any(target_os = "windows", test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CtrlKeySide {
-    Left,
-    Right,
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -139,8 +140,8 @@ pub(crate) fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: boo
         "\u{F701}" => Some(if app_cursor { b"\x1bOB" } else { b"\x1b[B" }),
         "\u{F702}" => Some(if app_cursor { b"\x1bOD" } else { b"\x1b[D" }),
         "\u{F703}" => Some(if app_cursor { b"\x1bOC" } else { b"\x1b[C" }),
-        "\u{F729}" => Some(b"\x1b[H"),
-        "\u{F72B}" => Some(b"\x1b[F"),
+        "\u{F729}" => Some(if app_cursor { b"\x1bOH" } else { b"\x1b[H" }),
+        "\u{F72B}" => Some(if app_cursor { b"\x1bOF" } else { b"\x1b[F" }),
         "\u{F72C}" => Some(b"\x1b[5~"),
         "\u{F72D}" => Some(b"\x1b[6~"),
         "\u{007F}" | "\u{F728}" => Some(b"\x1b[3~"),

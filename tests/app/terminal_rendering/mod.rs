@@ -33,6 +33,10 @@ fn make_buf(
         csi_state: CsiState::Normal,
         csi_pending: Vec::new(),
         raw: std::collections::VecDeque::new(),
+        interrupt_drop: std::sync::atomic::AtomicBool::new(false),
+        hl_version: 0,
+        hl_cache_version: 0,
+        hl_cache: std::collections::HashMap::new(),
     }
 }
 

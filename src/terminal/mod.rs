@@ -1,5 +1,5 @@
-#[path = "struct/types.rs"]
-mod types;
+#[path = "struct/state.rs"]
+mod state;
 
 #[path = "impls/input.rs"]
 mod input;
@@ -32,16 +32,18 @@ pub(crate) use input::{
     terminal_uses_bracketed_paste,
 };
 #[cfg(any(target_os = "windows", test))]
-pub(crate) use input::{windows_process_ctrl_release, CtrlKeySide};
+pub(crate) use input::windows_process_ctrl_release;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) use state::CtrlKeySide;
 pub(crate) use output_highlight::compile_output_rules;
-pub(crate) use presentation::{highlight_plain_output, render_term_span};
+pub(crate) use presentation::{cached_highlight, highlight_plain_output, render_term_span};
 #[cfg(test)]
 pub(crate) use presentation::{log_level_marker, text_cell_width, vt_span_colors};
 pub(crate) use render::{
     build_row, cell_prefix, char_after_cell_end, char_at_cell_start, detect_scroll, MAX_HISTORY,
     RAW_CAP,
 };
-pub(crate) use types::{
+pub(crate) use state::{
     BuiltScreen, CompiledOutputRule, CsiState, HistSpan, Line, OutputHighlightPreset, RenderGates,
-    TabRenderGate, TermBuffer, TermBuffers,
+    TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
 };

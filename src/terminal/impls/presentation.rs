@@ -1,8 +1,51 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::terminal::{CompiledOutputRule, HistSpan, OutputHighlightPreset};
 use crate::ui::TermSpan;
+
+/// Cap on cached highlighted lines; beyond this the cache is dropped wholesale
+/// (rare — only on very long, varied scrollback) to bound memory. (qian feature)
+const HL_CACHE_CAP: usize = 8192;
+
+/// Stable hash of a rendered line's plain text, used as the highlight-cache key.
+fn plain_key(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Return highlighted runs for `plain`, reusing a prior computation when the same
+/// line (same plain text, same highlight config `version`) was rendered before.
+/// `cache_version` tracks the version the cache was built under; whenever the
+/// highlight config changes (`version` bumps) the cache is cleared once.
+/// (qian branch feature)
+pub(crate) fn cached_highlight(
+    cache: &mut HashMap<u64, Arc<Vec<HistSpan>>>,
+    cache_version: &mut u64,
+    version: &mut u64,
+    preset: OutputHighlightPreset,
+    rules: &[CompiledOutputRule],
+    plain: &str,
+    runs: Vec<HistSpan>,
+) -> Arc<Vec<HistSpan>> {
+    if *cache_version != *version {
+        cache.clear();
+        *cache_version = *version;
+    }
+    let key = plain_key(plain);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    let computed = highlight_plain_output(runs, preset, rules);
+    let rc = Arc::new(computed);
+    if cache.len() < HL_CACHE_CAP {
+        cache.insert(key, rc.clone());
+    }
+    rc
+}
 
 /// Highlight the first recognisable log-level token in each otherwise unstyled
 /// terminal run. Uppercase standalone levels cover conventional text logs;
