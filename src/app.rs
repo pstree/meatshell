@@ -709,6 +709,7 @@ pub fn run() -> Result<()> {
         window.set_sidebar_dock(sidebar_dock.into());
         window.set_sftp_panel_width(s.sftp_panel_width());
         window.set_sftp_panel_height(s.sftp_panel_height());
+        window.set_sftp_tree_width(s.sftp_tree_width());
         window.set_sftp_dock(s.sftp_dock().into());
         window.set_quick_commands_as_sidebar(quick_commands_as_sidebar);
         window.set_quick_panel_open(quick_panel_open);
@@ -3826,6 +3827,7 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
     s.set_sidebar_collapsed(win.get_sidebar_collapsed());
     s.set_sftp_panel_width(win.get_sftp_panel_width());
     s.set_sftp_panel_height(win.get_sftp_panel_height());
+    s.set_sftp_tree_width(win.get_sftp_tree_width());
     s.set_sftp_dock(win.get_sftp_dock().to_string());
     s.set_quick_panel_open(win.get_quick_panel_open());
     s.set_quick_panel_collapsed(win.get_quick_panel_collapsed());

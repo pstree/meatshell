@@ -84,7 +84,15 @@ export component SftpPanel inherits Rectangle {
     // When narrow, drop Size then Modified the moment keeping them would squeeze
     // the Name column below `name-min` (names start eliding to "…"). Reserved
     // widths: checkbox+padding+spacing 36px, Size col 76px, Modified 120px.
-    property <length> list-w: root.show-tree ? root.width - 161px : root.width;
+    // Directory-tree column width. Draggable via the splitter between the tree
+    // and the file list; the active value is mirrored to Rust for persistence.
+    in-out property <length> tree-width: 160px;
+    // Splitter drag state (relative coords so the drag stays correct even after
+    // the pointer leaves the 7px splitter).
+    property <bool>   split-dragging: false;
+    property <length> split-base: 160px;
+    property <length> split-start-x: 0px;
+    property <length> list-w: root.show-tree ? root.width - root.tree-width - 1px : root.width;
     property <length> name-min: 180px;     // narrower than this → start dropping columns
     property <bool> show-size-col: root.show-tree || (root.list-w - 36px - 76px - 120px > root.name-min);
     property <bool> show-modified-col: root.show-tree || (root.list-w - 36px - 120px > root.name-min);
@@ -536,7 +544,7 @@ export component SftpPanel inherits Rectangle {
 
             // ── Left: directory tree (hidden when the panel is narrow) ──────
             if root.show-tree : VerticalLayout {
-                width: 160px;
+                width: root.tree-width;
                 spacing: 0;
 
                 // Tree header
@@ -610,8 +618,36 @@ export component SftpPanel inherits Rectangle {
                 }
             }
 
-            // Vertical separator (only when the tree is shown)
-            if root.show-tree : Rectangle { width: 1px; background: Theme.border-subtle; }
+            // Draggable vertical splitter between the tree and the file list.
+            // Drag left/right to resize the directory-tree width (160–600px).
+            if root.show-tree : Rectangle {
+                width: 7px;
+                background: root.split-dragging ? Theme.accent.with-alpha(0.35) : transparent;
+                // The thin visual divider stays centered on the splitter.
+                Rectangle {
+                    x: 3px;
+                    width: 1px;
+                    height: parent.height;
+                    background: Theme.border-subtle;
+                }
+                splitter-ta := TouchArea {
+                    mouse-cursor: col-resize;
+                    width: parent.width;
+                    height: parent.height;
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down) {
+                            root.split-dragging = true;
+                            root.split-base = root.tree-width;
+                            root.split-start-x = self.mouse-x;
+                        } else if (ev.kind == PointerEventKind.up) {
+                            root.split-dragging = false;
+                        } else if (ev.kind == PointerEventKind.move && root.split-dragging) {
+                            let delta = self.mouse-x - root.split-start-x;
+                            root.tree-width = max(160px, min(600px, root.split-base + delta));
+                        }
+                    }
+                }
+            }
 
             // ── Right: file listing ─────────────────────────────────────────
             VerticalLayout {

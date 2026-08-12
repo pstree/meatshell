@@ -260,6 +260,7 @@ export component TerminalView inherits Rectangle {
     in property <string>  sftp-status: "";
     in property <bool>    sftp-loading: false;
     in property <[SftpTreeNode]> sftp-tree-nodes: [];
+    in-out property <length> tree-width: 160px; // SFTP dir-tree column width (shared, persisted)
     in property <[TabInfo]> sftp-transfer-targets: [];
     in property <string> sftp-sort-key: "";
     in property <int> sftp-sort-dir: 0;
@@ -1905,6 +1906,7 @@ export component TerminalView inherits Rectangle {
             status:        root.sftp-status;
             loading:       root.sftp-loading;
             tree-nodes:    root.sftp-tree-nodes;
+            tree-width <=> root.tree-width;
             transfer-targets: root.sftp-transfer-targets;
             selected-count: root.sftp-selected-count;
             sort-key: root.sftp-sort-key;
