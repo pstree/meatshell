@@ -1181,36 +1181,46 @@ export component TerminalView inherits Rectangle {
                     viewport-width: qbtn-row.preferred-width;
                     viewport-height: self.height;
                     qbtn-row := HorizontalLayout {
-                        spacing: 4px;
                         height: 24px;
+                        // No layout `spacing` here: a hidden (non-selected-group)
+                        // button would still occupy the layout slot, so a
+                        // spacing-based gap would vary per group. Instead each
+                        // button chip carries its own 4px right-hand gap, keeping
+                        // the visible gaps even regardless of the selected group.
                         for q in root.quick-commands : Rectangle {
                             visible: q.group == root.selected-quick-group && q.orig-index >= 0;
                             height: 24px;
-                            width: self.visible ? max(54px, qbtn-text.preferred-width + 14px) : 0px;
-                            border-radius: Theme.radius-sm;
-                            border-width: self.visible ? 1px : 0px;
-                            border-color: Theme.border-subtle;
-                            background: qbtn-ta.has-hover ? Theme.accent : Theme.bg-elevated;
-                            qbtn-ta := TouchArea {
-                                mouse-cursor: pointer;
-                                // Respect send-enter: true → send + execute;
-                                // false → only fill the input box (no trailing Return).
-                                clicked => {
-                                    // Always send to the terminal; send-enter
-                                    // controls whether a trailing Return is
-                                    // appended (execute now) or not (type it
-                                    // without running).
-                                    root.run-command(q.command, root.send-to-all, q.send-enter);
+                            width: self.visible ? max(58px, qbtn-text.preferred-width + 18px) : 0px;
+                            // The chip + 4px trailing gap: the gap acts as the
+                            // inter-button spacing; a 0-width hidden chip adds none.
+                            qbtn := Rectangle {
+                                width: max(54px, qbtn-text.preferred-width + 14px);
+                                height: 24px;
+                                border-radius: Theme.radius-sm;
+                                border-width: 1px;
+                                border-color: Theme.border-subtle;
+                                background: qbtn-ta.has-hover ? Theme.accent : Theme.bg-elevated;
+                                qbtn-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    // Respect send-enter: true → send + execute;
+                                    // false → only fill the input box (no trailing Return).
+                                    clicked => {
+                                        // Always send to the terminal; send-enter
+                                        // controls whether a trailing Return is
+                                        // appended (execute now) or not (type it
+                                        // without running).
+                                        root.run-command(q.command, root.send-to-all, q.send-enter);
+                                    }
                                 }
-                            }
-                            qbtn-text := Text {
-                                text: q.name;
-                                color: qbtn-ta.has-hover ? #ffffff : Theme.text-primary;
-                                font-family: Theme.ui-font-family;
-                                font-size: Theme.fs-xs;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                                overflow: elide;
+                                qbtn-text := Text {
+                                    text: q.name;
+                                    color: qbtn-ta.has-hover ? #ffffff : Theme.text-primary;
+                                    font-family: Theme.ui-font-family;
+                                    font-size: Theme.fs-xs;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
                             }
                         }
                     }
