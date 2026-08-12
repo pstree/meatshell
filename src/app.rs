@@ -2740,7 +2740,34 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: std::path
 }
 
 #[cfg(not(windows))]
-fn handle_file_drop(_win: &AppWindow, _sftp_handles: &SftpHandles, _path: std::path::PathBuf) {}
+fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: std::path::PathBuf) {
+    let active = win.get_active_tab_id().to_string();
+    if active == "welcome" {
+        return;
+    }
+    let dir = active_sftp_path(win, &active);
+    if dir.is_empty() {
+        return;
+    }
+    let sync = win.get_sync_input() && win.get_sync_upload_enabled();
+    let other_dirs = if sync { terminal_sftp_paths(win) } else { HashMap::new() };
+    if let Ok(handles) = sftp_handles.lock() {
+        if let Some(h) = handles.get(&active) {
+            win.set_download_open(true);
+            h.upload(path.clone(), dir);
+        }
+        if sync {
+            for (id, h) in handles.iter() {
+                if id == &active {
+                    continue;
+                }
+                if let Some(d) = other_dirs.get(id).filter(|d| !d.is_empty()) {
+                    h.upload(path.clone(), d.clone());
+                }
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Model helpers
