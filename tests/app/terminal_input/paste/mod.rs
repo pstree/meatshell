@@ -35,12 +35,3 @@ fn paste_uses_remote_bracketed_paste_mode() {
         b"first\rsecond"
     );
 }
-
-#[test]
-fn long_pastes_switch_to_large_review() {
-    assert!(!paste_requires_large_review("short prompt\nsecond line"));
-    assert!(!paste_requires_large_review(&"a".repeat(600)));
-    assert!(paste_requires_large_review(&"a".repeat(601)));
-    assert!(!paste_requires_large_review(&vec!["line"; 12].join("\r\n")));
-    assert!(paste_requires_large_review(&vec!["line"; 13].join("\r\n")));
-}

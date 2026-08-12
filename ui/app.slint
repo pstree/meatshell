@@ -708,14 +708,6 @@ export component AppWindow inherits Window {
     in-out property <bool> batch-import-open: false;  // text batch-import dialog (#150)
     in-out property <string> batch-import-text;       // the textarea content
     callback batch-import-confirm(string /* pasted text */);
-    // Multi-line terminal paste safety prompt (#262).
-    in-out property <bool> paste-confirm-open: false;
-    in-out property <string> paste-confirm-tab;
-    in-out property <string> paste-confirm-text;
-    in-out property <string> paste-confirm-preview;
-    in-out property <bool> paste-confirm-large: false;
-    callback paste-confirmed(string /* tab-id */);
-    callback paste-confirm-cancelled();
     callback connect-session(string /* session-id */);
     callback edit-session(string /* session-id */);
     callback duplicate-session(string /* session-id */);
@@ -3922,32 +3914,6 @@ export component AppWindow inherits Window {
             root.confirm-delete-open = false;
         }
         cancel => { root.confirm-delete-batch = false; root.confirm-delete-open = false; }
-    }
-
-    // Multi-line paste can execute several shell commands at once. Keep the
-    // prompt explicit and require a button click; clicking the backdrop never
-    // accepts the paste (#262).
-    ConfirmDialog {
-        width: parent.width;
-        height: parent.height;
-        is-open <=> root.paste-confirm-open;
-        covered: root.confirm-close-open;
-        dismiss-on-backdrop: false;
-        title: root.lang-en ? "Confirm multi-line paste" : "确认多行粘贴";
-        message: root.lang-en
-            ? "The clipboard contains line breaks and may execute multiple commands. Review it before pasting."
-            : "剪贴板内容包含换行，粘贴后可能连续执行多个命令，请确认内容后再继续。";
-        detail: root.paste-confirm-preview;
-        large-detail: root.paste-confirm-large;
-        confirm-label: root.lang-en ? "Paste" : "粘贴";
-        confirm => {
-            root.paste-confirmed(root.paste-confirm-tab);
-            root.paste-confirm-open = false;
-        }
-        cancel => {
-            root.paste-confirm-cancelled();
-            root.paste-confirm-open = false;
-        }
     }
 
     // Host-key confirmation (#109-5). Reuses the confirm-dialog card. The backdrop

@@ -52,28 +52,6 @@ pub(crate) fn terminal_uses_bracketed_paste(bufs: &TermBuffers, tab_id: &str) ->
         .unwrap_or(false)
 }
 
-pub(crate) fn paste_requires_large_review(text: &str) -> bool {
-    const COMPACT_CHAR_LIMIT: usize = 600;
-    const COMPACT_LINE_LIMIT: usize = 12;
-    let bytes = text.as_bytes();
-    let mut lines = 1usize;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\r' => {
-                lines += 1;
-                if bytes.get(index + 1) == Some(&b'\n') {
-                    index += 1;
-                }
-            }
-            b'\n' => lines += 1,
-            _ => {}
-        }
-        index += 1;
-    }
-    text.chars().count() > COMPACT_CHAR_LIMIT || lines > COMPACT_LINE_LIMIT
-}
-
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn windows_process_ctrl_release(
     state: i_slint_backend_winit::winit::event::ElementState,

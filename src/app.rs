@@ -136,9 +136,8 @@ use crate::ssh::{
     SessionEvent, SessionHandle, SystemDetails,
 };
 use crate::terminal::{
-    bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules,
-    encode_pasted_text, key_to_pty_bytes, paste_requires_large_review,
-    should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste, CsiState,
+    bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules, encode_pasted_text,
+    key_to_pty_bytes, should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste, CsiState,
     OutputHighlightPreset, RenderGates, TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
 };
 #[cfg(test)]
@@ -4874,7 +4873,6 @@ fn wire_key_input(
     {
         let handles = handles.clone();
         let bufs = bufs.clone();
-        let weak = window.as_weak();
         window.on_paste_from_clipboard(move |tab_id: SharedString| {
             // Clone the (Send) command sender for this tab so the clipboard read
             // can run off the UI thread.  Reading arboard on the event-loop
@@ -4886,58 +4884,18 @@ fn wire_key_input(
                 .map(|h| h.commands.clone());
             let Some(sender) = sender else { return };
             let bracketed = terminal_uses_bracketed_paste(&bufs, tab_id.as_str());
-            let weak = weak.clone();
             let tab_id = tab_id.to_string();
             std::thread::spawn(move || {
                 match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     Ok(text) => {
-                        if text.contains(['\r', '\n']) {
-                            let large = paste_requires_large_review(&text);
-                            let preview = text.clone();
-                            let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(w) = weak.upgrade() {
-                                    w.set_paste_confirm_tab(tab_id.into());
-                                    w.set_paste_confirm_text(text.into());
-                                    w.set_paste_confirm_preview(preview.into());
-                                    w.set_paste_confirm_large(large);
-                                    w.set_paste_confirm_open(true);
-                                }
-                            });
-                        } else {
-                            let bytes = encode_pasted_text(&text, bracketed);
-                            let _ = sender.send(SessionCommand::RawInput(bytes));
-                        }
+                        let bytes = encode_pasted_text(&text, bracketed);
+                        let _ = sender.send(SessionCommand::RawInput(bytes));
                     }
                     Err(e) => tracing::warn!("paste_from_clipboard: clipboard error: {}", e),
                 }
             });
         });
     }
-
-    // Accept a previously reviewed multi-line paste (#262).
-    {
-        let handles_paste = handles.clone();
-        let bufs_paste = bufs.clone();
-        let weak = window.as_weak();
-        window.on_paste_confirmed(move |tab_id: SharedString| {
-            let Some(sender) = handles_paste
-                .borrow()
-                .get(tab_id.as_str())
-                .map(|h| h.commands.clone())
-            else {
-                return;
-            };
-            let Some(w) = weak.upgrade() else { return };
-            let text = w.get_paste_confirm_text().to_string();
-            let bracketed = terminal_uses_bracketed_paste(&bufs_paste, tab_id.as_str());
-            let _ = sender.send(SessionCommand::RawInput(encode_pasted_text(
-                &text, bracketed,
-            )));
-            w.set_paste_confirm_open(false);
-        });
-    }
-
-    window.on_paste_confirm_cancelled(|| {});
 
     // Context menu → 清空缓存: reset the local vt100 buffer (drops scrollback),
     // wipe the displayed screen, then nudge the remote to redraw a fresh prompt.
