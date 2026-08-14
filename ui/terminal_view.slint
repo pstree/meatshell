@@ -1027,19 +1027,19 @@ export component TerminalView inherits Rectangle {
                         root.paste-from-clipboard();
                         ime-input.focus();
                         accept
-                    // ── macOS: swallow any other ⌘ combo (control == Cmd here) so it
-                    // isn't typed into the shell as a literal character. ──
-                    } else if (Theme.is-mac && event.modifiers.control) {
-                        accept
                     // ── All other keys (printable, Ctrl+X, arrows, …) → the shell.
                     // The control flag is the *physical* Ctrl key: `meta` on macOS,
                     // `control` elsewhere, so ^X/^C reach the PTY everywhere (#158).
                     // Return `accept` for everything: `reject` would drop the char.
                     } else {
+                        if(event.text != "" && event.text <= "\u{0018}" && event.text >= "\u{0010}"){
+                            accept   // bare modifier key — don't forward to PTY
+                        }else{
                         root.send-key(event.text,
                                       Theme.is-mac ? event.modifiers.meta : event.modifiers.control,
                                       event.modifiers.alt, event.modifiers.shift);
                         accept
+                        }
                     }
                 }
 
