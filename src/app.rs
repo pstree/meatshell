@@ -57,6 +57,12 @@ const PACED_QUEUE_EVENT_LIMIT: usize = 256;
 
 /// Max UI renders per second for a tab under sustained output (#209).
 const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+/// Echo produced shortly after a physical keypress should feel immediate. This
+/// temporary 120 Hz ceiling is still coalesced, then falls back to 30 Hz once
+/// the user stops typing so firehose output keeps its existing CPU protection.
+const INTERACTIVE_RENDER_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(8);
+const INTERACTIVE_ECHO_WINDOW: std::time::Duration = std::time::Duration::from_millis(180);
 /// A scrolled-back viewport is content-anchored, so sustained output only
 /// needs occasional model refreshes for its scrollbar metadata (#306).
 const SCROLLED_RENDER_MIN_INTERVAL: std::time::Duration =
@@ -72,6 +78,9 @@ fn tab_render_interval(bufs: &TermBuffers, tab_id: &str) -> std::time::Duration 
     };
     let interval = match handle.try_lock() {
         Ok(buf) if buf.view_offset > 0 => SCROLLED_RENDER_MIN_INTERVAL,
+        Ok(buf) if std::time::Instant::now() < buf.interactive_echo_until => {
+            INTERACTIVE_RENDER_MIN_INTERVAL
+        }
         Ok(_) => RENDER_MIN_INTERVAL,
         // A busy ingest lock is itself a firehose signal. Deferring this
         // snapshot prevents the UI thread from joining the contention.
@@ -628,6 +637,7 @@ pub fn run() -> Result<()> {
             window.set_term_cursor_color(color);
         }
         window.set_output_highlight_enabled(s.output_highlight_enabled());
+        window.set_json_format_output(s.json_format_output());
         window.set_output_highlight_preset(s.output_highlight_preset().into());
         window.set_output_highlight_rules(output_highlight_rule_model(&s));
         window.set_ui_scale(s.ui_scale() as f32 / 100.0); // global UI zoom (#100)
@@ -719,10 +729,19 @@ pub fn run() -> Result<()> {
     }
     {
         let store = store.clone();
+        let handles = handles.clone();
+        let weak = window.as_weak();
         window.on_set_zen_mode(move |enabled| {
             let mut s = store.borrow_mut();
             s.set_zen_mode(enabled);
             let _ = s.save();
+            let sidebar_visible = weak
+                .upgrade()
+                .map(|window| !window.get_sidebar_collapsed())
+                .unwrap_or(false);
+            for handle in handles.borrow().values() {
+                handle.set_resource_monitoring(!enabled && sidebar_visible);
+            }
         });
     }
 
@@ -836,10 +855,16 @@ pub fn run() -> Result<()> {
     }
     {
         let store = store.clone();
+        let handles = handles.clone();
+        let weak = window.as_weak();
         window.on_set_sidebar_collapsed(move |v| {
             let mut s = store.borrow_mut();
             s.set_sidebar_collapsed(v);
             let _ = s.save();
+            let zen = weak.upgrade().map(|window| window.get_zen_mode()).unwrap_or(false);
+            for handle in handles.borrow().values() {
+                handle.set_resource_monitoring(!v && !zen);
+            }
         });
     }
     {
@@ -1100,6 +1125,20 @@ pub fn run() -> Result<()> {
         });
     }
     {
+        let store = store.clone();
+        let bufs = bufs.clone();
+        window.on_set_json_format_output(move |enabled| {
+            {
+                let mut settings = store.borrow_mut();
+                settings.set_json_format_output(enabled);
+                let _ = settings.save();
+            }
+            for buffer in bufs.lock().unwrap().values() {
+                buffer.lock().unwrap().json_format_output = enabled;
+            }
+        });
+    }
+    {
         let weak = window.as_weak();
         let store = store.clone();
         window.on_set_term_font_size(move |size: i32| {
@@ -1257,6 +1296,49 @@ pub fn run() -> Result<()> {
     let sessions_model: Rc<VecModel<SessionInfo>> = Rc::new(VecModel::default());
     window.set_sessions(ModelRc::from(sessions_model.clone()));
     sync_sessions_to_model(&store.borrow(), &sessions_model);
+    window.set_wsl_profiles(wsl_profile_model(&store.borrow()));
+    {
+        let weak = window.as_weak();
+        window.on_pick_wsl_directory(move || {
+            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                if let Some(w) = weak.upgrade() {
+                    w.set_wsl_new_directory(folder.to_string_lossy().to_string().into());
+                }
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let sessions_model = sessions_model.clone();
+        window.on_add_wsl_profile(move |name, distribution, directory| {
+            let mut s = store.borrow_mut();
+            s.add_wsl_profile(
+                name.to_string(),
+                distribution.to_string(),
+                directory.to_string(),
+            );
+            let _ = s.save();
+            if let Some(w) = weak.upgrade() {
+                w.set_wsl_profiles(wsl_profile_model(&s));
+                sync_sessions_to_model(&s, &sessions_model);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let sessions_model = sessions_model.clone();
+        window.on_remove_wsl_profile(move |id| {
+            let mut s = store.borrow_mut();
+            s.remove_wsl_profile(id.as_str());
+            let _ = s.save();
+            if let Some(w) = weak.upgrade() {
+                w.set_wsl_profiles(wsl_profile_model(&s));
+                sync_sessions_to_model(&s, &sessions_model);
+            }
+        });
+    }
     {
         let weak = window.as_weak();
         let store = store.clone();
@@ -1388,20 +1470,13 @@ pub fn run() -> Result<()> {
         let panes_model = panes_model.clone();
         let splitters_model = splitters_model.clone();
         window.on_set_welcome_as_sidebar(move |v| {
-            {
-                let mut s = store.borrow_mut();
-                s.set_welcome_as_sidebar(v);
-                let _ = s.save();
-            }
-            {
-                let mut lay = layout.borrow_mut();
-                update_welcome_tab(&mut lay, v);
-            }
-            // Switching the property destroys the sidebar Welcome component and
-            // creates the tabbed one (or vice versa). Rebuild the pane model on
-            // the next event-loop turn so Slint never mutates that component tree
-            // recursively from inside the Switch callback (#323).
+            // The property is two-way-bound through InterfacePanel and changing
+            // it destroys/recreates the Welcome subtree that owns the Switch.
+            // Defer the *entire* transition until its callback has returned;
+            // deferring only refresh_panes still destroys the component tree
+            // recursively on Windows (#323).
             let weak = weak.clone();
+            let store = store.clone();
             let layout = layout.clone();
             let content_size = content_size.clone();
             let tabs_model = tabs_model.clone();
@@ -1409,6 +1484,16 @@ pub fn run() -> Result<()> {
             let splitters_model = splitters_model.clone();
             slint::Timer::single_shot(std::time::Duration::ZERO, move || {
                 if let Some(w) = weak.upgrade() {
+                    w.set_welcome_as_sidebar(v);
+                    {
+                        let mut s = store.borrow_mut();
+                        s.set_welcome_as_sidebar(v);
+                        let _ = s.save();
+                    }
+                    {
+                        let mut lay = layout.borrow_mut();
+                        update_welcome_tab(&mut lay, v);
+                    }
                     refresh_panes(
                         &w,
                         &layout.borrow(),
@@ -1971,6 +2056,10 @@ pub fn run() -> Result<()> {
         slint::TimerMode::Repeated,
         SystemSampler::recommended_interval(),
         move || {
+            let Some(window) = weak.upgrade() else { return };
+            if window.get_sidebar_collapsed() || window.get_zen_mode() {
+                return;
+            }
             // Skip the (non-trivial) sysinfo refresh + sidebar repaint when no one
             // is looking, and back off to ~5 s when the window is in the background.
             match tick_activity.get() {
@@ -1994,12 +2083,10 @@ pub fn run() -> Result<()> {
             // and in the bottom network graph.
             *tick_local.lock().unwrap() = snap.clone();
 
-            if let Some(w) = weak.upgrade() {
-                // Everything (status, CPU/mem/swap, both graphs) follows the
-                // active tab; refresh_sidebar reads the stores we just updated.
-                if sidebar_updates_visible(&w) {
-                    refresh_sidebar(&w, &tick_statuses, &tick_local, &tick_net);
-                }
+            // Everything (status, CPU/mem/swap, both graphs) follows the
+            // active tab; refresh_sidebar reads the stores we just updated.
+            if sidebar_updates_visible(&window) {
+                refresh_sidebar(&window, &tick_statuses, &tick_local, &tick_net);
             }
         },
     );
@@ -3456,6 +3543,8 @@ fn wire_session_callbacks(
                 last_used: None,
                 group: draft.group.to_string(),
                 kind,
+                local_distribution: String::new(),
+                local_working_dir: String::new(),
                 serial_port: draft.serial_port.to_string(),
                 baud_rate: if draft.baud_rate <= 0 {
                     115_200
@@ -3756,7 +3845,10 @@ fn wire_session_callbacks(
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
             let session = if id.starts_with("system:") {
-                match builtin_local_sessions().into_iter().find(|s| s.id == id) {
+                match builtin_local_sessions(store.borrow().wsl_profiles())
+                    .into_iter()
+                    .find(|s| s.id == id)
+                {
                     Some(s) => s,
                     None => return,
                 }
@@ -3875,6 +3967,8 @@ fn wire_session_callbacks(
                     is_dark: is_dark_now,
                     output_highlight,
                     custom_highlight_rules,
+                    json_format_output: store.borrow().json_format_output(),
+                    interactive_echo_until: std::time::Instant::now(),
                     sel_anchor: None,
                     sel_focus: None,
                     sel_ranges: Vec::new(),
@@ -4531,6 +4625,30 @@ fn wire_key_input(
             }
         });
     }
+    // Reorder inside the current group (#310). The stored Vec remains the
+    // source of truth; the grouped display model preserves this relative order.
+    {
+        let store_rc = store.clone();
+        let weak = window.as_weak();
+        let collapsed = collapsed_quick_groups.clone();
+        window.on_reorder_quick_command(move |index: i32, move_up: bool| {
+            let changed = {
+                let mut s = store_rc.borrow_mut();
+                let mut commands = s.quick_commands().to_vec();
+                let changed = reorder_quick_command(&mut commands, index as usize, move_up);
+                if changed {
+                    s.set_quick_commands(commands);
+                    let _ = s.save();
+                }
+                changed
+            };
+            if changed {
+                if let Some(w) = weak.upgrade() {
+                    w.set_quick_commands(quick_cmd_model(&store_rc.borrow(), &collapsed.borrow()));
+                }
+            }
+        });
+    }
     // Quick-group create / rename (#55).
     {
         let store_rc = store.clone();
@@ -4911,10 +5029,18 @@ fn wire_key_input(
                 let h = handles.borrow();
                 if sync_input.load(std::sync::atomic::Ordering::Relaxed) {
                     // Broadcast the same bytes to every online session (#78 pt.4).
-                    for handle in h.values() {
+                    for (target_id, handle) in h.iter() {
+                        if let Some(buffer) = term_buf(&bufs, target_id) {
+                            buffer.lock().unwrap().interactive_echo_until =
+                                std::time::Instant::now() + INTERACTIVE_ECHO_WINDOW;
+                        }
                         handle.send_raw(bytes.clone());
                     }
                 } else if let Some(handle) = h.get(tab_id.as_str()) {
+                    if let Some(buffer) = term_buf(&bufs, tab_id.as_str()) {
+                        buffer.lock().unwrap().interactive_echo_until =
+                            std::time::Instant::now() + INTERACTIVE_ECHO_WINDOW;
+                    }
                     handle.send_raw(bytes);
                 }
             }

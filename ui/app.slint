@@ -25,12 +25,12 @@ import { TerminalView, TermSpan, TermMatch, QuickCmd, QuickDockPanel } from "ter
 import { SftpEntry, SftpTreeNode, TunnelInfo } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
 import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
-import { InterfacePanel, OutputRuleItem } from "interface_panel.slint";
+import { InterfacePanel, OutputRuleItem, WslProfileInfo } from "interface_panel.slint";
 // Re-export so `slint::include_modules!` generates the detached Rust window types.
 export { ProcWindow, SystemInfoWindow }
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
-export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd }
+export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd, WslProfileInfo }
 
 // --- TerminalState ---------------------------------------------------------
 // Per-terminal view-model exposed to Rust. A TabInfo has the metadata; the
@@ -397,6 +397,13 @@ export component AppWindow inherits Window {
     callback delete-history-cmd(string /* cmd */);   // remove a history entry by command (#101)
     callback search-history(string /* query */);     // filter the history dropdown (#101)
     in-out property <bool> quick-cmd-manage-open: false;  // manage dialog
+    in-out property <length> qcm-dialog-width: 560px;
+    in-out property <length> qcm-dialog-height: 560px;
+    property <bool> qcm-dialog-resizing;
+    property <length> qcm-resize-base-width;
+    property <length> qcm-resize-base-height;
+    property <length> qcm-resize-grab-x;
+    property <length> qcm-resize-grab-y;
     in-out property <string> qcm-name;                // manage form: name field
     in-out property <string> qcm-command;             // manage form: command field
     in-out property <string> qcm-group;               // manage form: group field (#55)
@@ -408,6 +415,7 @@ export component AppWindow inherits Window {
     callback edit-quick-command(int /* index */);
     callback duplicate-quick-command(int /* index */);
     callback move-quick-command(int /* index */, string /* group */);
+    callback reorder-quick-command(int /* index */, bool /* move up */);
     callback toggle-quick-group(string /* group */);  // collapse/expand a group (#55)
     // Quick-command group management (mirror session groups) (#55).
     in-out property <bool> qcg-open: false;           // group name dialog open
@@ -434,6 +442,7 @@ export component AppWindow inherits Window {
     in-out property <string> term-cursor-color-hex: root.dark-mode ? "#D4D4D4" : "#2D2D2F";
     in-out property <color> term-cursor-color: Theme.term-fg;
     in-out property <bool> output-highlight-enabled: true;
+    in-out property <bool> json-format-output: true;
     in-out property <string> output-highlight-preset: "log";
     in property <[OutputRuleItem]> output-highlight-rules;
     in-out property <string> output-highlight-rule-status;
@@ -496,6 +505,7 @@ export component AppWindow inherits Window {
     callback set-term-cursor-style(string);        // apply + persist cursor shape (#275)
     callback set-term-cursor-color(string) -> bool;// validate + persist cursor colour (#275)
     callback set-output-highlight(bool, string);   // enable + built-in preset
+    callback set-json-format-output(bool);
     callback add-output-highlight-rule(string, bool, bool, bool, string) -> bool;
     callback remove-output-highlight-rule(int);
     callback set-output-highlight-rule-enabled(int, bool);
@@ -504,6 +514,8 @@ export component AppWindow inherits Window {
     // feed the Interface → Wallpaper picker.
     in-out property <string> current-wallpaper: "";
     in-out property <string> custom-wallpaper-name: "";
+    in property <[WslProfileInfo]> wsl-profiles;
+    in-out property <string> wsl-new-directory: "~";
     callback set-wallpaper(string);                // apply + persist a wallpaper id
     callback pick-wallpaper-file();                // open the OS file dialog (Rust)
     // SFTP follows the terminal's cd; opt out in Interface settings.
@@ -526,6 +538,9 @@ export component AppWindow inherits Window {
     callback set-welcome-as-sidebar(bool);         // apply + persist
     in-out property <bool> update-check-enabled: true;   // startup new-version check (#184)
     callback set-update-check-enabled(bool);       // apply + persist
+    callback add-wsl-profile(string, string, string);
+    callback remove-wsl-profile(string);
+    callback pick-wsl-directory();
     // Drag-resizable width of that welcome sidebar (logical px), persisted.
     in-out property <length> welcome-sidebar-width: 240px;
     callback persist-welcome-sidebar-width(float);
@@ -2827,11 +2842,11 @@ export component AppWindow inherits Window {
         background: #00000080;
         TouchArea { clicked => { root.quick-cmd-manage-open = false; } }
 
-        Rectangle {
+        qcm-card := Rectangle {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            width: 460px;
-            height: 420px;
+            width: min(root.qcm-dialog-width, parent.width - 32px);
+            height: min(root.qcm-dialog-height, parent.height - 32px);
             background: Theme.popup-bg;
             border-radius: Theme.radius-md;
             border-width: 1px;
@@ -2881,20 +2896,26 @@ export component AppWindow inherits Window {
                 Text { text: @tr("Command"); color: Theme.text-secondary; font-size: Theme.fs-sm; }
                 HorizontalLayout {
                     spacing: 8px;
-                    qcm-cmd-in := LineEdit {
+                    Rectangle {
                         horizontal-stretch: 1;
-                        text <=> root.qcm-command;
-                        font-family: Theme.ui-font-family;
-                        placeholder-text: "tail -f /var/log/syslog";
-                        accepted => {
-                            if (root.qcm-name != "" && root.qcm-command != "") {
-                                if (root.qcm-edit-index >= 0) {
-                                    root.save-quick-command(root.qcm-edit-index, root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-send-enter);
-                                } else {
-                                    root.add-quick-command(root.qcm-name, root.qcm-command, root.qcm-group, root.qcm-send-enter);
-                                }
-                                root.qcm-edit-index = -1;
-                                root.qcm-name = ""; root.qcm-command = ""; root.qcm-group = ""; root.qcm-send-enter = true;
+                        height: 72px;
+                        border-radius: Theme.radius-sm;
+                        border-width: 1px;
+                        border-color: qcm-cmd-in.has-focus ? Theme.accent : Theme.border-subtle;
+                        background: Theme.bg-root;
+                        clip: true;
+                        Flickable {
+                            viewport-width: self.width;
+                            viewport-height: max(self.height, qcm-cmd-in.preferred-height + 12px);
+                            qcm-cmd-in := TextInput {
+                                x: 8px; y: 6px;
+                                width: parent.width - 16px;
+                                text <=> root.qcm-command;
+                                color: Theme.text-primary;
+                                font-family: Theme.font-mono;
+                                font-size: Theme.fs-sm;
+                                single-line: false;
+                                wrap: no-wrap;
                             }
                         }
                     }
@@ -3043,6 +3064,30 @@ export component AppWindow inherits Window {
                                                overflow: elide; font-family: Theme.ui-font-family; }
                                     }
                                     Rectangle {
+                                        width: 24px; height: 28px;
+                                        border-radius: Theme.radius-sm;
+                                        background: up-ta.has-hover ? Theme.bg-hover : transparent;
+                                        up-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.reorder-quick-command(q.orig-index, true); }
+                                        }
+                                        Text { text: "\u{E5D8}"; font-family: "Material Icons";
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm;
+                                               horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                    Rectangle {
+                                        width: 24px; height: 28px;
+                                        border-radius: Theme.radius-sm;
+                                        background: down-ta.has-hover ? Theme.bg-hover : transparent;
+                                        down-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.reorder-quick-command(q.orig-index, false); }
+                                        }
+                                        Text { text: "\u{E5DB}"; font-family: "Material Icons";
+                                               color: Theme.text-secondary; font-size: Theme.fs-sm;
+                                               horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                    Rectangle {
                                         width: 28px;
                                         y: (parent.height - self.height) / 2;
                                         height: 28px;
@@ -3107,6 +3152,51 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            // Bottom-right resize grip. The chosen size is retained while the
+            // application is running, and remains clamped to the main window.
+            Rectangle {
+                x: parent.width - 18px;
+                y: parent.height - 18px;
+                width: 18px;
+                height: 18px;
+                background: qcm-resize-ta.has-hover || root.qcm-dialog-resizing
+                    ? Theme.bg-hover : transparent;
+                Text {
+                    text: "\u{E3C2}";
+                    font-family: "Material Icons";
+                    color: Theme.text-muted;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                qcm-resize-ta := TouchArea {
+                    mouse-cursor: nwse-resize;
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down) {
+                            root.qcm-dialog-resizing = true;
+                            root.qcm-resize-base-width = root.qcm-dialog-width;
+                            root.qcm-resize-base-height = root.qcm-dialog-height;
+                            root.qcm-resize-grab-x = self.absolute-position.x + self.mouse-x;
+                            root.qcm-resize-grab-y = self.absolute-position.y + self.mouse-y;
+                        } else if (e.kind == PointerEventKind.up) {
+                            root.qcm-dialog-resizing = false;
+                        }
+                    }
+                    moved => {
+                        if (root.qcm-dialog-resizing) {
+                            root.qcm-dialog-width = clamp(
+                                root.qcm-resize-base-width
+                                    + self.absolute-position.x + self.mouse-x - root.qcm-resize-grab-x,
+                                460px, max(460px, root.width - 32px));
+                            root.qcm-dialog-height = clamp(
+                                root.qcm-resize-base-height
+                                    + self.absolute-position.y + self.mouse-y - root.qcm-resize-grab-y,
+                                420px, max(420px, root.height - 32px));
                         }
                     }
                 }
@@ -4074,6 +4164,7 @@ export component AppWindow inherits Window {
                     term-cursor-color-hex <=> root.term-cursor-color-hex;
                     term-cursor-color: root.term-cursor-color;
                     output-highlight-enabled <=> root.output-highlight-enabled;
+                    json-format-output <=> root.json-format-output;
                     output-highlight-preset <=> root.output-highlight-preset;
                     output-highlight-rules: root.output-highlight-rules;
                     output-highlight-rule-status <=> root.output-highlight-rule-status;
@@ -4099,6 +4190,8 @@ export component AppWindow inherits Window {
                     wallpaper-overlay <=> root.wallpaper-overlay;
                     current-wallpaper: root.current-wallpaper;
                     custom-wallpaper-name: root.custom-wallpaper-name;
+                    wsl-profiles: root.wsl-profiles;
+                    wsl-new-directory <=> root.wsl-new-directory;
                     set-wallpaper(v) => { root.set-wallpaper(v); }
                     pick-wallpaper-file() => { root.pick-wallpaper-file(); }
                     set-term-font(v) => { root.set-term-font(v); }
@@ -4110,6 +4203,7 @@ export component AppWindow inherits Window {
                     set-output-highlight(enabled, preset) => {
                         root.set-output-highlight(enabled, preset);
                     }
+                    set-json-format-output(enabled) => { root.set-json-format-output(enabled); }
                     add-output-highlight-rule(pattern, regex, case-sensitive, whole-line, color) => {
                         root.add-output-highlight-rule(
                             pattern, regex, case-sensitive, whole-line, color)
@@ -4146,6 +4240,9 @@ export component AppWindow inherits Window {
                         root.set-quick-commands-as-sidebar(v);
                     }
                     set-update-check-enabled(v) => { root.set-update-check-enabled(v); }
+                    add-wsl-profile(name, distribution, directory) => { root.add-wsl-profile(name, distribution, directory); }
+                    remove-wsl-profile(id) => { root.remove-wsl-profile(id); }
+                    pick-wsl-directory => { root.pick-wsl-directory(); }
                     persist-wallpaper-overlay(v) => { root.persist-wallpaper-overlay(v); }
                 }
             }

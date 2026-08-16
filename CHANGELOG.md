@@ -3,7 +3,49 @@
 All notable changes are documented here. 本文件记录所有重要变更。
 中英对照（中文在前，English after）.
 
-## [0.6.11] - 2026-08-16
+## [0.6.12] - 2026-08-16
+
+- **降低键盘输入后的字符回显延迟。** 检测到真实按键发送后，对应会话会在短暂交互窗口内把终端刷新间隔从约 33 ms 降至约 8 ms，使本地 CMD、PowerShell、WSL 和低延迟 SSH 会话的逐字输入更跟手；停止输入后自动恢复原有日志流限速，滚屏阅读仍使用低频刷新。
+- **Reduce character-echo latency after keyboard input.** After a real key is sent, the corresponding session temporarily lowers its terminal refresh interval from roughly 33 ms to 8 ms, making typing in local CMD, PowerShell, WSL, and low-latency SSH sessions feel more immediate. It automatically returns to the existing firehose throttle when typing stops, while scrolled-back views retain their lower refresh rate.
+
+- **自动格式化并分类着色 JSON 输出（#350）。** 终端现在只对占据完整一行、能够正确解析的 JSON 对象或数组进行缩进展开，并分别着色键、字符串、数字、布尔值和 `null`；已有 ANSI SGR 颜色会先安全归一化，提示符、半截 JSON、标量以及包含光标控制的输出保持原样。可在“设置 → 输出高亮”中关闭。
+- **Automatically format and syntax-colour JSON output (#350).** The terminal now pretty-prints only complete, whole-line JSON objects or arrays and assigns distinct colours to keys, strings, numbers, booleans, and `null`. Existing ANSI SGR colours are safely normalized first, while prompts, partial JSON, scalars, and cursor-controlled output remain untouched. The behavior can be disabled under Settings → Output Highlighting.
+
+- **支持双击标签复制连接（#340）。** 双击任意终端会话标签会创建一条独立的新连接，与右键“复制连接”一致；欢迎页标签不会被复制，现有单击选择和拖动排序/分屏行为保持不变。
+- **Support duplicating connections by double-clicking tabs (#340).** Double-clicking any terminal session tab now opens an independent duplicate connection, matching the context-menu action. The Welcome tab is excluded, and existing single-click selection plus drag reorder/split behavior remain unchanged.
+
+- **完善多标签导航并在隐藏运行状态时暂停采样（#340）。** 标签栏右侧新增全部会话下拉列表，可从大量已打开标签中直接定位并切换；收起运行状态面板或开启专注模式后，本地 `sysinfo` 采样和 SSH 远端资源/进程监控会暂停，重新展开时自动恢复，避免隐藏面板继续消耗本机与服务器资源。
+- **Complete crowded-tab navigation and pause hidden status sampling (#340).** The tab bar now provides an all-sessions dropdown for locating and switching among many open tabs. Collapsing the status panel or enabling Zen mode pauses local `sysinfo` sampling plus remote SSH resource/process monitoring, and expanding it resumes monitoring automatically so hidden UI no longer consumes local or server resources.
+
+- **命令栏新增历史命令自动提示（#349）。** 输入命令时会自动筛选并向上展示曾执行过的匹配命令，可用方向键选择、Tab 补全、Esc 关闭；原有的历史按钮、`Ctrl+R` 搜索、复制、删除和直接运行功能保持不变，且无需修改远端 Shell 配置。
+- **Add command-history autocomplete to the command bar (#349).** Typing now filters previously executed commands into an upward suggestion list with arrow-key selection, Tab completion, and Esc dismissal. Existing history-button and `Ctrl+R` search, copy, delete, and run actions remain available, with no remote shell configuration required.
+
+- **快捷命令支持手动排序（#310）。** 管理列表中的每条命令新增上移/下移按钮，可在当前分组内调整并持久化顺序；不同分组不会被意外交叉，现有 GUI 编辑、分组和滚动管理方式保持不变。
+- **Support manual quick-command ordering (#310).** Each command in the management list now has move-up and move-down controls that persist its order within the current group. Commands never cross group boundaries accidentally, and the existing GUI editing, grouping, and scrollable management remain intact.
+
+- **完善快捷命令 GUI 管理（#310）。** 管理窗口现在可通过右下角拖动放大，并默认提供更宽、更高的工作区；命令编辑框支持多行内容，长列表仍可滚动，配合组内上移/下移即可在不编辑配置文件的情况下完成批量整理。
+- **Complete the quick-command GUI manager (#310).** The manager can now be enlarged from its bottom-right resize grip and opens with a wider, taller workspace. Its command editor accepts multiline content, long lists remain scrollable, and in-group move controls allow bulk organization without editing configuration files.
+
+- **修复右键内置 WSL/PowerShell/CMD 时显示空白菜单（#336）。** 内置会话没有编辑、移动或删除操作，因此不再打开所有项目均被隐藏的右键弹窗；普通保存会话的上下文菜单保持不变。
+- **Fix the blank context menu on built-in WSL/PowerShell/CMD rows (#336).** Built-in sessions have no edit, move, or delete actions, so they no longer open a popup whose items are all hidden. Context menus for regular saved sessions are unchanged.
+
+- **支持配置多个 WSL 启动项和默认目录（#336）。** Windows 设置新增 WSL 页面，可添加多个命名启动项、指定发行版，并通过目录选择器或直接粘贴路径设置启动目录；目录留空时统一回退到 `~`，因此默认进入所选 Linux 用户的主目录。旧配置继续显示原有的默认 WSL 入口。
+- **Support multiple WSL entries and startup directories (#336).** Settings on Windows now include a WSL page for adding named launch entries, selecting a distribution, and choosing or pasting a startup directory. Blank directories consistently fall back to `~`, opening the selected Linux user's home, while existing configurations retain the original default WSL entry.
+
+- **彻底修复切换“欢迎页设为侧栏”时闪退（#323）。** 设置开关不再在自身回调栈内修改双向绑定并同步销毁 Welcome/设置组件树；属性应用、配置保存和分屏刷新现在整体延迟到下一次界面事件循环，覆盖 0.6.11 中仍可复现的 Windows 闪退及错误配置导致的后续启动问题。
+- **Fully fix crashes when toggling “Welcome page as sidebar” (#323).** The settings switch no longer changes its two-way binding and synchronously destroys the Welcome/settings component tree from inside its own callback. Property application, persistence, and pane refresh are now deferred together to the next UI turn, covering the Windows crash still reproducible in 0.6.11 and the resulting bad-startup state.
+
+- **优化侧栏快速连接的服务器信息显示（#339）。** 窄侧栏中的会话行改为两行紧凑布局，首行显示名称，次行始终显示 `用户@主机:端口`，避免固定宽度列把 IP 地址裁出可视区域；完整欢迎页继续保留原来的分栏布局。
+- **Improve server details in the Quick Connect sidebar (#339).** Session rows in the narrow sidebar now use a compact two-line layout with the name first and `user@host:port` always visible beneath it, preventing fixed-width columns from clipping the IP address. The full Welcome page retains its existing column layout.
+
+- **SSH config 导入支持 `Include`（#341）。** 导入 `~/.ssh/config` 时会在指令原位置递归读取包含文件，支持 `~`、相对 `~/.ssh` 的路径和 glob，并通过循环检测与深度上限避免恶意或误配置的递归引用。
+- **Support `Include` while importing SSH config (#341).** Importing `~/.ssh/config` now recursively expands included files at the directive position, supports `~`, paths relative to `~/.ssh`, and globs, and guards against cyclic or excessively deep include chains.
+
+- **防止不同服务器的同名文件在外部编辑时互相覆盖（#318）。** 外部打开/编辑使用按连接隔离的临时目录，并在本地文件名中加入服务器地址；编辑监视器会把修改上传到原始远端完整路径，而不再从带前缀的临时文件名推导目标，因此同时编辑多台服务器上的 `nginx.conf` 不会共用文档或传错服务器。
+- **Prevent same-named files from different servers colliding during external editing (#318).** External open/edit now uses a connection-isolated temporary directory and includes the server address in the local filename. The edit watcher uploads changes to the exact original remote path instead of deriving a target from the prefixed temp name, so concurrent `nginx.conf` edits across servers cannot share a document or upload to the wrong server.
+
+- **修复 Windows 右键打开终端查找时闪退（#343）。** 从右键菜单创建查找栏时，输入框现在会等弹窗点击事件和首轮布局完成后再获取焦点，避免 Windows 的 IME/无障碍焦点处理重入 Slint 运行时；`Ctrl+F` 与右键“查找”仍会自动聚焦搜索框。
+- **Fix the Windows crash when opening terminal Find from the context menu (#343).** When the find bar is created from the right-click menu, its input now waits for popup event dispatch and the first layout pass to finish before taking focus, avoiding re-entry into Slint through Windows IME/accessibility focus handling. Both `Ctrl+F` and right-click → Find still focus the search field automatically.
 
 - **SSH 终端支持多字符集（#338）。** 会话高级设置新增字符集选择，可使用 UTF-8、GBK（兼容 GB2312）、Big5、Shift_JIS、EUC-KR 和 Windows-1252；远端输出与键盘输入/粘贴会在 SSH PTY 边界双向转码，并通过有状态解码正确处理跨网络包拆分的多字节字符。旧会话继续默认使用 UTF-8。
 - **Support multiple character encodings in SSH terminals (#338).** Session advanced settings now offer UTF-8, GBK (including GB2312), Big5, Shift_JIS, EUC-KR, and Windows-1252. Remote output and keyboard/paste input are transcoded bidirectionally at the SSH PTY boundary, with stateful decoding for multibyte characters split across network packets. Existing sessions continue to default to UTF-8.

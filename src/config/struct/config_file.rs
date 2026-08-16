@@ -2,6 +2,20 @@ use serde::{Deserialize, Serialize};
 
 use super::{OutputHighlightRule, QuickCommand, Secret, Session};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WslProfile {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub distribution: String,
+    #[serde(default = "default_wsl_home")]
+    pub directory: String,
+}
+
+fn default_wsl_home() -> String {
+    "~".to_string()
+}
+
 /// Ships with the "幻想 3048" sci-fi wallpaper on by default (a dark theme). New
 /// installs and users upgrading from before the wallpaper feature get it; once
 /// the user picks anything (including "无"/none, stored as ""), their choice is
@@ -52,6 +66,10 @@ pub(crate) fn default_quick_panel_height() -> f32 {
 pub struct ConfigFile {
     #[serde(default)]
     pub sessions: Vec<Session>,
+    /// User-managed WSL launch entries. An empty list keeps the implicit default
+    /// WSL entry for backwards compatibility.
+    #[serde(default)]
+    pub wsl_profiles: Vec<WslProfile>,
     /// Preset SFTP download directory. Empty = ask each time.
     #[serde(default)]
     pub download_dir: String,
@@ -93,6 +111,10 @@ pub struct ConfigFile {
     /// User-defined rules applied before the selected built-in preset.
     #[serde(default)]
     pub output_highlight_rules: Vec<OutputHighlightRule>,
+    /// Stored inverted so complete JSON lines are formatted and syntax-coloured
+    /// by default while still allowing users to preserve byte-for-byte display.
+    #[serde(default)]
+    pub json_format_disabled: bool,
     /// Global UI scale in percent (#100). 0 = default (100%).
     #[serde(default)]
     pub ui_scale: u32,

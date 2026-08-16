@@ -733,6 +733,14 @@ impl ConfigStore {
         self.cache.output_highlight_disabled = !enabled;
     }
 
+    pub fn json_format_output(&self) -> bool {
+        !self.cache.json_format_disabled
+    }
+
+    pub fn set_json_format_output(&mut self, enabled: bool) {
+        self.cache.json_format_disabled = !enabled;
+    }
+
     /// Selected built-in rule set. Unknown values safely fall back to the
     /// conservative log-level preset for forward/backward compatibility.
     pub fn output_highlight_preset(&self) -> &str {
@@ -809,6 +817,30 @@ impl ConfigStore {
 
     pub fn set_quick_commands(&mut self, cmds: Vec<QuickCommand>) {
         self.cache.quick_commands = cmds;
+    }
+
+    pub fn wsl_profiles(&self) -> &[WslProfile] {
+        &self.cache.wsl_profiles
+    }
+
+    pub fn add_wsl_profile(&mut self, name: String, distribution: String, directory: String) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.cache.wsl_profiles.push(WslProfile {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            distribution: distribution.trim().to_string(),
+            directory: match directory.trim() {
+                "" => "~".to_string(),
+                value => value.to_string(),
+            },
+        });
+    }
+
+    pub fn remove_wsl_profile(&mut self, id: &str) {
+        self.cache.wsl_profiles.retain(|profile| profile.id != id);
     }
 
     pub fn quick_panel_open(&self) -> bool {
@@ -1850,11 +1882,14 @@ mod tests {
     fn output_highlight_defaults_and_preset_validation() {
         let mut store = temp_store();
         assert!(store.output_highlight_enabled());
+        assert!(store.json_format_output());
         assert_eq!(store.output_highlight_preset(), "log");
 
         store.set_output_highlight_enabled(false);
         store.set_output_highlight_preset("devops".to_string());
         assert!(!store.output_highlight_enabled());
+        store.set_json_format_output(false);
+        assert!(!store.json_format_output());
         assert_eq!(store.output_highlight_preset(), "devops");
 
         store.set_output_highlight_preset("future-preset".to_string());
