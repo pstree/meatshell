@@ -1,5 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::ui::TermSpan;
@@ -28,18 +27,6 @@ pub(crate) struct TermBuffer {
     pub(crate) csi_state: CsiState,
     pub(crate) csi_pending: Vec<u8>,
     pub(crate) raw: VecDeque<u8>,
-    /// Ctrl+C was just sent: drop sustained firehose batches until a small
-    /// batch (the ^C echo / fresh prompt) marks the end of the flood.
-    pub(crate) interrupt_drop: AtomicBool,
-    /// Highlight-cache version. Bumped whenever the highlight configuration
-    /// (dark mode, preset, custom rules) changes so stale cached lines are
-    /// discarded once. (qian branch feature)
-    pub(crate) hl_version: u64,
-    /// The `hl_version` the current `hl_cache` was built under.
-    pub(crate) hl_cache_version: u64,
-    /// LRU-ish cache of highlighted runs keyed by a stable hash of the plain
-    /// text, bounded by `HL_CACHE_CAP`.
-    pub(crate) hl_cache: HashMap<u64, Arc<Vec<HistSpan>>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]

@@ -246,9 +246,7 @@ pub(super) fn apply_dark_mode(window: &AppWindow, bufs: &TermBuffers, dark: bool
     {
         let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
         for h in handles {
-            let mut b = h.lock().unwrap();
-            b.is_dark = dark;
-            b.hl_version = b.hl_version.wrapping_add(1);
+            h.lock().unwrap().is_dark = dark;
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
@@ -267,9 +265,7 @@ pub(super) fn apply_output_highlight(
     {
         let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
         for handle in handles {
-            let mut b = handle.lock().unwrap();
-            b.output_highlight = mode;
-            b.hl_version = b.hl_version.wrapping_add(1);
+            handle.lock().unwrap().output_highlight = mode;
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
@@ -287,9 +283,7 @@ pub(super) fn apply_custom_output_rules(
     {
         let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
         for handle in handles {
-            let mut b = handle.lock().unwrap();
-            b.custom_highlight_rules = compiled.clone();
-            b.hl_version = b.hl_version.wrapping_add(1);
+            handle.lock().unwrap().custom_highlight_rules = compiled.clone();
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();

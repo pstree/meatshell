@@ -214,7 +214,6 @@ fn restore_user_backup_if_needed(primary_dir: &Path, backup_dir: &Path) {
     }
 }
 
-
 fn normalize_hex_color(value: &str) -> Option<String> {
     let digits = value.trim().strip_prefix('#').unwrap_or(value.trim());
     if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -284,7 +283,6 @@ fn migrate_defaults(cfg: &mut ConfigFile) -> bool {
     true
 }
 
-
 fn normalize_highlight_color(color: &str) -> &'static str {
     match color {
         "yellow" => "yellow",
@@ -295,7 +293,6 @@ fn normalize_highlight_color(color: &str) -> &'static str {
         _ => "red",
     }
 }
-
 
 /// Remove duplicate entries in place, keeping the *last* (most recent)
 /// occurrence of each and preserving relative order (#113). The list is capped
@@ -331,6 +328,15 @@ fn normalize_reserved_session_groups(cfg: &mut ConfigFile) -> bool {
         }
     }
     changed
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn normalize_macos_renderer_mode(mode: &str) -> &'static str {
+    match mode {
+        "femtovg" => "femtovg",
+        "skia" => "skia",
+        _ => "software",
+    }
 }
 
 impl ConfigStore {
@@ -568,10 +574,7 @@ impl ConfigStore {
     /// Renderer preference for the current platform.
     #[cfg(target_os = "macos")]
     pub fn renderer_mode(&self) -> &str {
-        match self.cache.renderer_mode.as_str() {
-            "skia" => "skia",
-            _ => "femtovg",
-        }
+        normalize_macos_renderer_mode(&self.cache.renderer_mode)
     }
 
     /// Missing and invalid Windows values deliberately use software so upgrades
@@ -587,10 +590,7 @@ impl ConfigStore {
 
     #[cfg(target_os = "macos")]
     pub fn set_renderer_mode(&mut self, mode: String) {
-        self.cache.renderer_mode = match mode.as_str() {
-            "skia" => "skia".into(),
-            _ => "femtovg".into(),
-        };
+        self.cache.renderer_mode = normalize_macos_renderer_mode(&mode).into();
     }
 
     /// Linux previously used Slint's automatic renderer selection and had no
@@ -642,6 +642,43 @@ impl ConfigStore {
 
     pub fn set_font_size(&mut self, size: u32) {
         self.cache.font_size = size.clamp(8, 32);
+    }
+
+    pub fn terminal_line_spacing(&self) -> f32 {
+        let value = self.cache.terminal_line_spacing;
+        if value <= 0.0 {
+            1.0
+        } else {
+            value.clamp(0.8, 1.5)
+        }
+    }
+
+    pub fn set_terminal_line_spacing(&mut self, value: f32) {
+        self.cache.terminal_line_spacing = value.clamp(0.8, 1.5);
+    }
+
+    pub fn paste_confirm_enabled(&self) -> bool {
+        !self.cache.paste_confirm_disabled
+    }
+
+    pub fn set_paste_confirm_enabled(&mut self, enabled: bool) {
+        self.cache.paste_confirm_disabled = !enabled;
+    }
+
+    pub fn extra_paste_shortcuts_enabled(&self) -> bool {
+        !self.cache.extra_paste_shortcuts_disabled
+    }
+
+    pub fn set_extra_paste_shortcuts_enabled(&mut self, enabled: bool) {
+        self.cache.extra_paste_shortcuts_disabled = !enabled;
+    }
+
+    pub fn zen_mode(&self) -> bool {
+        self.cache.zen_mode
+    }
+
+    pub fn set_zen_mode(&mut self, enabled: bool) {
+        self.cache.zen_mode = enabled;
     }
 
     /// Force regular terminal text to render with a bold face (#262).
@@ -1052,17 +1089,6 @@ impl ConfigStore {
     pub fn set_sftp_panel_width(&mut self, v: f32) {
         self.cache.sftp_panel_width = v;
     }
-    pub fn sftp_tree_width(&self) -> f32 {
-        let w = self.cache.sftp_tree_width;
-        if w <= 0.0 {
-            default_sftp_tree_width()
-        } else {
-            w
-        }
-    }
-    pub fn set_sftp_tree_width(&mut self, v: f32) {
-        self.cache.sftp_tree_width = v;
-    }
     pub fn sftp_panel_height(&self) -> f32 {
         let h = self.cache.sftp_panel_height;
         if h <= 0.0 {
@@ -1073,6 +1099,17 @@ impl ConfigStore {
     }
     pub fn set_sftp_panel_height(&mut self, v: f32) {
         self.cache.sftp_panel_height = v;
+    }
+    pub fn sftp_tree_width(&self) -> f32 {
+        let width = self.cache.sftp_tree_width;
+        if width <= 0.0 {
+            default_sftp_tree_width()
+        } else {
+            width.clamp(120.0, 420.0)
+        }
+    }
+    pub fn set_sftp_tree_width(&mut self, width: f32) {
+        self.cache.sftp_tree_width = width.clamp(120.0, 420.0);
     }
     pub fn sftp_dock(&self) -> String {
         let d = self.cache.sftp_dock.trim();
@@ -1606,7 +1643,12 @@ mod tests {
         default_session.group = "Default".into();
         let mut cfg = ConfigFile {
             sessions: vec![system_session, default_session],
-            groups: vec!["system".into(), "System".into(), "default".into(), "prod".into()],
+            groups: vec![
+                "system".into(),
+                "System".into(),
+                "default".into(),
+                "prod".into(),
+            ],
             collapsed_session_groups: Some(vec!["system".into(), "prod".into()]),
             ..ConfigFile::default()
         };
@@ -1658,20 +1700,31 @@ mod tests {
     }
 
     #[test]
+    fn macos_renderer_mode_defaults_to_cpu_and_preserves_gpu_choices() {
+        assert_eq!(normalize_macos_renderer_mode(""), "software");
+        assert_eq!(normalize_macos_renderer_mode("software"), "software");
+        assert_eq!(normalize_macos_renderer_mode("femtovg"), "femtovg");
+        assert_eq!(normalize_macos_renderer_mode("skia"), "skia");
+        assert_eq!(normalize_macos_renderer_mode("unexpected"), "software");
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn renderer_mode_uses_macos_backends_and_validates() {
         let mut store = temp_store();
-        assert_eq!(store.renderer_mode(), "femtovg");
+        assert_eq!(store.renderer_mode(), "software");
 
         store.set_renderer_mode("skia".into());
         assert_eq!(store.renderer_mode(), "skia");
         store.set_renderer_mode("femtovg".into());
         assert_eq!(store.renderer_mode(), "femtovg");
+        store.set_renderer_mode("software".into());
+        assert_eq!(store.renderer_mode(), "software");
         store.set_renderer_mode("unexpected".into());
-        assert_eq!(store.renderer_mode(), "femtovg");
+        assert_eq!(store.renderer_mode(), "software");
 
         store.cache = serde_json::from_str("{}").expect("legacy config must deserialize");
-        assert_eq!(store.renderer_mode(), "femtovg");
+        assert_eq!(store.renderer_mode(), "software");
     }
 
     #[test]
@@ -1895,5 +1948,29 @@ mod tests {
         let _ = std::fs::remove_file(&export_path);
         let _ = std::fs::remove_file(&a.path);
         let _ = std::fs::remove_file(&b.path);
+    }
+
+    #[test]
+    fn issue_300_interface_defaults_and_ranges_are_safe() {
+        let mut store = temp_store();
+
+        // Legacy configs keep the safe confirmation and familiar paste aliases.
+        store.cache = serde_json::from_str("{}").unwrap();
+        assert!(store.paste_confirm_enabled());
+        assert!(store.extra_paste_shortcuts_enabled());
+        assert!(!store.zen_mode());
+        assert_eq!(store.terminal_line_spacing(), 1.0);
+
+        store.set_terminal_line_spacing(0.1);
+        assert_eq!(store.terminal_line_spacing(), 0.8);
+        store.set_terminal_line_spacing(9.0);
+        assert_eq!(store.terminal_line_spacing(), 1.5);
+
+        store.set_paste_confirm_enabled(false);
+        store.set_extra_paste_shortcuts_enabled(false);
+        store.set_zen_mode(true);
+        assert!(!store.paste_confirm_enabled());
+        assert!(!store.extra_paste_shortcuts_enabled());
+        assert!(store.zen_mode());
     }
 }

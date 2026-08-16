@@ -1,5 +1,43 @@
 use super::*;
 
+fn choose_download_conflict(remote: &str, local_dir: &str) -> Option<DownloadConflict> {
+    let target = download_target_path(remote, local_dir);
+    if !target.is_file() {
+        return Some(DownloadConflict::Replace);
+    }
+    let replace = t("替换", "Replace");
+    let keep_both = t("共存", "Keep both");
+    let cancel = t("取消", "Cancel");
+    let result = rfd::MessageDialog::new()
+        .set_title(t("文件已存在", "File already exists"))
+        .set_description(format!(
+            "{}\n{}",
+            target.display(),
+            t(
+                "请选择替换现有文件，或保留两份文件。",
+                "Choose whether to replace the existing file or keep both files."
+            )
+        ))
+        .set_level(rfd::MessageLevel::Warning)
+        .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+            replace.to_string(),
+            keep_both.to_string(),
+            cancel.to_string(),
+        ))
+        .show();
+    match result {
+        rfd::MessageDialogResult::Yes => Some(DownloadConflict::Replace),
+        rfd::MessageDialogResult::No => Some(DownloadConflict::KeepBoth),
+        rfd::MessageDialogResult::Custom(value) if value == replace => {
+            Some(DownloadConflict::Replace)
+        }
+        rfd::MessageDialogResult::Custom(value) if value == keep_both => {
+            Some(DownloadConflict::KeepBoth)
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn wire_sftp_callbacks(
     window: &AppWindow,
     sftp_handles: SftpHandles,
@@ -100,8 +138,10 @@ pub(super) fn wire_sftp_callbacks(
                     if let Some(h) = handles.get(&tab_id) {
                         if let Some(ref dir) = arc_dir {
                             h.download_archive(dir.clone(), arc_names.clone(), preset);
-                        } else {
-                            h.download(remote_path, preset);
+                        } else if let Some(conflict) =
+                            choose_download_conflict(&remote_path, &preset)
+                        {
+                            h.download(remote_path, preset, conflict);
                         }
                         // Pop the transfers panel so progress is visible (user
                         // request: any download opens the download popup).
@@ -121,8 +161,10 @@ pub(super) fn wire_sftp_callbacks(
                         if let Some(h) = handles.get(&tab_id) {
                             if let Some(ref rdir) = arc_dir {
                                 h.download_archive(rdir.clone(), arc_names.clone(), local_dir);
-                            } else {
-                                h.download(remote_path, local_dir);
+                            } else if let Some(conflict) =
+                                choose_download_conflict(&remote_path, &local_dir)
+                            {
+                                h.download(remote_path, local_dir, conflict);
                             }
                         }
                     }
@@ -364,7 +406,11 @@ pub(super) fn wire_sftp_callbacks(
                 if let Ok(handles) = sftp_handles.lock() {
                     if let Some(h) = handles.get(tab_id.as_str()) {
                         if single {
-                            h.download(paths[0].clone(), preset.clone());
+                            if let Some(conflict) =
+                                choose_download_conflict(&paths[0], &preset)
+                            {
+                                h.download(paths[0].clone(), preset.clone(), conflict);
+                            }
                         } else {
                             h.download_archive(remote_dir.clone(), names.clone(), preset.clone());
                         }
@@ -381,7 +427,11 @@ pub(super) fn wire_sftp_callbacks(
                         if let Ok(handles) = sftp_handles.lock() {
                             if let Some(h) = handles.get(&tab) {
                                 if single {
-                                    h.download(paths[0].clone(), dir.clone());
+                                    if let Some(conflict) =
+                                        choose_download_conflict(&paths[0], &dir)
+                                    {
+                                        h.download(paths[0].clone(), dir.clone(), conflict);
+                                    }
                                 } else {
                                     h.download_archive(
                                         remote_dir.clone(),
@@ -631,104 +681,7 @@ pub(super) fn wire_sftp_callbacks(
         window.on_editor_recount(move |text: SharedString| {
             if let Some(w) = weak.upgrade() {
                 w.set_editor_line_numbers(line_numbers_for(text.as_str()).into());
-                update_editor_text_layers(&w, text.as_str());
             }
-        });
-    }
-
-    // Replace any tab characters with 4 spaces (Slint's TextInput can't
-    // render 0x09 — it shows as a tofu box). Called from edited so the
-    // cursor briefly sits on the tab then immediately lands on spaces.
-    {
-        let weak = window.as_weak();
-        window.on_editor_replace_tabs(move || {
-            if let Some(w) = weak.upgrade() {
-                let content = w.get_editor_content().to_string();
-                if !content.contains('\t') {
-                    return;
-                }
-                let new = content.replace('\t', "    ");
-                let line_numbers = line_numbers_for(&new);
-                w.set_editor_content(new.clone().into());
-                w.set_editor_line_numbers(line_numbers.into());
-                update_editor_text_layers(&w, &new);
-            }
-        });
-    }
-
-    // --- Editor find / replace (Ctrl+F) --------------------------------------
-    // Slint can't search strings or measure UTF-8 byte length, so the heavy
-    // lifting lives here. The find panel stores match offsets + current index
-    // in Slint; Rust only (a) computes matches, (b) measures byte length, and
-    // (c) performs the actual text mutation for Replace / Replace All.
-
-    // Pure: every byte offset where `query` occurs in `text` (ascending).
-    {
-        window.on_editor_search_matches(
-            move |text: SharedString, query: SharedString| {
-                ModelRc::from(Rc::new(VecModel::from(editor_find_offsets(
-                    text.as_str(),
-                    query.as_str(),
-                ))))
-            },
-        );
-    }
-
-    // Pure: UTF-8 byte length of a string. Used by Slint to set the selection
-    // end on the TextInput (selection offsets are byte-based in Slint).
-    {
-        window.on_editor_byte_length_of(move |s: SharedString| s.as_str().len() as i32);
-    }
-
-    // Pure: zero-based visual line index for a byte offset. Slint uses this to
-    // center the ScrollView on the active find match.
-    {
-        window.on_editor_line_index_at(move |text: SharedString, offset: i32| {
-            let off = offset.max(0) as usize;
-            text.as_str()[..off.min(text.len())]
-                .bytes()
-                .filter(|&b| b == b'\n')
-                .count() as i32
-        });
-    }
-
-    // Pure: number of logical lines in the text (newlines + 1). Slint divides
-    // the TextInput's `preferred-height` by this to measure the *actual* line
-    // height for the find-scroll math.
-    {
-        window.on_editor_line_count(move |text: SharedString| {
-            text.as_str().split('\n').count().max(1) as i32
-        });
-    }
-
-    // Replace every occurrence of the query with `replacement`. Uses Rust's
-    // `str::replace` (handles non-overlapping matches identically to the find
-    // loop). After writing the new content back, Slint refreshes the search.
-    {
-        let weak = window.as_weak();
-        window.on_editor_replace_all(move |replacement: SharedString| {
-            let Some(w) = weak.upgrade() else { return };
-            if w.get_editor_readonly() {
-                return;
-            }
-            let query = w.get_editor_find_query().to_string();
-            if query.is_empty() {
-                return;
-            }
-            let content = w.get_editor_content().to_string();
-            let new_content = content.replace(query.as_str(), replacement.as_str());
-            if new_content == content {
-                return;
-            }
-            w.set_editor_content(new_content.into());
-            w.set_editor_dirty(true);
-            let current_content = w.get_editor_content();
-            w.set_editor_line_numbers(line_numbers_for(current_content.as_str()).into());
-            update_editor_text_layers(&w, current_content.as_str());
-            // After replace-all all intended occurrences are gone. Clear the
-            // selection so the user doesn't see a spurious highlight.
-            w.set_editor_current_match(-1);
-            w.set_editor_highlight_trigger(w.get_editor_highlight_trigger() + 1);
         });
     }
 
@@ -753,14 +706,83 @@ pub(super) fn wire_sftp_callbacks(
             w.set_editor_dirty(false);
         });
     }
-    // Close the editor WITHOUT saving. Unsaved edits are discarded — the file
-    // is only written to the remote host when the user explicitly clicks Save.
+    // Closing the editor discards unsaved edits. Saving is an explicit action
+    // (button / Ctrl+S); silently uploading on X or Esc is surprising and can
+    // overwrite a remote file the user only meant to inspect (#287).
     {
         let weak = window.as_weak();
         window.on_close_editor(move || {
             let Some(w) = weak.upgrade() else { return };
             w.set_editor_open(false);
             w.set_editor_dirty(false);
+            w.set_editor_find_query("".into());
+            w.set_editor_replace_text("".into());
+            w.set_editor_match_count(0);
+            w.set_editor_find_position(-1);
+        });
+    }
+
+    // Built-in editor find/replace (#287). Keep matching literal and
+    // case-sensitive, which is predictable for configuration/source files.
+    window.on_editor_count_matches(|content: SharedString, query: SharedString| {
+        if query.is_empty() {
+            0
+        } else {
+            content
+                .matches(query.as_str())
+                .count()
+                .min(i32::MAX as usize) as i32
+        }
+    });
+    window.on_editor_find_step(
+        |content: SharedString, query: SharedString, current: i32, reverse: bool| {
+            if query.is_empty() {
+                return EditorFindResult {
+                    start: 0,
+                    end: 0,
+                    count: 0,
+                };
+            }
+            let positions: Vec<usize> = content
+                .match_indices(query.as_str())
+                .map(|(index, _)| index)
+                .collect();
+            let selected = if reverse {
+                positions
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|position| current < 0 || *position < current as usize)
+                    .or_else(|| positions.last().copied())
+            } else {
+                positions
+                    .iter()
+                    .copied()
+                    .find(|position| current < 0 || *position > current as usize)
+                    .or_else(|| positions.first().copied())
+            };
+            let start = selected.unwrap_or(0).min(i32::MAX as usize) as i32;
+            EditorFindResult {
+                start,
+                end: start.saturating_add(query.len().min(i32::MAX as usize) as i32),
+                count: positions.len().min(i32::MAX as usize) as i32,
+            }
+        },
+    );
+    {
+        let weak = window.as_weak();
+        window.on_editor_replace_all(move |query: SharedString, replacement: SharedString| {
+            let Some(w) = weak.upgrade() else { return };
+            if w.get_editor_readonly() || query.is_empty() {
+                return;
+            }
+            let replaced = w
+                .get_editor_content()
+                .replace(query.as_str(), replacement.as_str());
+            w.set_editor_content(replaced.clone().into());
+            w.set_editor_dirty(true);
+            w.set_editor_line_numbers(line_numbers_for(&replaced).into());
+            w.set_editor_match_count(0);
         });
     }
 }

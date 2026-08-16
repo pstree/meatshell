@@ -191,42 +191,6 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
                     continue;
                 }
 
-                // Ctrl+C interrupt handling (qian branch feature). Once a Ctrl+C
-                // is sent, large output batches (a real firehose, e.g.
-                // `tail -n 1000000`) are discarded so the terminal stops
-                // scrolling instead of replaying the whole pre-read stream.
-                // Small batches — the `^C` echo and the shell's fresh prompt that
-                // the keystroke itself produces — are kept, so repeated Ctrl+C at
-                // an idle prompt still shows a newline + prompt. The trigger stays
-                // set until a small batch is seen, which marks the end of the
-                // firehose (the process was interrupted).
-                let triggered = bufs_thread.lock().ok().and_then(|m| {
-                    m.get(&tab_id_pump)
-                        .and_then(|h| h.lock().ok())
-                        .map(|b| b.interrupt_drop.load(std::sync::atomic::Ordering::SeqCst))
-                });
-                if triggered.unwrap_or(false) {
-                    let batch_bytes: usize = ui_batch
-                        .iter()
-                        .map(|e| match e {
-                            SessionEvent::Output(s) => s.len(),
-                            _ => 0,
-                        })
-                        .sum();
-                    if batch_bytes >= CTRL_C_DROP_THRESHOLD {
-                        // Sustained firehose: discard this batch's output only.
-                        ui_batch.retain(|e| !matches!(e, SessionEvent::Output(_)));
-                    } else if let Ok(m) = bufs_thread.lock() {
-                        // Small batch = the Ctrl+C echo/prompt (or end of flood):
-                        // keep it and stop discarding.
-                        if let Some(h) = m.get(&tab_id_pump) {
-                            if let Ok(b) = h.lock() {
-                                b.interrupt_drop.store(false, std::sync::atomic::Ordering::SeqCst);
-                            }
-                        }
-                    }
-                }
-
                 // Ingest terminal output on this pump thread (not the UI thread).
                 // Keep each Output event atomic: TermBuffer detects full-screen
                 // redraw sequences within one ingest call, so artificial byte

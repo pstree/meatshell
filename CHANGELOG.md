@@ -3,7 +3,31 @@
 All notable changes are documented here. 本文件记录所有重要变更。
 中英对照（中文在前，English after）.
 
-## [Unreleased]
+## [0.6.11] - 2026-08-16
+
+- **SSH 终端支持多字符集（#338）。** 会话高级设置新增字符集选择，可使用 UTF-8、GBK（兼容 GB2312）、Big5、Shift_JIS、EUC-KR 和 Windows-1252；远端输出与键盘输入/粘贴会在 SSH PTY 边界双向转码，并通过有状态解码正确处理跨网络包拆分的多字节字符。旧会话继续默认使用 UTF-8。
+- **Support multiple character encodings in SSH terminals (#338).** Session advanced settings now offer UTF-8, GBK (including GB2312), Big5, Shift_JIS, EUC-KR, and Windows-1252. Remote output and keyboard/paste input are transcoded bidirectionally at the SSH PTY boundary, with stateful decoding for multibyte characters split across network packets. Existing sessions continue to default to UTF-8.
+
+- **修复通过命令栏启动 `top`、`iftop` 等程序后 `q` 难以退出（#345）。** 命令框、快捷命令和历史记录的所有“立即执行”入口现在会在发送命令后把键盘焦点安全地交还终端，因此后续 `q`、方向键及其他交互按键会直接到达远端 TUI；仅填充但不执行命令时仍保留输入框焦点。
+- **Fix `q` not exiting `top`, `iftop`, and similar programs launched from the command bar (#345).** Every immediate-execution path—command input, quick commands, and history—now safely returns keyboard focus to the terminal after sending, so `q`, arrows, and other interactive keys reach the remote TUI. Filling a command without executing it still keeps focus in the input field.
+
+- **支持在设置中关闭多行粘贴确认（#346）。** 多行粘贴安全提示默认开启；用户可在“设置 → 界面 → 确认多行粘贴”中持久化关闭或重新开启。超过 100 KiB 的超大粘贴始终强制确认。
+- **Allow disabling multiline-paste confirmation in Settings (#346).** The safety prompt remains enabled by default and can be persistently disabled or re-enabled under Settings → Interface → Confirm multiline paste. Pastes over 100 KiB always require review.
+
+- **修复 macOS 使用 `Ctrl+Space` 切换输入法时误删字符（#348）。** 部分 macOS 输入法会把裸 Control 错误上报为 `U+0008`；该标记现在仅在 macOS 输入边界被过滤，不再作为 Backspace 发送到终端。Windows、Linux 及真正由最终字母事件生成的 Ctrl+H 不受影响。
+- **Fix character deletion when switching macOS input methods with `Ctrl+Space` (#348).** Some macOS input methods report bare Control as `U+0008`; that marker is now filtered only at the macOS input boundary instead of being sent as Backspace. Windows, Linux, and genuine Ctrl+H generated from the final letter event remain unchanged.
+
+- **彻底阻止 zsh 泄漏 shell integration 初始化命令（#344）。** 不再依赖回显文本形态、软换行或 16 KiB 容量上限来判断初始化结束；注入命令现在输出专用的不可见完成标记，客户端在收到标记前持续隐藏并滚动丢弃内部回显。zsh/ZLE 即使反复重绘长命令也不会再把 `test -z "$FISH_VERSION" ...` 放到终端首屏，同时缓冲内存保持有界。
+- **Reliably prevent zsh shell-integration setup leaks (#344).** Setup completion no longer depends on echoed text shape, soft wrapping, or a 16 KiB threshold. The injected command now emits a private invisible completion marker, while the client hides and rolls over internal echo until that marker arrives. Repeated zsh/ZLE redraws can no longer expose `test -z "$FISH_VERSION" ...`, and buffering remains bounded.
+
+- **修复 macOS 无法在文件选择器中选择无扩展名 OpenSSH 私钥的问题（#325）。** macOS 的私钥浏览器不再按扩展名过滤，因此可直接选择 `~/.ssh/id_ed25519`、`id_rsa` 等标准无扩展名私钥；Windows 和 Linux 保持原有文件过滤行为。
+- **Fix selecting extensionless OpenSSH private keys on macOS (#325).** The macOS private-key picker no longer filters by extension, allowing standard files such as `~/.ssh/id_ed25519` and `id_rsa` to be selected directly. Windows and Linux retain their existing file filters.
+
+- **完善 macOS `Ctrl+X` 修复（#312）。** 真机日志确认部分 macOS 26.5 设备会在物理 Control 按住期间连续产生 `U+0017`（Ctrl+W）裸标记，导致 nano 在收到真正的 Ctrl+X 前先打开搜索。现在会一并过滤该设备相关标记，同时仍由组合键最后的字母事件生成真正的 Ctrl+W/Ctrl+X 控制码。
+- **Complete the macOS `Ctrl+X` fix (#312).** On-device logs confirmed that some macOS 26.5 systems repeatedly emit a bare `U+0017` (Ctrl+W) marker while physical Control is held, making nano open search before the real Ctrl+X arrives. That device-specific marker is now filtered while the chord's final letter event continues to generate genuine Ctrl+W/Ctrl+X bytes.
+
+- **macOS 新增 CPU 渲染并设为默认。** “设置 → 界面 → 渲染”现在可选择 CPU、FemtoVG 和 Skia；新安装及未保存渲染器偏好的配置默认使用 CPU 渲染，已有的 FemtoVG/Skia 明确选择保持不变。设置在重启 MeatShell 后生效，`SLINT_BACKEND` 环境变量仍具有最高优先级。
+- **Add CPU rendering on macOS and make it the default.** Settings → Interface → Rendering now offers CPU, FemtoVG, and Skia. New installations and configurations without a saved renderer preference default to CPU rendering, while explicit existing FemtoVG/Skia choices are preserved. Changes apply after restarting MeatShell, and `SLINT_BACKEND` keeps the highest priority.
 
 ## [0.6.10] - 2026-08-05
 

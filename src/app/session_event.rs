@@ -85,7 +85,9 @@ pub(super) fn apply_session_event_to_window(
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.state = 1;
             }
-            if win.get_active_tab_id().as_str() == tab_id {
+            if win.get_active_tab_id().as_str() == tab_id
+                && (sidebar_updates_visible(win) || win.get_system_info_window_open())
+            {
                 refresh_sidebar(win, statuses, local, local_net_hist);
             }
         }
@@ -115,7 +117,9 @@ pub(super) fn apply_session_event_to_window(
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.state = 2;
             }
-            if win.get_active_tab_id().as_str() == tab_id {
+            if win.get_active_tab_id().as_str() == tab_id
+                && (sidebar_updates_visible(win) || win.get_system_info_window_open())
+            {
                 refresh_sidebar(win, statuses, local, local_net_hist);
             }
         }
@@ -150,7 +154,9 @@ pub(super) fn apply_session_event_to_window(
                 let (_, rx, tx) = selected_iface(st);
                 push_ring(&mut st.net_hist, (rx + tx) as f32);
             }
-            if win.get_active_tab_id().as_str() == tab_id {
+            if win.get_active_tab_id().as_str() == tab_id
+                && (sidebar_updates_visible(win) || win.get_system_info_window_open())
+            {
                 refresh_sidebar(win, statuses, local, local_net_hist);
             }
         }
@@ -165,7 +171,7 @@ pub(super) fn apply_session_event_to_window(
                 st.procs = procs;
             }
             if win.get_active_tab_id().as_str() == tab_id {
-                refresh_sidebar(win, statuses, local, local_net_hist);
+                refresh_process_model(win, statuses);
             }
         }
         SessionEvent::TunnelUpdate(rows) => {
@@ -256,7 +262,6 @@ pub(super) fn apply_session_event_to_window(
             if error.is_empty() {
                 // Open the built-in viewer/editor (#70).
                 win.set_editor_line_numbers(line_numbers_for(&content).into());
-                update_editor_text_layers(&win, &content);
                 win.set_editor_path(path.into());
                 win.set_editor_name(name.into());
                 win.set_editor_content(content.into());

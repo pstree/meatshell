@@ -26,7 +26,6 @@ use super::structs::*;
 // SFTP-related shared types
 // ---------------------------------------------------------------------------
 
-
 pub(crate) fn load_session_private_key(session: &Session, pass: &str) -> Result<PrivateKey> {
     let pass = if pass.is_empty() { None } else { Some(pass) };
     let inline = session.private_key_inline.as_str().trim();
@@ -100,7 +99,8 @@ const ZMODEM_CANCEL: [u8; 16] = [
 const PROMPT_SETUP_PREFIX: &str = "test -z \"$FISH_VERSION\"";
 const PROMPT_SETUP_SUFFIX: &str = "__ms7'";
 const PROMPT_SETUP_HISTORY_MARKER: &str = "__MEATSHELL_INTERNAL_SETUP_1";
-const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; __msc; }; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; : __MEATSHELL_INTERNAL_SETUP_1; if [ -n \"$BASH_VERSION\" ]; then __md=\"$(history 2>/dev/null | { __md=\"\"; while read -r __mn __mr; do case \"$__mr\" in *\"__ms7()\"*\"PROMPT_COMMAND=\"*) __mn=\"${__mn%\\*}\"; __md=\"$__mn $__md\";; esac; done; printf \"%s\" \"$__md\"; })\"; for __mn in $__md; do history -d \"$__mn\" 2>/dev/null; done; unset __md __mn __mr; fi; __cl=\"$(fc -ln -1 2>/dev/null)\"; __ms7'";
+const PROMPT_SETUP_DONE: &str = "\u{1b}]699;ready\u{07}";
+const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; __msc; }; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; : __MEATSHELL_INTERNAL_SETUP_1; if [ -n \"$BASH_VERSION\" ]; then __md=\"$(history 2>/dev/null | { __md=\"\"; while read -r __mn __mr; do case \"$__mr\" in *\"__ms7()\"*\"PROMPT_COMMAND=\"*) __mn=\"${__mn%\\*}\"; __md=\"$__mn $__md\";; esac; done; printf \"%s\" \"$__md\"; })\"; for __mn in $__md; do history -d \"$__mn\" 2>/dev/null; done; unset __md __mn __mr; fi; __cl=\"$(fc -ln -1 2>/dev/null)\"; printf \"\\033]699;ready\\007\"; __ms7'";
 const PROMPT_SHELL_PROBE: &[u8] = b"if [ -n \"$BASH_VERSION\" ]; then printf '__MEATSHELL_SHELL__:bash\\n'; elif [ -n \"$ZSH_VERSION\" ]; then printf '__MEATSHELL_SHELL__:zsh\\n'; else printf '__MEATSHELL_SHELL__:other\\n'; fi";
 
 fn prompt_setup_supported(probe_output: &str) -> Option<bool> {
@@ -182,6 +182,7 @@ fn include_following_line_break(text: &str, mut pos: usize) -> usize {
     pos
 }
 
+#[cfg(test)]
 fn prompt_setup_echo_end(text: &str, prefix_pos: usize) -> usize {
     if let Some(rel) = text[prefix_pos..].find(PROMPT_SETUP_SUFFIX) {
         return include_following_line_break(text, prefix_pos + rel + PROMPT_SETUP_SUFFIX.len());
@@ -226,6 +227,30 @@ fn strip_pending_prompt_setup_echo(text: &mut String, pending: &mut bool) -> boo
     }
     *pending = false;
     true
+}
+
+/// Consume all buffered setup echo through the private completion marker.
+/// The marker is emitted by the executed command, unlike its printable escaped
+/// representation in the echoed input, so it remains reliable across zsh/ZLE
+/// redraws, wrapping, and arbitrary chunk boundaries (#344).
+fn take_after_prompt_setup_done(text: &mut String) -> Option<String> {
+    let marker = text.find(PROMPT_SETUP_DONE)?;
+    let tail = text.split_off(marker + PROMPT_SETUP_DONE.len());
+    text.clear();
+    Some(tail)
+}
+
+fn bound_prompt_setup_echo(text: &mut String) {
+    const KEEP_CHARS: usize = 64;
+    const MAX_BUFFER: usize = 64 * 1024;
+    if text.len() <= MAX_BUFFER {
+        return;
+    }
+    // Everything before the completion marker is private setup echo. Retain a
+    // short suffix only so a marker split across channel chunks still matches.
+    let mut tail: String = text.chars().rev().take(KEEP_CHARS).collect();
+    tail = tail.chars().rev().collect();
+    *text = tail;
 }
 
 /// Extract the remote path from an OSC 7 sequence embedded in `text`.
@@ -356,7 +381,6 @@ fn url_decode(s: &str) -> String {
     }
     result
 }
-
 
 async fn kill_remote_process(
     handle: Arc<Handle<ClientHandler>>,
@@ -1165,12 +1189,6 @@ async fn run_session(
     // True from injecting PROMPT_SETUP until the echoed setup line has been
     // received and stripped; output is buffered (not shown) during that window.
     let mut suppress_echo = false;
-    // Hard deadline for the suppression window. A non-POSIX shell (Windows
-    // pwsh/cmd) never runs our hook and so never echoes the OSC 7 we wait for —
-    // without this, output stayed hidden until a 16 KiB cap, leaving the terminal
-    // blank/"unusable" on Windows servers (#140-1). When the deadline passes we
-    // stop suppressing and show whatever arrived.
-    let mut suppress_deadline: Option<tokio::time::Instant> = None;
     // Buffers output while `suppress_echo` so the (long) echoed setup line can be
     // stripped even when it splits across reads (#98).
     let mut echo_buf = String::new();
@@ -1212,9 +1230,9 @@ async fn run_session(
     // command so a redrawn prompt (e.g. Enter on an empty line) doesn't re-emit
     // it, and is primed once up front so the pre-session history isn't replayed.
     //
-    // The echoed setup line is discarded by anchoring on the OSC 7 it produces
-    // (see the suppress block below), so it doesn't matter that the long line
-    // wraps — we never substring-match it.
+    // The echoed setup line is discarded through the private OSC 699 completion
+    // marker emitted after installation (see the suppress block below), so zsh
+    // redraws and soft wrapping cannot make the internal command visible.
     let prompt_setup = format!(" {}\r", PROMPT_BODY);
     // --- Remote resource monitor (separate exec channel) ----------------
     // A tiny remote loop streams /proc/stat + /proc/meminfo every 2s; we parse
@@ -1392,6 +1410,10 @@ async fn run_session(
     }
     emit_tunnel_update(&runtime_forwards, &events);
 
+    let mut terminal_decoder = crate::terminal::TerminalEncoding::new(&session.encoding);
+    let mut extended_decoder = crate::terminal::TerminalEncoding::new(&session.encoding);
+    let terminal_encoder = crate::terminal::TerminalEncoding::new(&session.encoding);
+
     // --- Main pump ------------------------------------------------------
     loop {
         tokio::select! {
@@ -1428,6 +1450,7 @@ async fn run_session(
                         // Only log the byte count — never the bytes themselves,
                         // which are raw keystrokes and may contain passwords (#15).
                         tracing::debug!("ssh channel.data len={} bytes", bytes.len());
+                        let bytes = terminal_encoder.encode(&bytes);
                         if let Err(err) = channel.data(&bytes[..]).await {
                             let _ = events.send(SessionEvent::Closed(format!("{}: {err}", t("写入失败", "write failed"))));
                             break;
@@ -1473,33 +1496,6 @@ async fn run_session(
                     }
                 }
             }
-            // Suppression safety net: if the injected hook hasn't echoed its OSC 7
-            // by the deadline, the remote shell isn't the POSIX one we injected for
-            // (e.g. Windows pwsh/cmd). Stop hiding output so the terminal is usable
-            // again; best-effort drop just the echoed setup line (#140-1).
-            _ = async {
-                match suppress_deadline {
-                    Some(d) => tokio::time::sleep_until(d).await,
-                    None => std::future::pending::<()>().await,
-                }
-            }, if suppress_echo => {
-                suppress_echo = false;
-                suppress_deadline = None;
-                let mut buf = std::mem::take(&mut echo_buf);
-                if let Some(p) = buf.find(PROMPT_SETUP_PREFIX) {
-                    let end = prompt_setup_echo_end(&buf, p);
-                    strip_prompt_setup_echo(&mut buf, p, end);
-                    late_prompt_echo_pending = false;
-                } else {
-                    // Nothing identifiable arrived before the deadline. Allow
-                    // one later setup echo to be removed, then permanently
-                    // disable the special-case stripping for this session.
-                    late_prompt_echo_pending = true;
-                }
-                if !buf.is_empty() {
-                    let _ = events.send(SessionEvent::Output(buf));
-                }
-            }
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
@@ -1518,8 +1514,7 @@ async fn run_session(
                                     // run them through the normal output path so
                                     // the prompt shows and the cwd updates.
                                     if !leftover.is_empty() {
-                                        let text =
-                                            String::from_utf8_lossy(&leftover).into_owned();
+                                        let text = terminal_decoder.decode(&leftover);
                                         if let Some(cwd) = extract_osc7_path(&text) {
                                             let _ =
                                                 events.send(SessionEvent::CwdChanged(cwd));
@@ -1539,7 +1534,7 @@ async fn run_session(
                             continue;
                         }
 
-                        let chunk = String::from_utf8_lossy(&data).into_owned();
+                        let chunk = terminal_decoder.decode(&data);
 
                         if first_terminal_output {
                             first_terminal_output = false;
@@ -1559,17 +1554,11 @@ async fn run_session(
                         {
                             prompt_injected = true;
                             suppress_echo = true;
-                            // Give the hook ~2 s to echo its OSC 7; past that we
-                            // assume a non-POSIX shell and stop hiding output (#140-1).
-                            // 1.2 s was too tight for slow PTY/SSH servers — the echo
-                            // + OSC 7 landed after the deadline, so the injected setup
-                            // line leaked through (#176). The cost of the larger window
-                            // is only a slightly longer blank on a non-POSIX shell that
-                            // wasn't already flagged disable_shell_integration.
-                            suppress_deadline = Some(
-                                tokio::time::Instant::now()
-                                    + std::time::Duration::from_millis(2000),
-                            );
+                            // A separate exec probe already confirmed bash or zsh.
+                            // Keep buffering until the hook's OSC 7 arrives: slow
+                            // Linux/macOS PTYs may echo this command after several
+                            // seconds, while unsupported Windows shells never enter
+                            // this branch.
                             // Paint the banner/prompt immediately. Only later
                             // output containing our injected setup command is
                             // buffered and stripped; the first usable terminal
@@ -1579,48 +1568,26 @@ async fn run_session(
                             continue;
                         }
 
-                        // While suppressing, buffer output until our echoed setup
-                        // command AND the OSC 7 that the injected __ms7 prints right
-                        // after it have both arrived. Then delete just that span —
-                        // from the start of the command's line through the OSC 7 —
-                        // which removes the echoed command (even if it WRAPPED across
-                        // the terminal width, since we cut by byte range) and the
-                        // now-redundant first prompt, while PRESERVING any MOTD/banner
-                        // printed before it (#98). The command line is located by a
-                        // short, un-wrappable prefix of the injected command. A size
-                        // cap is the safety valve for a shell that never reports back
-                        // (e.g. dash without PROMPT_COMMAND).
+                        // While suppressing, wait for the private OSC 699 completion
+                        // marker emitted by the executed setup command. Do not infer
+                        // completion from echoed text size: zsh/ZLE may redraw the
+                        // long input line often enough to exceed 16 KiB before it
+                        // executes, which previously released the internal command
+                        // onto the terminal (#344). Output before the marker is
+                        // private setup echo and is safely discarded; the rolling
+                        // buffer remains bounded while preserving split markers.
                         let mut text = if suppress_echo {
                             echo_buf.push_str(&chunk);
-                            const ECHO_BUF_CAP: usize = 1 << 14; // 16 KiB
-                            // The command echo + its trailing OSC 7 (the one after
-                            // our command, not any earlier prompt OSC 7).
-                            let landed = echo_buf.find(PROMPT_SETUP_PREFIX).and_then(|p| {
-                                extract_osc7_end(&echo_buf[p..])
-                                    .map(|(cwd, rel)| (p, p + rel, cwd))
-                            });
-                            if let Some((cmd_pos, osc_end, cwd)) = landed {
+                            if let Some(tail) = take_after_prompt_setup_done(&mut echo_buf) {
                                 suppress_echo = false;
-                                suppress_deadline = None;
                                 late_prompt_echo_pending = false;
-                                tracing::debug!("OSC7 cwd={:?}", cwd);
-                                let _ = events.send(SessionEvent::CwdChanged(cwd));
-                                let mut buf = std::mem::take(&mut echo_buf);
-                                strip_prompt_setup_echo(&mut buf, cmd_pos, osc_end);
-                                buf
-                            } else if echo_buf.len() >= ECHO_BUF_CAP {
-                                suppress_echo = false;
-                                suppress_deadline = None;
-                                let mut buf = std::mem::take(&mut echo_buf);
-                                if let Some(p) = buf.find(PROMPT_SETUP_PREFIX) {
-                                    let end = prompt_setup_echo_end(&buf, p);
-                                    strip_prompt_setup_echo(&mut buf, p, end);
-                                    late_prompt_echo_pending = false;
-                                } else {
-                                    late_prompt_echo_pending = true;
+                                if let Some(cwd) = extract_osc7_path(&tail) {
+                                    tracing::debug!("OSC7 cwd={:?}", cwd);
+                                    let _ = events.send(SessionEvent::CwdChanged(cwd));
                                 }
-                                buf
+                                tail
                             } else {
+                                bound_prompt_setup_echo(&mut echo_buf);
                                 continue; // keep buffering; show nothing yet
                             }
                         } else {
@@ -1652,7 +1619,7 @@ async fn run_session(
                         let _ = events.send(SessionEvent::Output(text));
                     }
                     Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
-                        let text = String::from_utf8_lossy(&data).into_owned();
+                        let text = extended_decoder.decode(&data);
                         let _ = events.send(SessionEvent::Output(text));
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
@@ -2526,9 +2493,10 @@ fn _assert_handle_send() {
 #[cfg(test)]
 mod prompt_setup_echo_tests {
     use super::{
-        prompt_setup_echo_end, prompt_setup_supported, strip_late_prompt_setup_echo,
-        strip_pending_prompt_setup_echo, strip_prompt_setup_echo, PROMPT_BODY,
-        PROMPT_SETUP_HISTORY_MARKER, PROMPT_SETUP_PREFIX,
+        bound_prompt_setup_echo, prompt_setup_echo_end, prompt_setup_supported,
+        strip_late_prompt_setup_echo, strip_pending_prompt_setup_echo, strip_prompt_setup_echo,
+        take_after_prompt_setup_done, PROMPT_BODY, PROMPT_SETUP_DONE, PROMPT_SETUP_HISTORY_MARKER,
+        PROMPT_SETUP_PREFIX,
     };
 
     #[test]
@@ -2557,6 +2525,35 @@ mod prompt_setup_echo_tests {
         // Re-prime command capture only after deleting the setup entry, so the
         // previous real user command does not get reported as newly executed.
         assert!(PROMPT_BODY.find("history -d").unwrap() < PROMPT_BODY.rfind("__cl=").unwrap());
+        assert!(PROMPT_BODY.contains("699;ready"));
+    }
+
+    #[test]
+    fn completion_marker_hides_corrupted_large_zsh_redraws() {
+        let mut buffered = "cst test -z redraw\r".repeat(5000);
+        buffered.push_str(PROMPT_SETUP_DONE);
+        buffered.push_str("\u{1b}]7;file://host/home/user\u{07}prompt");
+
+        let tail = take_after_prompt_setup_done(&mut buffered).expect("completion marker");
+        assert!(buffered.is_empty());
+        assert_eq!(tail, "\u{1b}]7;file://host/home/user\u{07}prompt");
+        assert!(!tail.contains("test -z"));
+    }
+
+    #[test]
+    fn rolling_setup_buffer_preserves_a_split_completion_marker() {
+        let split = 6;
+        let mut buffered = "redraw".repeat(20_000);
+        buffered.push_str(&PROMPT_SETUP_DONE[..split]);
+        bound_prompt_setup_echo(&mut buffered);
+        assert!(buffered.len() < 1024);
+
+        buffered.push_str(&PROMPT_SETUP_DONE[split..]);
+        buffered.push_str("prompt");
+        assert_eq!(
+            take_after_prompt_setup_done(&mut buffered).as_deref(),
+            Some("prompt")
+        );
     }
 
     #[test]

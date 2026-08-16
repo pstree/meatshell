@@ -9,12 +9,12 @@ mod auth_dialogs;
 mod port_forward;
 mod quick_commands;
 mod resource_ui;
-mod session_runtime;
 mod session_event;
 mod session_models;
-mod sidebar;
+mod session_runtime;
 mod sftp_callbacks;
 mod sftp_ui;
+mod sidebar;
 mod tab_callbacks;
 mod terminal_ui;
 mod webdav;
@@ -24,12 +24,12 @@ use self::auth_dialogs::*;
 use self::port_forward::*;
 use self::quick_commands::*;
 use self::resource_ui::*;
-use self::session_runtime::*;
 use self::session_event::*;
 use self::session_models::*;
-use self::sidebar::*;
+use self::session_runtime::*;
 use self::sftp_callbacks::*;
 use self::sftp_ui::*;
+use self::sidebar::*;
 use self::tab_callbacks::*;
 use self::terminal_ui::*;
 use self::webdav::*;
@@ -44,10 +44,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// Keeps a single UI callback from spending hundreds of ms in vt100 ingest.
 const OUTPUT_MERGE_BYTE_CAP: usize = 64 * 1024;
 
-/// Output bytes at/above which a Ctrl+C'd terminal's sustained firehose is
-/// discarded (per batch), until the small `^C` echo / fresh prompt arrives.
-const CTRL_C_DROP_THRESHOLD: usize = 32 * 1024;
-
 /// Output parsed between UI-flush checkpoints during sustained traffic.
 const INGEST_FRAME_BUDGET: usize = 64 * 1024;
 
@@ -61,9 +57,27 @@ const PACED_QUEUE_EVENT_LIMIT: usize = 256;
 
 /// Max UI renders per second for a tab under sustained output (#209).
 const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+/// A scrolled-back viewport is content-anchored, so sustained output only
+/// needs occasional model refreshes for its scrollbar metadata (#306).
+const SCROLLED_RENDER_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
 
 fn term_buf(bufs: &TermBuffers, tab_id: &str) -> Option<TermBufferHandle> {
     bufs.lock().unwrap().get(tab_id).cloned()
+}
+
+fn tab_render_interval(bufs: &TermBuffers, tab_id: &str) -> std::time::Duration {
+    let Some(handle) = term_buf(bufs, tab_id) else {
+        return RENDER_MIN_INTERVAL;
+    };
+    let interval = match handle.try_lock() {
+        Ok(buf) if buf.view_offset > 0 => SCROLLED_RENDER_MIN_INTERVAL,
+        Ok(_) => RENDER_MIN_INTERVAL,
+        // A busy ingest lock is itself a firehose signal. Deferring this
+        // snapshot prevents the UI thread from joining the contention.
+        Err(_) => SCROLLED_RENDER_MIN_INTERVAL,
+    };
+    interval
 }
 
 fn with_term_buf<R>(
@@ -126,31 +140,34 @@ use crate::config::{
 };
 use crate::i18n::t;
 use crate::layout::{LogicalRect, TerminalWheelHit};
+use crate::resource::system::{format_bytes_per_sec, format_mem};
 use crate::resource::{
     LocalGpuInfo, LocalHardwareInfo, LocalSnap, NetHist, TabStatus, TabStatuses,
 };
+use crate::resource::{SystemSampler, SystemSnapshot};
 use crate::session::{ConnectCtx, PendingCred, PendingHostKey, PendingMfa};
-use crate::sftp::{spawn_sftp, SftpHandles, SftpLastCwd};
+use crate::sftp::{
+    download_target_path, spawn_sftp, DownloadConflict, SftpHandles, SftpLastCwd,
+};
 use crate::ssh::{
     format_mtime, format_size, spawn_session, test_session_auth, ProcInfo, SessionCommand,
     SessionEvent, SessionHandle, SystemDetails,
 };
+#[cfg(windows)]
+use crate::terminal::c0_letter_key_down;
 use crate::terminal::{
-    bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules, encode_pasted_text,
-    key_to_pty_bytes, should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste, CsiState,
-    OutputHighlightPreset, RenderGates, TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
+    bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules,
+    encode_command_bar_input, encode_pasted_text, key_to_pty_bytes, paste_requires_large_review,
+    should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste, CsiState, OutputHighlightPreset,
+    RenderGates, TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
 };
 #[cfg(test)]
 use crate::terminal::{
-    build_row, encode_command_bar_input, highlight_plain_output, log_level_marker,
-    normalize_pasted_newlines, text_cell_width, vt_span_colors, CompiledOutputRule, HistSpan, Line,
+    build_row, highlight_plain_output, log_level_marker, normalize_pasted_newlines,
+    text_cell_width, vt_span_colors, CompiledOutputRule, HistSpan, Line,
 };
-#[cfg(windows)]
-use crate::terminal::c0_letter_key_down;
 #[cfg(any(target_os = "windows", test))]
 use crate::terminal::{windows_process_ctrl_release, CtrlKeySide};
-use crate::resource::system::{format_bytes_per_sec, format_mem};
-use crate::resource::{SystemSampler, SystemSnapshot};
 use crate::ui::*;
 use crate::webdav::WebDavAcceptAnyCertVerifier;
 
@@ -161,7 +178,6 @@ fn tab_title_len(title: &str) -> i32 {
         .sum::<usize>()
         .min(i32::MAX as usize) as i32
 }
-
 
 fn should_block_close(exit_confirmed: bool, has_live_sessions: bool) -> bool {
     !exit_confirmed && has_live_sessions
@@ -266,7 +282,7 @@ fn run_coalesced_tab_render(
     bufs: &TermBuffers,
     gate: Arc<TabRenderGate>,
 ) {
-    let delay = gate.flush_delay(RENDER_MIN_INTERVAL);
+    let delay = gate.flush_delay(tab_render_interval(bufs, tab_id));
 
     let weak2 = weak.clone();
     let tid = tab_id.to_string();
@@ -459,7 +475,11 @@ pub fn run() -> Result<()> {
     {
         // ✕ hides the window (data keeps flowing into the shared model).
         let weak = proc_win.as_weak();
+        let main_weak = window.as_weak();
         proc_win.on_close(move || {
+            if let Some(main) = main_weak.upgrade() {
+                main.set_process_window_open(false);
+            }
             if let Some(w) = weak.upgrade() {
                 let _ = w.hide();
             }
@@ -504,6 +524,8 @@ pub fn run() -> Result<()> {
             let (Some(main), Some(pw)) = (win_weak.upgrade(), proc_weak.upgrade()) else {
                 return;
             };
+            main.set_process_window_open(true);
+            main.invoke_refresh_sidebar();
             pw.set_host(main.get_connection_state());
             sync_proc_theme(&main, &pw);
             let _ = pw.show();
@@ -513,7 +535,11 @@ pub fn run() -> Result<()> {
     }
     {
         let weak = sys_win.as_weak();
+        let main_weak = window.as_weak();
         sys_win.on_close(move || {
+            if let Some(main) = main_weak.upgrade() {
+                main.set_system_info_window_open(false);
+            }
             if let Some(w) = weak.upgrade() {
                 let _ = w.hide();
             }
@@ -554,6 +580,8 @@ pub fn run() -> Result<()> {
             if !main.get_system_info_available() {
                 return;
             }
+            main.set_system_info_window_open(true);
+            main.invoke_refresh_sidebar();
             sw.set_host(main.get_conn_host());
             sw.set_connection_state(main.get_connection_state());
             sw.set_resource_title(main.get_resource_title());
@@ -592,6 +620,7 @@ pub fn run() -> Result<()> {
             window.set_term_font_family(fam.into());
         }
         window.set_term_font_size(s.font_size() as f32);
+        window.set_terminal_line_spacing(s.terminal_line_spacing());
         window.set_term_font_bold(s.terminal_bold());
         window.set_term_cursor_style(s.terminal_cursor_style().into());
         if let Some(color) = parse_hex_color(s.terminal_cursor_color()) {
@@ -661,11 +690,38 @@ pub fn run() -> Result<()> {
     // Interface setting: always ask where to save on download (#87). Read live
     // by the download handler from the window property, so just set + persist.
     window.set_download_always_ask(store.borrow().download_always_ask());
+    window.set_paste_confirm_enabled(store.borrow().paste_confirm_enabled());
+    window.set_extra_paste_shortcuts_enabled(store.borrow().extra_paste_shortcuts_enabled());
+    window.set_zen_mode(store.borrow().zen_mode());
     {
         let store = store.clone();
         window.on_set_download_always_ask(move |ask| {
             let mut s = store.borrow_mut();
             s.set_download_always_ask(ask);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
+        window.on_set_paste_confirm_enabled(move |enabled| {
+            let mut s = store.borrow_mut();
+            s.set_paste_confirm_enabled(enabled);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
+        window.on_set_extra_paste_shortcuts_enabled(move |enabled| {
+            let mut s = store.borrow_mut();
+            s.set_extra_paste_shortcuts_enabled(enabled);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
+        window.on_set_zen_mode(move |enabled| {
+            let mut s = store.borrow_mut();
+            s.set_zen_mode(enabled);
             let _ = s.save();
         });
     }
@@ -1058,6 +1114,30 @@ pub fn run() -> Result<()> {
         });
     }
     {
+        let store = store.clone();
+        window.on_persist_sftp_tree_width(move |width| {
+            let mut s = store.borrow_mut();
+            s.set_sftp_tree_width(width);
+            let _ = s.save();
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_terminal_line_spacing(move |spacing: f32| {
+            let normalized = {
+                let mut s = store.borrow_mut();
+                s.set_terminal_line_spacing(spacing);
+                let normalized = s.terminal_line_spacing();
+                let _ = s.save();
+                normalized
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_terminal_line_spacing(normalized);
+            }
+        });
+    }
+    {
         let weak = window.as_weak();
         let store = store.clone();
         window.on_set_term_font_bold(move |bold: bool| {
@@ -1390,62 +1470,80 @@ pub fn run() -> Result<()> {
         let handles = handles.clone();
         let statuses = tab_statuses.clone();
         let runtime = runtime.clone();
-        proc_win.on_terminate_process(move |tab_id: SharedString, pid: SharedString, password: SharedString| {
-            let tab_id = tab_id.to_string();
-            let Ok(pid) = pid.parse::<u32>() else {
-                set_process_action_error(&proc_weak, t("无效的 PID", "Invalid PID"));
-                return;
-            };
+        proc_win.on_terminate_process(
+            move |tab_id: SharedString, pid: SharedString, password: SharedString| {
+                let tab_id = tab_id.to_string();
+                let Ok(pid) = pid.parse::<u32>() else {
+                    set_process_action_error(&proc_weak, t("无效的 PID", "Invalid PID"));
+                    return;
+                };
 
-            // Re-check the source tab, PID, and owner against the latest sample;
-            // the main window may have switched tabs since the menu was opened.
-            let ownership = {
-                let states = statuses.lock().unwrap();
-                states.get(&tab_id).map_or_else(
-                    || Err(t("当前会话不可用", "The current session is unavailable")),
-                    |status| status.procs.iter().find(|p| p.pid == pid)
-                        .map(|process| process_needs_root(&status.user, &process.user))
-                        .ok_or_else(|| t("进程已退出", "The process has already exited")),
-                )
-            };
-            let needs_root = match ownership {
-                Ok(value) => value,
-                Err(message) => {
-                    set_process_action_error(&proc_weak, message);
+                // Re-check the source tab, PID, and owner against the latest sample;
+                // the main window may have switched tabs since the menu was opened.
+                let ownership = {
+                    let states = statuses.lock().unwrap();
+                    states.get(&tab_id).map_or_else(
+                        || Err(t("当前会话不可用", "The current session is unavailable")),
+                        |status| {
+                            status
+                                .procs
+                                .iter()
+                                .find(|p| p.pid == pid)
+                                .map(|process| process_needs_root(&status.user, &process.user))
+                                .ok_or_else(|| t("进程已退出", "The process has already exited"))
+                        },
+                    )
+                };
+                let needs_root = match ownership {
+                    Ok(value) => value,
+                    Err(message) => {
+                        set_process_action_error(&proc_weak, message);
+                        return;
+                    }
+                };
+                if needs_root && password.is_empty() {
+                    set_process_action_error(
+                        &proc_weak,
+                        t(
+                            "请输入管理员（sudo）密码",
+                            "Enter the administrator (sudo) password",
+                        ),
+                    );
                     return;
                 }
-            };
-            if needs_root && password.is_empty() {
-                set_process_action_error(
-                    &proc_weak,
-                    t("请输入管理员（sudo）密码", "Enter the administrator (sudo) password"),
-                );
-                return;
-            }
 
-            let root_password = needs_root.then(|| crate::config::Secret::new(password.to_string()));
-            let response = handles.borrow().get(&tab_id)
-                .map(|handle| handle.kill_process(pid, root_password));
-            let Some(response) = response else {
-                set_process_action_error(&proc_weak, t("SSH 会话不可用", "The SSH session is unavailable"));
-                return;
-            };
+                let root_password =
+                    needs_root.then(|| crate::config::Secret::new(password.to_string()));
+                let response = handles
+                    .borrow()
+                    .get(&tab_id)
+                    .map(|handle| handle.kill_process(pid, root_password));
+                let Some(response) = response else {
+                    set_process_action_error(
+                        &proc_weak,
+                        t("SSH 会话不可用", "The SSH session is unavailable"),
+                    );
+                    return;
+                };
 
-            let done_weak = proc_weak.clone();
-            runtime.spawn(async move {
-                let result = response.await.unwrap_or_else(|_| crate::ssh::ProcessKillResult {
-                    success: false,
-                    message: t("SSH 会话已关闭", "The SSH session has closed").to_string(),
+                let done_weak = proc_weak.clone();
+                runtime.spawn(async move {
+                    let result = response
+                        .await
+                        .unwrap_or_else(|_| crate::ssh::ProcessKillResult {
+                            success: false,
+                            message: t("SSH 会话已关闭", "The SSH session has closed").to_string(),
+                        });
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(pw) = done_weak.upgrade() {
+                            pw.set_action_busy(false);
+                            pw.set_action_error(!result.success);
+                            pw.set_action_status(result.message.into());
+                        }
+                    });
                 });
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(pw) = done_weak.upgrade() {
-                        pw.set_action_busy(false);
-                        pw.set_action_error(!result.success);
-                        pw.set_action_status(result.message.into());
-                    }
-                });
-            });
-        });
+            },
+        );
     }
 
     // --- Wire callbacks --------------------------------------------------
@@ -1899,7 +1997,9 @@ pub fn run() -> Result<()> {
             if let Some(w) = weak.upgrade() {
                 // Everything (status, CPU/mem/swap, both graphs) follows the
                 // active tab; refresh_sidebar reads the stores we just updated.
-                refresh_sidebar(&w, &tick_statuses, &tick_local, &tick_net);
+                if sidebar_updates_visible(&w) {
+                    refresh_sidebar(&w, &tick_statuses, &tick_local, &tick_net);
+                }
             }
         },
     );
@@ -1931,289 +2031,292 @@ pub fn run() -> Result<()> {
         // Apply the Win11 rounded-corner hint once, on the first event (the HWND
         // reliably exists by then, unlike a pre-run timer) (#166).
         let mut chrome_done = false;
-        window.window().on_winit_window_event(move |slint_window, event| {
-            if !chrome_done {
-                chrome_done = true;
-                if let Some(win) = weak.upgrade() {
-                    apply_window_chrome(win.window());
-                }
-            }
-            // Recompute window activity, push it to the shared cell, and update
-            // Theme.window-focused (gates the cursor blink) (#127).
-            let apply_activity = |focused: bool, minimized: bool, occluded: bool| {
-                let act = if minimized || occluded {
-                    WinActivity::Hidden
-                } else if focused {
-                    WinActivity::Active
-                } else {
-                    WinActivity::Background
-                };
-                let prev = ev_activity.get();
-                ev_activity.set(act);
-                if let Some(win) = weak.upgrade() {
-                    win.set_window_focused(act == WinActivity::Active);
-                    if prev == WinActivity::Hidden && act != WinActivity::Hidden {
-                        win.set_terminal_restore_cover(true);
-                        let weak2 = weak.clone();
-                        slint::Timer::single_shot(
-                            std::time::Duration::from_millis(120),
-                            move || {
-                                if let Some(w) = weak2.upgrade() {
-                                    w.set_terminal_restore_cover(false);
-                                }
-                            },
-                        );
-                    }
-                }
-            };
-            match event {
-                #[cfg(target_os = "windows")]
-                WEvent::KeyboardInput { event, .. } => {
-                    // Microsoft IME can relabel a Ctrl key-up as Process while
-                    // retaining the physical Ctrl scan code. Slint drops Process,
-                    // so deliver the missing modifier release directly.
-                    if let Some(side) = windows_process_ctrl_release(
-                        event.state,
-                        &event.logical_key,
-                        &event.physical_key,
-                    ) {
-                        let key = match side {
-                            CtrlKeySide::Left => slint::platform::Key::Control,
-                            CtrlKeySide::Right => slint::platform::Key::ControlR,
-                        };
-                        slint_window.dispatch_event(
-                            slint::platform::WindowEvent::KeyReleased { text: key.into() },
-                        );
-                        tracing::debug!(
-                            "restored Windows IME Process-key Ctrl release side={side:?}"
-                        );
-                        return EventResult::PreventDefault;
-                    }
-                }
-                #[cfg(target_os = "windows")]
-                WEvent::Ime(i_slint_backend_winit::winit::event::Ime::Disabled) => {
-                    // Windows emits Ime::Disabled when a composition ends, including
-                    // while switching between Chinese and English input methods. The
-                    // Slint winit backend intentionally ignores this notification, so
-                    // after several switches the native input context can remain
-                    // detached and every TextInput appears to stop accepting keys
-                    // (#236). Re-associate the window with its current default IME;
-                    // the focused Slint TextInput keeps owning text input as before.
-                    slint_window.with_winit_window(|window| window.set_ime_allowed(true));
-                }
-                WEvent::DroppedFile(path) => {
+        window
+            .window()
+            .on_winit_window_event(move |slint_window, event| {
+                if !chrome_done {
+                    chrome_done = true;
                     if let Some(win) = weak.upgrade() {
-                        handle_file_drop(&win, &sh, path.clone());
+                        apply_window_chrome(win.window());
                     }
                 }
-                WEvent::CursorMoved { position, .. } => {
+                // Recompute window activity, push it to the shared cell, and update
+                // Theme.window-focused (gates the cursor blink) (#127).
+                let apply_activity = |focused: bool, minimized: bool, occluded: bool| {
+                    let act = if minimized || occluded {
+                        WinActivity::Hidden
+                    } else if focused {
+                        WinActivity::Active
+                    } else {
+                        WinActivity::Background
+                    };
+                    let prev = ev_activity.get();
+                    ev_activity.set(act);
                     if let Some(win) = weak.upgrade() {
-                        let scale = win.window().scale_factor().max(0.01) as f64;
-                        let p = position.to_logical::<f64>(scale);
-                        last_cursor_logical = Some((p.x as f32, p.y as f32));
-                    }
-                }
-                WEvent::MouseWheel { delta, .. } if cfg!(target_os = "macos") => {
-                    let Some((x, y)) = last_cursor_logical else {
-                        return EventResult::Propagate;
-                    };
-                    let Some(win) = weak.upgrade() else {
-                        return EventResult::Propagate;
-                    };
-                    let wheel_lines = match delta {
-                        MouseScrollDelta::LineDelta(_, dy) => dy * 3.0,
-                        MouseScrollDelta::PixelDelta(p) => {
-                            let scale = win.window().scale_factor().max(0.01) as f64;
-                            let p = p.to_logical::<f64>(scale);
-                            p.y as f32 / 18.0
+                        win.set_window_focused(act == WinActivity::Active);
+                        win.set_dynamic_ui_active(act == WinActivity::Active);
+                        if prev == WinActivity::Hidden && act != WinActivity::Hidden {
+                            win.set_terminal_restore_cover(true);
+                            let weak2 = weak.clone();
+                            slint::Timer::single_shot(
+                                std::time::Duration::from_millis(120),
+                                move || {
+                                    if let Some(w) = weak2.upgrade() {
+                                        w.set_terminal_restore_cover(false);
+                                    }
+                                },
+                            );
                         }
-                    };
-                    if wheel_lines.abs() < f32::EPSILON {
-                        return EventResult::Propagate;
                     }
-                    macos_wheel_accum += wheel_lines;
-                    let whole = macos_wheel_accum.trunc() as i32;
-                    if whole == 0 {
-                        return EventResult::Propagate;
+                };
+                match event {
+                    #[cfg(target_os = "windows")]
+                    WEvent::KeyboardInput { event, .. } => {
+                        // Microsoft IME can relabel a Ctrl key-up as Process while
+                        // retaining the physical Ctrl scan code. Slint drops Process,
+                        // so deliver the missing modifier release directly.
+                        if let Some(side) = windows_process_ctrl_release(
+                            event.state,
+                            &event.logical_key,
+                            &event.physical_key,
+                        ) {
+                            let key = match side {
+                                CtrlKeySide::Left => slint::platform::Key::Control,
+                                CtrlKeySide::Right => slint::platform::Key::ControlR,
+                            };
+                            slint_window.dispatch_event(
+                                slint::platform::WindowEvent::KeyReleased { text: key.into() },
+                            );
+                            tracing::debug!(
+                                "restored Windows IME Process-key Ctrl release side={side:?}"
+                            );
+                            return EventResult::PreventDefault;
+                        }
                     }
-                    macos_wheel_accum -= whole as f32;
-                    if handle_macos_terminal_wheel(&win, &wheel_bufs, x, y, whole) {
-                        return EventResult::PreventDefault;
-                    }
-                }
-                WEvent::Focused(f) => {
-                    focused = *f;
-                    apply_activity(focused, minimized, occluded);
-                    if *f {
-                        #[cfg(target_os = "windows")]
+                    #[cfg(target_os = "windows")]
+                    WEvent::Ime(i_slint_backend_winit::winit::event::Ime::Disabled) => {
+                        // Windows emits Ime::Disabled when a composition ends, including
+                        // while switching between Chinese and English input methods. The
+                        // Slint winit backend intentionally ignores this notification, so
+                        // after several switches the native input context can remain
+                        // detached and every TextInput appears to stop accepting keys
+                        // (#236). Re-associate the window with its current default IME;
+                        // the focused Slint TextInput keeps owning text input as before.
                         slint_window.with_winit_window(|window| window.set_ime_allowed(true));
+                    }
+                    WEvent::DroppedFile(path) => {
+                        if let Some(win) = weak.upgrade() {
+                            handle_file_drop(&win, &sh, path.clone());
+                        }
+                    }
+                    WEvent::CursorMoved { position, .. } => {
+                        if let Some(win) = weak.upgrade() {
+                            let scale = win.window().scale_factor().max(0.01) as f64;
+                            let p = position.to_logical::<f64>(scale);
+                            last_cursor_logical = Some((p.x as f32, p.y as f32));
+                        }
+                    }
+                    WEvent::MouseWheel { delta, .. } if cfg!(target_os = "macos") => {
+                        let Some((x, y)) = last_cursor_logical else {
+                            return EventResult::Propagate;
+                        };
+                        let Some(win) = weak.upgrade() else {
+                            return EventResult::Propagate;
+                        };
+                        let wheel_lines = match delta {
+                            MouseScrollDelta::LineDelta(_, dy) => dy * 3.0,
+                            MouseScrollDelta::PixelDelta(p) => {
+                                let scale = win.window().scale_factor().max(0.01) as f64;
+                                let p = p.to_logical::<f64>(scale);
+                                p.y as f32 / 18.0
+                            }
+                        };
+                        if wheel_lines.abs() < f32::EPSILON {
+                            return EventResult::Propagate;
+                        }
+                        macos_wheel_accum += wheel_lines;
+                        let whole = macos_wheel_accum.trunc() as i32;
+                        if whole == 0 {
+                            return EventResult::Propagate;
+                        }
+                        macos_wheel_accum -= whole as f32;
+                        if handle_macos_terminal_wheel(&win, &wheel_bufs, x, y, whole) {
+                            return EventResult::PreventDefault;
+                        }
+                    }
+                    WEvent::Focused(f) => {
+                        focused = *f;
+                        apply_activity(focused, minimized, occluded);
+                        if *f {
+                            #[cfg(target_os = "windows")]
+                            slint_window.with_winit_window(|window| window.set_ime_allowed(true));
 
-                        // Some window managers deliver the first Resized event
-                        // before the native window belongs to a monitor. Focus
-                        // is a reliable second opportunity to seed restoration;
-                        // request_inner_size will produce the Resized event that
-                        // verifies the native window actually reached the target.
-                        if !ev_window_size_tracking_ready.get() {
-                            if let Some(win) = weak.upgrade() {
-                                if is_wayland_window(&win.window()) {
-                                    ev_pending_window_size_restore.set(None);
-                                    ev_window_size_tracking_ready.set(true);
-                                    tracing::info!(
+                            // Some window managers deliver the first Resized event
+                            // before the native window belongs to a monitor. Focus
+                            // is a reliable second opportunity to seed restoration;
+                            // request_inner_size will produce the Resized event that
+                            // verifies the native window actually reached the target.
+                            if !ev_window_size_tracking_ready.get() {
+                                if let Some(win) = weak.upgrade() {
+                                    if is_wayland_window(&win.window()) {
+                                        ev_pending_window_size_restore.set(None);
+                                        ev_window_size_tracking_ready.set(true);
+                                        tracing::info!(
                                         "[WINDOW_SIZE] skipped persisted-size restore on Wayland"
                                     );
-                                } else if let Some(preferred) =
-                                    ev_pending_window_size_restore.get()
-                                {
-                                    if let Some(target) = clamp_window_size_to_monitor(
-                                        &win.window(),
-                                        Some(preferred),
-                                    ) {
-                                        tracing::info!(
-                                            "[WINDOW_SIZE] focus retry saved={:.0}x{:.0} \
+                                    } else if let Some(preferred) =
+                                        ev_pending_window_size_restore.get()
+                                    {
+                                        if let Some(target) = clamp_window_size_to_monitor(
+                                            &win.window(),
+                                            Some(preferred),
+                                        ) {
+                                            tracing::info!(
+                                                "[WINDOW_SIZE] focus retry saved={:.0}x{:.0} \
                                              target={:.0}x{:.0}",
+                                                preferred.0,
+                                                preferred.1,
+                                                target.0,
+                                                target.1,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            refresh_revealed_main_window(weak.clone());
+                        }
+                    }
+                    WEvent::Occluded(o) => {
+                        occluded = *o;
+                        apply_activity(focused, minimized, occluded);
+                        if !*o {
+                            refresh_revealed_main_window(weak.clone());
+                        }
+                    }
+                    WEvent::ScaleFactorChanged { .. } => {
+                        // Moving a maximized frameless window between mixed-DPI
+                        // monitors can leave Win11 reporting "maximized" while the
+                        // native rectangle/render surface still has the old size.
+                        refresh_revealed_main_window(weak.clone());
+                    }
+                    WEvent::Resized(size) => {
+                        // A 0-sized resize is how Windows reports a minimize; track it
+                        // so we pause the sampler while minimized (#127).
+                        minimized = size.width == 0 || size.height == 0;
+                        apply_activity(focused, minimized, occluded);
+                        // Keep the maximize/restore icon (and resize-edge gating) in
+                        // sync when the OS changes the window state (#119).
+                        if let Some(win) = weak.upgrade() {
+                            let maxed = win
+                                .window()
+                                .with_winit_window(|ww| ww.is_maximized())
+                                .unwrap_or(false);
+                            win.set_window_maximized(maxed);
+                            if !ev_window_size_tracking_ready.get()
+                                && is_wayland_window(&win.window())
+                            {
+                                // The configure size in this event is authoritative
+                                // on Wayland. Accept and persist that actual size;
+                                // never chase the advisory saved size (#286).
+                                ev_pending_window_size_restore.set(None);
+                                ev_window_size_tracking_ready.set(true);
+                                tracing::info!(
+                                    "[WINDOW_SIZE] accepted compositor size {}x{} on Wayland",
+                                    size.width,
+                                    size.height
+                                );
+                            }
+                            if !ev_window_size_tracking_ready.get() {
+                                if let Some(preferred) = ev_pending_window_size_restore.get() {
+                                    let scale = win.window().scale_factor().max(0.01);
+                                    let actual =
+                                        (size.width as f32 / scale, size.height as f32 / scale);
+                                    if let Some(target) =
+                                        clamp_window_size_to_monitor(&win.window(), Some(preferred))
+                                    {
+                                        tracing::info!(
+                                            "[WINDOW_SIZE] restore requested saved={:.0}x{:.0} \
+                                         target={:.0}x{:.0} actual={:.0}x{:.0} scale={:.2}",
                                             preferred.0,
                                             preferred.1,
                                             target.0,
                                             target.1,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        refresh_revealed_main_window(weak.clone());
-                    }
-                }
-                WEvent::Occluded(o) => {
-                    occluded = *o;
-                    apply_activity(focused, minimized, occluded);
-                    if !*o {
-                        refresh_revealed_main_window(weak.clone());
-                    }
-                }
-                WEvent::ScaleFactorChanged { .. } => {
-                    // Moving a maximized frameless window between mixed-DPI
-                    // monitors can leave Win11 reporting "maximized" while the
-                    // native rectangle/render surface still has the old size.
-                    refresh_revealed_main_window(weak.clone());
-                }
-                WEvent::Resized(size) => {
-                    // A 0-sized resize is how Windows reports a minimize; track it
-                    // so we pause the sampler while minimized (#127).
-                    minimized = size.width == 0 || size.height == 0;
-                    apply_activity(focused, minimized, occluded);
-                    // Keep the maximize/restore icon (and resize-edge gating) in
-                    // sync when the OS changes the window state (#119).
-                    if let Some(win) = weak.upgrade() {
-                        let maxed = win
-                            .window()
-                            .with_winit_window(|ww| ww.is_maximized())
-                            .unwrap_or(false);
-                        win.set_window_maximized(maxed);
-                        if !ev_window_size_tracking_ready.get()
-                            && is_wayland_window(&win.window())
-                        {
-                            // The configure size in this event is authoritative
-                            // on Wayland. Accept and persist that actual size;
-                            // never chase the advisory saved size (#286).
-                            ev_pending_window_size_restore.set(None);
-                            ev_window_size_tracking_ready.set(true);
-                            tracing::info!(
-                                "[WINDOW_SIZE] accepted compositor size {}x{} on Wayland",
-                                size.width,
-                                size.height
-                            );
-                        }
-                        if !ev_window_size_tracking_ready.get() {
-                            if let Some(preferred) = ev_pending_window_size_restore.get() {
-                                let scale = win.window().scale_factor().max(0.01);
-                                let actual =
-                                    (size.width as f32 / scale, size.height as f32 / scale);
-                                if let Some(target) =
-                                    clamp_window_size_to_monitor(&win.window(), Some(preferred))
-                                {
-                                    tracing::info!(
-                                        "[WINDOW_SIZE] restore requested saved={:.0}x{:.0} \
-                                         target={:.0}x{:.0} actual={:.0}x{:.0} scale={:.2}",
-                                        preferred.0,
-                                        preferred.1,
-                                        target.0,
-                                        target.1,
-                                        actual.0,
-                                        actual.1,
-                                        scale,
-                                    );
-                                    if (actual.0 - target.0).abs() <= 2.0
-                                        && (actual.1 - target.1).abs() <= 2.0
-                                    {
-                                        ev_pending_window_size_restore.set(None);
-                                        ev_window_size_tracking_ready.set(true);
-                                        tracing::info!(
-                                            "[WINDOW_SIZE] restore settled at {:.0}x{:.0}",
                                             actual.0,
-                                            actual.1
+                                            actual.1,
+                                            scale,
+                                        );
+                                        if (actual.0 - target.0).abs() <= 2.0
+                                            && (actual.1 - target.1).abs() <= 2.0
+                                        {
+                                            ev_pending_window_size_restore.set(None);
+                                            ev_window_size_tracking_ready.set(true);
+                                            tracing::info!(
+                                                "[WINDOW_SIZE] restore settled at {:.0}x{:.0}",
+                                                actual.0,
+                                                actual.1
+                                            );
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            "[WINDOW_SIZE] restore deferred: no monitor available \
+                                         saved={:.0}x{:.0}",
+                                            preferred.0,
+                                            preferred.1,
                                         );
                                     }
                                 } else {
-                                    tracing::warn!(
-                                        "[WINDOW_SIZE] restore deferred: no monitor available \
-                                         saved={:.0}x{:.0}",
-                                        preferred.0,
-                                        preferred.1,
+                                    // First run: accept the initialized size as the
+                                    // baseline, but do not persist this startup event.
+                                    ev_window_size_tracking_ready.set(true);
+                                }
+                                return EventResult::Propagate;
+                            }
+                            // Record the last user-adjusted windowed size while the
+                            // resize event still carries authoritative native
+                            // geometry. Persisting only during CloseRequested can
+                            // observe an installer/minimize transition instead
+                            // (#278). Keep writes in memory here; save_layout flushes
+                            // the config on exit.
+                            if ev_window_size_tracking_ready.get() && !maxed && !minimized {
+                                let scale = win.window().scale_factor().max(0.01);
+                                let width = size.width as f32 / scale;
+                                let height = size.height as f32 / scale;
+                                if width > 200.0 && height > 200.0 {
+                                    ev_store.borrow_mut().set_window_size(width, height);
+                                    tracing::debug!(
+                                        "[WINDOW_SIZE] recorded user size {:.0}x{:.0}",
+                                        width,
+                                        height
                                     );
                                 }
-                            } else {
-                                // First run: accept the initialized size as the
-                                // baseline, but do not persist this startup event.
-                                ev_window_size_tracking_ready.set(true);
-                            }
-                            return EventResult::Propagate;
-                        }
-                        // Record the last user-adjusted windowed size while the
-                        // resize event still carries authoritative native
-                        // geometry. Persisting only during CloseRequested can
-                        // observe an installer/minimize transition instead
-                        // (#278). Keep writes in memory here; save_layout flushes
-                        // the config on exit.
-                        if ev_window_size_tracking_ready.get() && !maxed && !minimized {
-                            let scale = win.window().scale_factor().max(0.01);
-                            let width = size.width as f32 / scale;
-                            let height = size.height as f32 / scale;
-                            if width > 200.0 && height > 200.0 {
-                                ev_store.borrow_mut().set_window_size(width, height);
-                                tracing::debug!(
-                                    "[WINDOW_SIZE] recorded user size {:.0}x{:.0}",
-                                    width,
-                                    height
-                                );
                             }
                         }
                     }
-                }
-                WEvent::CloseRequested => {
-                    // Confirm before closing if there are open session tabs (#88),
-                    // so a stray double-click on the title-bar icon / X / Alt+F4
-                    // doesn't silently drop live sessions. Installer/Restart
-                    // Manager may send repeated requests, so never intercept
-                    // again after the user has confirmed shutdown (#267).
-                    if should_block_close(
-                        ev_exit_confirmed.get(),
-                        !close_handles.borrow().is_empty(),
-                    ) {
+                    WEvent::CloseRequested => {
+                        // Confirm before closing if there are open session tabs (#88),
+                        // so a stray double-click on the title-bar icon / X / Alt+F4
+                        // doesn't silently drop live sessions. Installer/Restart
+                        // Manager may send repeated requests, so never intercept
+                        // again after the user has confirmed shutdown (#267).
+                        if should_block_close(
+                            ev_exit_confirmed.get(),
+                            !close_handles.borrow().is_empty(),
+                        ) {
+                            if let Some(win) = weak.upgrade() {
+                                win.set_confirm_close_open(true);
+                            }
+                            return EventResult::PreventDefault;
+                        }
+                        ev_exit_confirmed.set(true);
+                        // No sessions → the window is about to close; persist layout.
                         if let Some(win) = weak.upgrade() {
-                            win.set_confirm_close_open(true);
+                            save_layout(&win, &ev_store);
                         }
-                        return EventResult::PreventDefault;
                     }
-                    ev_exit_confirmed.set(true);
-                    // No sessions → the window is about to close; persist layout.
-                    if let Some(win) = weak.upgrade() {
-                        save_layout(&win, &ev_store);
-                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            EventResult::Propagate
-        });
+                EventResult::Propagate
+            });
     }
     // Confirm-close dialog "Close" → actually quit the event loop (#88).
     {
@@ -2293,10 +2396,8 @@ pub fn run() -> Result<()> {
         window.on_win_close(move || {
             if let Some(w) = weak.upgrade() {
                 // Mirror the native-X behaviour: confirm if sessions are open.
-                if !should_block_close(
-                    wc_exit_confirmed.get(),
-                    !close_handles.borrow().is_empty(),
-                ) {
+                if !should_block_close(wc_exit_confirmed.get(), !close_handles.borrow().is_empty())
+                {
                     wc_exit_confirmed.set(true);
                     save_layout(&w, &wc_store);
                     let _ = slint::quit_event_loop();
@@ -2439,23 +2540,36 @@ fn terminal_wheel_hit(
     let mut term_w = term.w;
     let mut term_h = term.h;
 
-    // TerminalView starts with a 24px status line, then the SFTP dock-region.
-    term_y += 24.0;
-    term_h = (term_h - 24.0).max(0.0);
+    // Zen mode removes the status strip and command bar as well as all docks.
+    if !win.get_zen_mode() {
+        term_y += 24.0;
+        term_h = (term_h - 24.0).max(0.0);
+    }
 
     let sftp_dock = win.get_sftp_dock().to_string();
-    let sftp_take = if term_state.sftp_collapsed {
+    let sftp_take = if win.get_zen_mode() {
+        0.0
+    } else if term_state.sftp_collapsed {
         36.0
     } else if sftp_dock == "left" || sftp_dock == "right" {
         term_state.sftp_panel_width + 4.0
     } else {
         term_state.sftp_panel_height + 4.0
     };
-    shrink_edge(&mut term_x, &mut term_y, &mut term_w, &mut term_h, &sftp_dock, sftp_take);
+    shrink_edge(
+        &mut term_x,
+        &mut term_y,
+        &mut term_w,
+        &mut term_h,
+        &sftp_dock,
+        sftp_take,
+    );
 
     // Leave the command bar to TextInput/history handling; wheel fallback is for
     // terminal output only.
-    term_h = (term_h - 34.0).max(0.0);
+    if !win.get_zen_mode() {
+        term_h = (term_h - 34.0).max(0.0);
+    }
     if !contains_logical(
         LogicalRect {
             x: term_x,
@@ -2520,6 +2634,10 @@ fn app_content_area(win: &AppWindow) -> LogicalRect {
         h: 0.0,
     };
     area.h = size.height as f32 / scale - area.y;
+
+    if win.get_zen_mode() {
+        return area;
+    }
 
     if win.get_welcome_as_sidebar() {
         let dock = win.get_welcome_sidebar_dock().to_string();
@@ -2616,6 +2734,9 @@ fn active_terminal_panel_rects(win: &AppWindow) -> Option<(String, LogicalRect, 
 }
 
 fn active_sftp_file_list_rect(win: &AppWindow) -> Option<LogicalRect> {
+    if win.get_zen_mode() {
+        return None;
+    }
     let (_active, term, term_state) = active_terminal_panel_rects(win)?;
     if term_state.sftp_collapsed {
         return None;
@@ -2842,6 +2963,7 @@ fn wire_session_callbacks(
             w.set_dialog_stop_bits("1".into());
             w.set_dialog_parity("none".into());
             w.set_dialog_flow("none".into());
+            w.set_dialog_encoding("UTF-8".into());
             w.set_dialog_disable_shell_integration(false);
             w.set_dialog_note("".into());
             w.set_dialog_editing(false);
@@ -3056,6 +3178,7 @@ fn wire_session_callbacks(
                 w.set_dialog_stop_bits(session.stop_bits.to_string().into());
                 w.set_dialog_parity(session.parity.clone().into());
                 w.set_dialog_flow(session.flow_control.clone().into());
+                w.set_dialog_encoding(session.encoding.clone().into());
                 w.set_dialog_disable_shell_integration(session.disable_shell_integration);
                 w.set_dialog_note(session.note.clone().into());
                 w.set_dialog_editing(true);
@@ -3197,10 +3320,7 @@ fn wire_session_callbacks(
                 if trimmed.is_empty() {
                     Some(t("请输入分组名称", "Enter a group name"))
                 } else if is_reserved_session_group(trimmed) {
-                    Some(t(
-                        "该名称为系统保留分组",
-                        "This group name is reserved",
-                    ))
+                    Some(t("该名称为系统保留分组", "This group name is reserved"))
                 } else if (orig.is_empty() || !trimmed.eq_ignore_ascii_case(orig.as_str()))
                     && s.session_group_exists(trimmed)
                 {
@@ -3346,6 +3466,7 @@ fn wire_session_callbacks(
                 stop_bits: draft.stop_bits as u8,
                 parity: draft.parity.to_string(),
                 flow_control: draft.flow_control.to_string(),
+                encoding: draft.encoding.to_string(),
                 forwards,
                 disable_shell_integration: draft.disable_shell_integration,
                 note: draft.note.to_string(),
@@ -3541,13 +3662,19 @@ fn wire_session_callbacks(
     {
         let weak = window.as_weak();
         window.on_session_dialog_pick_key(move || {
-            let mut dialog =
-                rfd::FileDialog::new()
-                    .set_title(t("选择私钥文件", "Choose private key file"))
-                    .add_filter(
-                        t("SSH 私钥", "SSH private keys"),
-                        &["ppk", "pem", "key"],
-                    );
+            let mut dialog = rfd::FileDialog::new()
+                .set_title(t("选择私钥文件", "Choose private key file"));
+            // OpenSSH's standard macOS key names (id_ed25519, id_rsa, …) have
+            // no extension. A native macOS extension filter makes those files
+            // visible but disabled, so leave the picker unfiltered there (#325).
+            // Other platforms retain the narrower existing filter.
+            #[cfg(not(target_os = "macos"))]
+            {
+                dialog = dialog.add_filter(
+                    t("SSH 私钥", "SSH private keys"),
+                    &["ppk", "pem", "key"],
+                );
+            }
             // Start in ~/.ssh if it exists.
             if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().join(".ssh")) {
                 if home.is_dir() {
@@ -3758,19 +3885,12 @@ fn wire_session_callbacks(
                     csi_state: CsiState::Normal,
                     csi_pending: Vec::new(),
                     raw: std::collections::VecDeque::new(),
-                    interrupt_drop: std::sync::atomic::AtomicBool::new(false),
-                    hl_version: 0,
-                    hl_cache_version: 0,
-                    hl_cache: HashMap::new(),
                 })),
             );
-            render_gates
-                .lock()
-                .unwrap()
-                .insert(
-                    tab_id.clone(),
-                    Arc::new(TabRenderGate::new(RENDER_MIN_INTERVAL)),
-                );
+            render_gates.lock().unwrap().insert(
+                tab_id.clone(),
+                Arc::new(TabRenderGate::new(RENDER_MIN_INTERVAL)),
+            );
             // No followed-cwd yet: the first OSC 7 always triggers a follow.
             sftp_last_cwd.lock().unwrap().remove(&tab_id);
             // Add the new tab to the focused pane and re-flatten (this also sets
@@ -3853,7 +3973,6 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
     s.set_sidebar_collapsed(win.get_sidebar_collapsed());
     s.set_sftp_panel_width(win.get_sftp_panel_width());
     s.set_sftp_panel_height(win.get_sftp_panel_height());
-    s.set_sftp_tree_width(win.get_sftp_tree_width());
     s.set_sftp_dock(win.get_sftp_dock().to_string());
     s.set_quick_panel_open(win.get_quick_panel_open());
     s.set_quick_panel_collapsed(win.get_quick_panel_collapsed());
@@ -3871,11 +3990,7 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
         .with_winit_window(|ww| ww.is_maximized())
         .unwrap_or_else(|| win.get_window_maximized());
     let (saved_w, saved_h) = s.window_size();
-    if !native_maximized
-        && (saved_w <= 0.0 || saved_h <= 0.0)
-        && w > 200.0
-        && h > 200.0
-    {
+    if !native_maximized && (saved_w <= 0.0 || saved_h <= 0.0) && w > 200.0 && h > 200.0 {
         // Normal resize events keep this cache current. Only fall back to the
         // close-time geometry for a first run where no valid resize was seen;
         // do not issue a new native resize while the window is shutting down.
@@ -4150,13 +4265,9 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_run_command(
             move |tab_id: SharedString, cmd: SharedString, to_all: bool, send_enter: bool| {
-                let line = cmd.trim_end().to_string();
-                if line.is_empty() {
-                    return;
-                }
-                let mut bytes = line.clone().into_bytes();
-                if send_enter {
-                    bytes.push(b'\n');
+                let (history_line, mut bytes) = encode_command_bar_input(&cmd);
+                if !send_enter {
+                    bytes.pop();
                 }
                 {
                     let h = handles_rc.borrow();
@@ -4168,13 +4279,13 @@ fn wire_key_input(
                         handle.send_raw(bytes);
                     }
                 }
-                {
+                if let Some(line) = history_line {
                     let mut s = store_rc.borrow_mut();
                     s.push_command_history(line);
                     let _ = s.save();
-                }
-                if let Some(w) = weak.upgrade() {
-                    w.set_command_history(history_model(&store_rc.borrow()));
+                    if let Some(w) = weak.upgrade() {
+                        w.set_command_history(history_model(&s));
+                    }
                 }
             },
         );
@@ -4471,6 +4582,33 @@ fn wire_key_input(
     // Forward each keystroke as raw bytes to the SSH PTY. The server's bash /
     // readline handles echo, history (↑↓), Tab completion, Ctrl+C, etc.
     {
+        // Capture Slint's raw modifier mapping before app-shortcut routing.
+        // WARN is deliberate: packaged builds persist WARN+ to error.log.
+        window.on_diagnose_key_event(
+            move |tab_id: SharedString,
+                  key: SharedString,
+                  raw_control: bool,
+                  raw_meta: bool,
+                  alt: bool,
+                  shift: bool| {
+                if cfg!(target_os = "macos")
+                    && (raw_control
+                        || raw_meta
+                        || key.chars().any(|c| (0x10..=0x18).contains(&(c as u32))))
+                {
+                    tracing::warn!(
+                        "[KEY_DIAG_312] stage=slint tab={} key={} raw_control={} raw_meta={} alt={} shift={}",
+                        tab_id,
+                        redact_key(key.as_str()),
+                        raw_control,
+                        raw_meta,
+                        alt,
+                        shift
+                    );
+                }
+            },
+        );
+
         let handles = handles.clone();
         let bufs = bufs.clone();
         let sync_input = sync_input.clone();
@@ -4731,25 +4869,36 @@ fn wire_key_input(
                 key.as_str(),
                 ctrl,
                 bare_ctrl_marker_workaround_enabled(),
-            ) {
+            ) || should_drop_macos_bare_ctrl_marker(key.as_str(), ctrl, cfg!(target_os = "macos"))
+            {
                 tracing::debug!(
                     "send_key: dropped Slint bare Ctrl modifier marker {}",
                     redact_key(key.as_str())
                 );
+                if cfg!(target_os = "macos") {
+                    tracing::warn!(
+                        "[KEY_DIAG_312] stage=filter tab={} key={} ctrl={} alt={} shift={} action=drop_bare_marker",
+                        tab_id, redact_key(key.as_str()), ctrl, alt, shift
+                    );
+                }
                 return;
             }
 
             let bytes = key_to_pty_bytes(key.as_str(), ctrl, alt, app_cursor);
-            // Ctrl+C (0x03): mark this tab's output backlog for discard so a
-            // firehose stops scrolling immediately once the process is
-            // interrupted, instead of replaying the entire pre-read stream.
-            if bytes.as_slice() == [0x03] {
-                if let Some(h) = term_buf(&bufs, tab_id.as_str()) {
-                    if let Ok(mut b) = h.lock() {
-                        b.interrupt_drop
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
+            if cfg!(target_os = "macos")
+                && (ctrl || key.chars().any(|c| (0x10..=0x18).contains(&(c as u32))))
+            {
+                tracing::warn!(
+                    "[KEY_DIAG_312] stage=pty tab={} key={} ctrl={} alt={} shift={} app_cursor={} encoded={} action={}",
+                    tab_id,
+                    redact_key(key.as_str()),
+                    ctrl,
+                    alt,
+                    shift,
+                    app_cursor,
+                    redact_key(&String::from_utf8_lossy(&bytes)),
+                    if bytes.is_empty() { "drop_empty" } else { "send" }
+                );
             }
             // Log only the length — never the keystroke bytes, which can be
             // password characters (#15).
@@ -4873,6 +5022,7 @@ fn wire_key_input(
     {
         let handles = handles.clone();
         let bufs = bufs.clone();
+        let weak = window.as_weak();
         window.on_paste_from_clipboard(move |tab_id: SharedString| {
             // Clone the (Send) command sender for this tab so the clipboard read
             // can run off the UI thread.  Reading arboard on the event-loop
@@ -4884,18 +5034,63 @@ fn wire_key_input(
                 .map(|h| h.commands.clone());
             let Some(sender) = sender else { return };
             let bracketed = terminal_uses_bracketed_paste(&bufs, tab_id.as_str());
+            let confirm_multiline = weak
+                .upgrade()
+                .map(|w| w.get_paste_confirm_enabled())
+                .unwrap_or(true);
+            let weak = weak.clone();
             let tab_id = tab_id.to_string();
             std::thread::spawn(move || {
                 match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     Ok(text) => {
-                        let bytes = encode_pasted_text(&text, bracketed);
-                        let _ = sender.send(SessionCommand::RawInput(bytes));
+                        let force_review = text.len() > 100 * 1024;
+                        if text.contains(['\r', '\n']) && (confirm_multiline || force_review) {
+                            let large = paste_requires_large_review(&text);
+                            let preview = text.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(w) = weak.upgrade() {
+                                    w.set_paste_confirm_tab(tab_id.into());
+                                    w.set_paste_confirm_text(text.into());
+                                    w.set_paste_confirm_preview(preview.into());
+                                    w.set_paste_confirm_large(large);
+                                    w.set_paste_confirm_open(true);
+                                }
+                            });
+                        } else {
+                            let bytes = encode_pasted_text(&text, bracketed);
+                            let _ = sender.send(SessionCommand::RawInput(bytes));
+                        }
                     }
                     Err(e) => tracing::warn!("paste_from_clipboard: clipboard error: {}", e),
                 }
             });
         });
     }
+
+    // Accept a previously reviewed multi-line paste (#262).
+    {
+        let handles_paste = handles.clone();
+        let bufs_paste = bufs.clone();
+        let weak = window.as_weak();
+        window.on_paste_confirmed(move |tab_id: SharedString| {
+            let Some(sender) = handles_paste
+                .borrow()
+                .get(tab_id.as_str())
+                .map(|h| h.commands.clone())
+            else {
+                return;
+            };
+            let Some(w) = weak.upgrade() else { return };
+            let text = w.get_paste_confirm_text().to_string();
+            let bracketed = terminal_uses_bracketed_paste(&bufs_paste, tab_id.as_str());
+            let _ = sender.send(SessionCommand::RawInput(encode_pasted_text(
+                &text, bracketed,
+            )));
+            w.set_paste_confirm_open(false);
+        });
+    }
+
+    window.on_paste_confirm_cancelled(|| {});
 
     // Context menu → 清空缓存: reset the local vt100 buffer (drops scrollback),
     // wipe the displayed screen, then nudge the remote to redraw a fresh prompt.
@@ -5058,34 +5253,36 @@ fn wire_key_input(
     {
         let bufs_sel = bufs.clone();
         let weak = window.as_weak();
-        window.on_term_select_start(move |tab_id: SharedString, row: i32, col: i32, ctrl: bool, shift: bool| {
-            let tid = tab_id.to_string();
-            with_term_buf(&bufs_sel, &tid, |buf| {
-                let (rows, cols) = buf.parser.screen().size();
-                let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
-                let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
-                // Anchor + focus in absolute scrollback coordinates.
-                let abs = buf.vis_to_abs(r);
-                let point = (abs, c);
-                if ctrl && !shift {
-                    buf.sel_ranges.push((point, point));
-                } else if shift && !buf.sel_ranges.is_empty() {
-                    let anchor = buf.sel_ranges.last().map(|range| range.0).unwrap_or(point);
-                    if let Some(range) = buf.sel_ranges.last_mut() {
-                        *range = (anchor, point);
+        window.on_term_select_start(
+            move |tab_id: SharedString, row: i32, col: i32, ctrl: bool, shift: bool| {
+                let tid = tab_id.to_string();
+                with_term_buf(&bufs_sel, &tid, |buf| {
+                    let (rows, cols) = buf.parser.screen().size();
+                    let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
+                    let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
+                    // Anchor + focus in absolute scrollback coordinates.
+                    let abs = buf.vis_to_abs(r);
+                    let point = (abs, c);
+                    if ctrl && !shift {
+                        buf.sel_ranges.push((point, point));
+                    } else if shift && !buf.sel_ranges.is_empty() {
+                        let anchor = buf.sel_ranges.last().map(|range| range.0).unwrap_or(point);
+                        if let Some(range) = buf.sel_ranges.last_mut() {
+                            *range = (anchor, point);
+                        }
+                    } else {
+                        buf.sel_ranges.clear();
+                        buf.sel_ranges.push((point, point));
                     }
-                } else {
-                    buf.sel_ranges.clear();
-                    buf.sel_ranges.push((point, point));
+                    let (anchor, focus) = buf.sel_ranges.last().copied().unwrap_or((point, point));
+                    buf.sel_anchor = Some(anchor);
+                    buf.sel_focus = Some(focus);
+                });
+                if let Some(win) = weak.upgrade() {
+                    refresh_terminal_selection(&win, &bufs_sel, &tid);
                 }
-                let (anchor, focus) = buf.sel_ranges.last().copied().unwrap_or((point, point));
-                buf.sel_anchor = Some(anchor);
-                buf.sel_focus = Some(focus);
-            });
-            if let Some(win) = weak.upgrade() {
-                refresh_terminal_selection(&win, &bufs_sel, &tid);
-            }
-        });
+            },
+        );
     }
     {
         let bufs_sel = bufs.clone();
@@ -5151,6 +5348,26 @@ fn wire_key_input(
             }
         });
     }
+    {
+        let bufs_sel = bufs.clone();
+        let weak = window.as_weak();
+        window.on_term_select_word(move |tab_id: SharedString, row: i32, col: i32| {
+            let tid = tab_id.to_string();
+            let text = with_term_buf(&bufs_sel, &tid, |buf| {
+                let (rows, cols) = buf.parser.screen().size();
+                let row = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
+                let col = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
+                buf.select_word_at(row, col)
+            })
+            .flatten();
+            if let Some(text) = text.filter(|text| !text.is_empty()) {
+                std::thread::spawn(move || clipboard_set_text(text));
+            }
+            if let Some(win) = weak.upgrade() {
+                refresh_terminal_selection(&win, &bufs_sel, &tid);
+            }
+        });
+    }
     // Auto-scroll while drag-selecting past the visible top/bottom edge.  The
     // anchor is in absolute coordinates so it stays pinned no matter how far the
     // view moves; we only advance the scrollback view and re-point the focus at
@@ -5208,31 +5425,6 @@ fn wire_key_input(
             }
         });
     }
-    // Double-click word selection (qian branch feature): select the "word"
-    // under the cell and copy it to the clipboard (Xshell/PuTTY style).
-    {
-        let bufs_sel = bufs.clone();
-        let weak = window.as_weak();
-        window.on_term_select_word(move |tab_id: SharedString, row: i32, col: i32| {
-            let tid = tab_id.to_string();
-            let text = {
-                let Some(h) = term_buf(&bufs_sel, &tid) else {
-                    return;
-                };
-                let mut buf = h.lock().unwrap();
-                let (rows, cols) = buf.parser.screen().size();
-                let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
-                let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
-                buf.select_word_at(r, c)
-            };
-            if let Some(t) = text {
-                std::thread::spawn(move || clipboard_set_text(t));
-            }
-            if let Some(win) = weak.upgrade() {
-                rebuild_tab_display(&win, &bufs_sel, &tid);
-            }
-        });
-    }
 }
 
 fn set_terminal_row(win: &AppWindow, tab_id: &str, mutator: impl Fn(&mut TerminalState)) {
@@ -5284,6 +5476,18 @@ fn redact_key(key: &str) -> String {
     parts.join(",")
 }
 
+/// macOS/IME combinations may report bare physical Control as a C0 character:
+/// U+0017 opens nano search before Ctrl+X (#312), while U+0008 is encoded as
+/// Backspace and deletes the preceding character during Ctrl+Space (#348).
+fn should_drop_macos_bare_ctrl_marker(key: &str, ctrl: bool, is_macos: bool) -> bool {
+    is_macos
+        && ctrl
+        && matches!(
+            key.chars().collect::<Vec<_>>().as_slice(),
+            ['\u{0008}'] | ['\u{0017}']
+        )
+}
+
 /// `app_cursor` mirrors the remote terminal's DECCKM mode (`\x1b[?1h/l`):
 /// when true the four arrow keys must use SS3 sequences (`\x1bOA`…) instead
 /// of the default CSI sequences (`\x1b[A`…).  Full-screen apps like nano and
@@ -5301,45 +5505,6 @@ fn line_numbers_for(content: &str) -> String {
         let _ = write!(s, "{i}");
     }
     s
-}
-
-/// Update the built-in editor's syntax-highlighting layers: comment lines
-/// (`#`) go on the green `editor-comment-text` layer, everything else on the
-/// `editor-normal-text` layer (rendered behind the near-transparent TextInput).
-/// (qian branch feature)
-fn update_editor_text_layers(win: &AppWindow, content: &str) {
-    let mut comment_lines = Vec::new();
-    let mut normal_lines = Vec::new();
-    for line in content.split('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('#') {
-            comment_lines.push(line);
-            normal_lines.push("");
-        } else {
-            comment_lines.push("");
-            normal_lines.push(line);
-        }
-    }
-    win.set_editor_comment_text(comment_lines.join("\n").into());
-    win.set_editor_normal_text(normal_lines.join("\n").into());
-}
-
-/// Every byte offset where `query` occurs in `text` (ascending, non-overlapping).
-/// Used by the editor's find/replace panel — Slint has no string-search op so
-/// the search runs here and the offsets are returned to Slint for highlighting.
-/// (qian branch feature)
-fn editor_find_offsets(text: &str, query: &str) -> Vec<i32> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let mut offsets = Vec::new();
-    let mut start = 0;
-    while let Some(idx) = text[start..].find(query) {
-        let abs = start + idx;
-        offsets.push(abs as i32);
-        start = abs + query.len();
-    }
-    offsets
 }
 
 /// Write `text` to the system clipboard. Call from a dedicated thread, never the

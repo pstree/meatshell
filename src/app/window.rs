@@ -186,8 +186,8 @@ pub(super) fn clamp_window_size_to_monitor(
         let monitor_pos = monitor.position();
         let max_w = (monitor_size.width as f64 / scale - 16.0).max(1.0) as f32;
         let max_h = (monitor_size.height as f64 / scale - 16.0).max(1.0) as f32;
-        let min_w = 960.0_f32.min(max_w);
-        let min_h = 600.0_f32.min(max_h);
+        let min_w = 720.0_f32.min(max_w);
+        let min_h = 420.0_f32.min(max_h);
         let current = ww.inner_size();
         let current_w = (current.width as f64 / scale) as f32;
         let current_h = (current.height as f64 / scale) as f32;
@@ -341,7 +341,7 @@ where
 ///
 /// Must run before any window is created. We build the backend explicitly, which
 /// would otherwise bypass the `SLINT_BACKEND` renderer override that exists as the
-/// macOS femtovg/Skia escape hatch (#108/#129) — so we re-honour it by hand.
+/// macOS software/FemtoVG/Skia selection (#108/#129) — so we re-honour it by hand.
 #[cfg(target_os = "macos")]
 pub(super) fn setup_macos_platform(renderer_mode: &str) {
     use i_slint_backend_winit::winit::platform::macos::WindowAttributesExtMacOS;
