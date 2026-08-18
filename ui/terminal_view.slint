@@ -410,16 +410,6 @@ export component TerminalView inherits Rectangle {
         }
     }
 
-    // Quick-click bar: filling the input box without sending (send-enter=false).
-    // A seq-triggered `changed` handler is used so the bar buttons (siblings of
-    // cmd-input) can set the input text without reaching into cmd-bar's scope.
-    property <string> quick-fill-command: "";
-    property <int> quick-fill-seq: 0;
-    changed quick-fill-seq => {
-        cmd-input.text = root.quick-fill-command;
-        cmd-input.focus();
-    }
-
     background: Theme.term-bg;
     forward-focus: ime-input;
 
