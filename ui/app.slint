@@ -669,12 +669,21 @@ export component AppWindow inherits Window {
     in-out property <string> editor-replace-text;
     in-out property <int> editor-match-count: 0;
     in-out property <int> editor-find-position: -1;
+    // 编辑器修改：语法高亮分两层——注释行（绿色）/普通行，均绘制在近透明
+    // 的编辑器 TextInput 之下以透出颜色（qian 分支特性）。
+    in-out property <string> editor-comment-text: "";
+    in-out property <string> editor-normal-text: "";
     callback save-file();                     // Ctrl+S / Save button (edit only)
     callback close-editor();                  // X / Esc; discard unsaved edits (#287)
     callback editor-recount(string);          // rebuild line numbers after an edit
     callback editor-count-matches(string /* content */, string /* query */) -> int;
     callback editor-find-step(string /* content */, string /* query */, int /* current */, bool /* reverse */) -> EditorFindResult;
     callback editor-replace-all(string /* query */, string /* replacement */);
+    // 编辑器修改：查找定位文本（#287）——把字节偏移换算为可视行号等，供界面
+    // 在查找时把 ScrollView 滚动并居中到匹配行。
+    callback editor-line-index-at(string /* content */, int /* byte offset */) -> int;
+    callback editor-line-count(string /* content */) -> int;
+    callback editor-byte-length-of(string) -> int;
     // Editor card geometry: draggable by its title bar, resizable from the
     // bottom-right grip (same absolute-position pattern as the Interface
     // dialog). Defaults centre the card; user drags/resizes override them.
@@ -2311,6 +2320,22 @@ export component AppWindow inherits Window {
                                     root.editor-find-position = -1;
                                     root.editor-match-count = root.editor-count-matches(
                                         root.editor-content, root.editor-find-query);
+                                    // 编辑器修改：查找定位文本（#287）——输入查询词时
+                                    // 立即滚动并居中到第一个匹配行。
+                                    if (root.editor-match-count > 0) {
+                                        let found = root.editor-find-step(
+                                            root.editor-content, root.editor-find-query, -1, false);
+                                        root.editor-find-position = found.start;
+                                        edit-input.set-selection-offsets(found.start, found.end);
+                                        // 用匹配字节偏移推算可视行号，滚动到该行并居中。
+                                        let line-index = root.editor-line-index-at(root.editor-content, found.start);
+                                        let n-lines = root.editor-line-count(root.editor-content);
+                                        let line-height = edit-input.preferred-height / max(1, n-lines);
+                                        let match-y = edit-input.y + line-height * line-index;
+                                        let target-top = max(0px, match-y - max(0px, ed-scroll.visible-height / 2 - line-height));
+                                        let min-y = min(0px, ed-scroll.visible-height - ed-scroll.viewport-height);
+                                        ed-scroll.viewport-y = max(min-y, min(0px, -target-top));
+                                    }
                                 }
                             }
                             Text {
@@ -2333,6 +2358,15 @@ export component AppWindow inherits Window {
                                         root.editor-match-count = found.count;
                                         edit-input.set-selection-offsets(found.start, found.end);
                                         edit-input.focus();
+                                        // 编辑器修改：查找定位文本（#287）——上一处，
+                                        // 滚动并居中到匹配行。
+                                        let line-index = root.editor-line-index-at(root.editor-content, found.start);
+                                        let n-lines = root.editor-line-count(root.editor-content);
+                                        let line-height = edit-input.preferred-height / max(1, n-lines);
+                                        let match-y = edit-input.y + line-height * line-index;
+                                        let target-top = max(0px, match-y - max(0px, ed-scroll.visible-height / 2 - line-height));
+                                        let min-y = min(0px, ed-scroll.visible-height - ed-scroll.viewport-height);
+                                        ed-scroll.viewport-y = max(min-y, min(0px, -target-top));
                                     }
                                 }
                                 Text { text: "↑"; color: Theme.text-primary; horizontal-alignment: center; vertical-alignment: center; }
@@ -2350,6 +2384,15 @@ export component AppWindow inherits Window {
                                         root.editor-match-count = found.count;
                                         edit-input.set-selection-offsets(found.start, found.end);
                                         edit-input.focus();
+                                        // 编辑器修改：查找定位文本（#287）——下一处，
+                                        // 滚动并居中到匹配行。
+                                        let line-index = root.editor-line-index-at(root.editor-content, found.start);
+                                        let n-lines = root.editor-line-count(root.editor-content);
+                                        let line-height = edit-input.preferred-height / max(1, n-lines);
+                                        let match-y = edit-input.y + line-height * line-index;
+                                        let target-top = max(0px, match-y - max(0px, ed-scroll.visible-height / 2 - line-height));
+                                        let min-y = min(0px, ed-scroll.visible-height - ed-scroll.viewport-height);
+                                        ed-scroll.viewport-y = max(min-y, min(0px, -target-top));
                                     }
                                 }
                                 Text { text: "↓"; color: Theme.text-primary; horizontal-alignment: center; vertical-alignment: center; }
@@ -2411,6 +2454,44 @@ export component AppWindow inherits Window {
                             ed-scroll := ScrollView {
                                 viewport-width: max(self.visible-width, edit-input.preferred-width + 16px);
                                 viewport-height: max(self.visible-height, edit-input.preferred-height + 16px);
+
+                                // --- 编辑器修改：语法高亮（qian 分支特性） ---
+                                // 在近透明输入框之下绘制两层着色文本：`#` 注释行绿色，
+                                // 其余普通行使用前景色；TextInput 只负责选区与自绘光标。
+                                Text {
+                                    x: edit-input.x;
+                                    y: edit-input.y;
+                                    width: edit-input.width;
+                                    height: edit-input.height;
+                                    text: root.editor-comment-text;
+                                    color: Theme.success;
+                                    font-family: Theme.ui-font-family;
+                                    font-size: Theme.fs-md;
+                                    wrap: no-wrap;
+                                }
+                                Text {
+                                    x: edit-input.x;
+                                    y: edit-input.y;
+                                    width: edit-input.width;
+                                    height: edit-input.height;
+                                    text: root.editor-normal-text;
+                                    color: Theme.text-primary;
+                                    font-family: Theme.ui-font-family;
+                                    font-size: Theme.fs-md;
+                                    wrap: no-wrap;
+                                }
+
+                                // 编辑器修改：自绘光标——TextInput 文字近透明（以透出高亮层），
+                                // 其原生光标也随之不可见，因此自绘一个闪烁的块状光标。
+                                private property <length> ed-cursor-x: 0px;
+                                private property <length> ed-cursor-y: 0px;
+                                private property <bool> ed-cursor-visible: true;
+                                ed-cursor-blink := Timer {
+                                    interval: 500ms;
+                                    running: edit-input.has-focus && !root.editor-readonly;
+                                    triggered => { ed-cursor-visible = !ed-cursor-visible; }
+                                }
+
                                 edit-input := TextInput {
                                     x: 8px;
                                     y: 8px;
@@ -2420,7 +2501,10 @@ export component AppWindow inherits Window {
                                     read-only: root.editor-readonly;
                                     single-line: false;
                                     wrap: no-wrap;
-                                    color: Theme.text-primary;
+                                    // 编辑器修改：文字近透明，由下方高亮层着色；仅显示选区。
+                                    color: Theme.text-primary.with-alpha(0.01);
+                                    selection-background-color: Theme.accent;
+                                    selection-foreground-color: white;
                                     font-family: Theme.ui-font-family;
                                     font-size: Theme.fs-md;
                                     edited => {
@@ -2429,6 +2513,24 @@ export component AppWindow inherits Window {
                                         root.editor-match-count = root.editor-count-matches(
                                             root.editor-content, root.editor-find-query);
                                     }
+                                    cursor-position-changed(pos) => {
+                                        ed-cursor-x = pos.x;
+                                        ed-cursor-y = pos.y;
+                                    }
+                                }
+
+                                // 编辑器修改：自绘光标图形本身（闪烁块状光标）。
+                                Rectangle {
+                                    visible: edit-input.has-focus && !root.editor-readonly;
+                                    x: edit-input.x + ed-cursor-x;
+                                    y: edit-input.y + ed-cursor-y;
+                                    width: 2px;
+                                    height: edit-input.font-size * 1.2;
+                                    background: Theme.text-primary;
+                                    opacity: ed-cursor-visible ? 1 : 0;
+                                    animate x { duration: 50ms; }
+                                    animate y { duration: 50ms; }
+                                    animate opacity { duration: 100ms; }
                                 }
                             }
                         }

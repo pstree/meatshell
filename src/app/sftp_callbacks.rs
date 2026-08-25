@@ -674,16 +674,34 @@ pub(super) fn wire_sftp_callbacks(
         });
     }
 
-    // Rebuild the editor's line-number gutter after each edit (#81). The text
-    // comes straight from the TextInput so we don't re-read the property.
+    // 编辑器修改：每次编辑后重建行号，并同步刷新两层语法着色（#81 等）。
     {
         let weak = window.as_weak();
         window.on_editor_recount(move |text: SharedString| {
             if let Some(w) = weak.upgrade() {
                 w.set_editor_line_numbers(line_numbers_for(text.as_str()).into());
+                // 编辑器修改：刷新注释/普通行的语法高亮层。
+                update_editor_text_layers(&w, text.as_str());
             }
         });
     }
+    // 编辑器修改：查找定位文本所需的三组辅助查询（#287）。
+    // Slint 无法统计行数/切分字符串，因此由 Rust 把字节偏移换算成可视行号，
+    // 供界面在点击“上一处/下一处”或输入查询词时把 ScrollView 滚动并居中到匹配行。
+    window.on_editor_line_index_at(|content: SharedString, offset: i32| {
+        let mut off = offset.max(0) as usize;
+        let bytes = content.as_str().as_bytes();
+        if off > bytes.len() {
+            off = bytes.len();
+        }
+        bytes[..off].iter().filter(|&&b| b == b'\n').count() as i32
+    });
+    // 编辑器修改：逻辑总行数（换行数 + 1），用于估算单行像素高度。
+    window.on_editor_line_count(|content: SharedString| {
+        content.as_str().split('\n').count().max(1) as i32
+    });
+    // 编辑器修改：字符串的 UTF-8 字节长度，供界面定位匹配文本的选中范围。
+    window.on_editor_byte_length_of(|s: SharedString| s.as_str().len() as i32);
 
     // Built-in editor: save (Ctrl+S / button) writes the text back to the
     // remote file (#70). Read-only (view) sessions never save.
@@ -782,6 +800,8 @@ pub(super) fn wire_sftp_callbacks(
             w.set_editor_content(replaced.clone().into());
             w.set_editor_dirty(true);
             w.set_editor_line_numbers(line_numbers_for(&replaced).into());
+            // 编辑器修改：替换可能改变行首注释判定，同步刷新语法高亮层。
+            update_editor_text_layers(&w, &replaced);
             w.set_editor_match_count(0);
         });
     }
