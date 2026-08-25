@@ -171,25 +171,6 @@ pub(super) fn apply_terminal_resize(
     }
 }
 
-/// Field-by-field equality for a `TermSpan`. Slint-generated structs don't get
-/// `PartialEq` by default, and we need this to skip touching spans whose screen
-/// cell hasn't changed — that's what keeps interactive typing from rebuilding the
-/// entire Slint span model every frame.
-fn span_eq(a: &TermSpan, b: &TermSpan) -> bool {
-    a.text == b.text
-        && a.fg == b.fg
-        && a.bg == b.bg
-        && a.bold == b.bold
-        && a.row == b.row
-        && a.col == b.col
-        && a.cells == b.cells
-        && a.cjk == b.cjk
-        && a.emoji == b.emoji
-        // `emoji-image` is compared by value/identity; both are empty in the
-        // common (non-emoji) path so this stays cheap.
-        && a.emoji_image == b.emoji_image
-}
-
 /// Recompute spans + cursor + find/selection highlights for one tab from its
 /// current vt100 screen (respecting scrollback) and push them to the model.
 /// Used by scroll + selection callbacks (Output has its own equivalent inline).
@@ -197,62 +178,26 @@ pub(super) fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &
     let data = with_term_buf(bufs, tab_id, |buf| {
         let cols = buf.parser.screen().size().1;
         let b = buf.render(); // also refreshes buf.displayed_text
-        // Only recompute find/selection when they're actually in use — otherwise
-        // we'd re-scan the whole screen on every interactive keystroke for nothing.
-        let matches = if buf.find_query.is_empty() {
-            None
-        } else {
-            Some(compute_find_matches(&buf.displayed_text, &buf.find_query))
-        };
-        let sel = if buf.sel_anchor.is_none() && buf.sel_ranges.is_empty() {
-            None
-        } else {
-            Some(buf.selection_rects_visible(cols))
-        };
+        let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
+        let sel = buf.selection_rects_visible(cols);
         (b, matches, sel)
     });
     let Some((b, matches, sel)) = data else {
         return;
     };
-    let fm = matches.map(|m| ModelRc::from(Rc::new(VecModel::from(m))));
-    let sm = sel.map(|s| ModelRc::from(Rc::new(VecModel::from(s))));
+    let spans = ModelRc::from(Rc::new(VecModel::from(b.spans)));
+    let fm = ModelRc::from(Rc::new(VecModel::from(matches)));
+    let sm = ModelRc::from(Rc::new(VecModel::from(sel)));
     let (cr, cc, ru, alt) = (b.cursor_row, b.cursor_col, b.rows_used, b.is_alt);
     let (smax, soff) = (b.scroll_max, b.scroll_offset);
-    set_terminal_row(win, tab_id, |row| {
-        // Incremental spans update: when the visible cell count is unchanged (the
-        // common case while typing — only the cursor line mutates), reuse the
-        // existing `VecModel` and patch only the spans that actually changed.
-        // Replacing the whole model every frame forces Slint to tear down and
-        // recreate every span element, which is what made interactive input feel
-        // janky. When the cell count differs (scroll/resize/alt-screen clear) we
-        // fall back to a full replacement, which is correct and rare.
-        if let Some(em) = row.spans.as_any().downcast_ref::<VecModel<TermSpan>>() {
-            if em.row_count() == b.spans.len() {
-                for idx in 0..b.spans.len() {
-                    let changed = match em.row_data(idx) {
-                        Some(old) => !span_eq(&old, &b.spans[idx]),
-                        None => true,
-                    };
-                    if changed {
-                        em.set_row_data(idx, b.spans[idx].clone());
-                    }
-                }
-            } else {
-                row.spans = ModelRc::from(Rc::new(VecModel::from(b.spans.clone())));
-            }
-        } else {
-            row.spans = ModelRc::from(Rc::new(VecModel::from(b.spans.clone())));
-        }
+    set_terminal_row(win, tab_id, move |row| {
+        row.spans = spans.clone();
         row.cursor_row = cr;
         row.cursor_col = cc;
         row.rows_used = ru;
         row.is_alt_screen = alt;
-        if let Some(fm) = &fm {
-            row.find_matches = fm.clone();
-        }
-        if let Some(sm) = &sm {
-            row.selection = sm.clone();
-        }
+        row.find_matches = fm.clone();
+        row.selection = sm.clone();
         row.scroll_max = smax;
         row.scroll_offset = soff;
     });

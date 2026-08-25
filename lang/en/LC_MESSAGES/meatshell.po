@@ -54,8 +54,8 @@ msgstr "About"
 msgid "About meatshell"
 msgstr "About meatshell"
 
-msgid "A lightweight Rust + Slint SSH terminal client by 'lil meatball'."
-msgstr "A lightweight Rust + Slint SSH terminal client by 'lil meatball'."
+msgid "A lightweight Rust + Slint SSH terminal client."
+msgstr "A lightweight Rust + Slint SSH terminal client."
 
 msgid "Open source · MIT / Apache-2.0"
 msgstr "Open source · MIT / Apache-2.0"
@@ -536,3 +536,12 @@ msgstr "No matching sessions"
 
 msgid "Clear search"
 msgstr "Clear search"
+
+msgid "新建窗口"
+msgstr "New Window"
+
+msgid "Session name"
+msgstr "Session name"
+
+msgid "Leave empty to restore the default name"
+msgstr "Leave empty to restore the default name"

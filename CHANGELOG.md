@@ -3,7 +3,18 @@
 All notable changes are documented here. 本文件记录所有重要变更。
 中英对照（中文在前，English after）.
 
-## [Unreleased]
+## [0.6.16] - 2026-08-24
+
+- **新增 Debian 与 Flatpak 安装包。** 发布流水线现在为 Linux x86_64 和 ARM64 生成 `.deb`，并为 x86_64 生成可直接安装的 Flatpak bundle；这些安装包会作为工作流产物保存，并在标签发版时自动附加到 GitHub Release。现有 tar.gz 与 AppImage 保持不变。
+- **Add Debian and Flatpak packages.** The release workflow now builds `.deb` packages for Linux x86_64 and ARM64 and an installable Flatpak bundle for x86_64. They are retained as workflow artifacts and automatically attached to tagged GitHub Releases, alongside the existing tar.gz and AppImage assets.
+
+- **修复 Linux 安装包流水线并改善 Windows 占用升级。** DEB 构建现在为 `dpkg-shlibdeps` 提供所需的软件包元数据，避免 amd64 与 ARM64 任务以代码 25 退出；Flatpak 改由独立 job 在 Flathub 官方 25.08 容器中打包，不再依赖 Ubuntu 22.04 的旧工具链。Windows MSI 升级检测到 MeatShell 或无窗口 MCP 服务仍在运行时会提示用户关闭，必要时经用户确认后结束旧进程，避免 `meatshell.exe` 被占用而无法替换。
+- **Fix Linux package CI and Windows in-use upgrades.** DEB builds now provide the package metadata required by `dpkg-shlibdeps`, preventing exit code 25 on amd64 and ARM64. Flatpak packaging now runs as a separate job in Flathub's official 25.08 container instead of relying on Ubuntu 22.04's older toolchain. During a Windows MSI upgrade, a running MeatShell or windowless MCP server now produces a close/retry prompt and can be terminated after explicit user confirmation so the installer can replace `meatshell.exe`.
+
+## [0.6.15] - 2026-08-24
+
+- **修复 Fedora 等非 Debian Linux 桌面按下 Ctrl 即触发终端快捷键的问题（#369）。** Linux 下 Slint/winit 可能把裸 Control 按键上报为 `U+0011` 或 `U+0016`；过滤范围现已从 Debian 系扩展到所有 Linux 发行版，避免 nano 在只按 Ctrl 时误触发搜索或其他操作。真正的 Ctrl+Q、Ctrl+V、Ctrl+X 等组合键仍由最终字母事件生成；Windows 与 macOS 保持各自独立的输入适配。
+- **Fix bare Ctrl triggering terminal shortcuts on Fedora and other non-Debian Linux desktops (#369).** Slint/winit may report a physical Control press as `U+0011` or `U+0016` on Linux. Filtering now applies to every Linux distribution instead of only the Debian family, preventing nano and other terminal programs from reacting when Ctrl alone is pressed. Genuine Ctrl+Q, Ctrl+V, Ctrl+X, and similar chords still come from the final letter event, while Windows and macOS retain their separate input handling.
 
 - **新增 MCP 与 CLI 自动化入口。** `meatshell mcp serve` 通过本机 stdio 提供会话查询、SSH 命令执行、SFTP 目录浏览、有界文本读取以及文件上传/下载，并在“设置 → 界面 → MCP”中独立控制服务、保存凭据、任意命令及文件传输权限；密码、私钥和代理凭据不会出现在协议响应中。`meatshell cli` 复用同一核心能力，提供人类可读输出及 `--json`。
 - **Add MCP and CLI automation entry points.** `meatshell mcp serve` exposes session discovery, SSH command execution, SFTP directory listing, bounded text reads, and file uploads/downloads over local stdio, with separate service, saved-credential, arbitrary-command, and file-transfer controls under Settings → Interface → MCP. Passwords, private keys, and proxy credentials never appear in protocol responses. `meatshell cli` reuses the same core and supports both human-readable output and `--json`.
