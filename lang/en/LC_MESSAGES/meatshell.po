@@ -303,6 +303,12 @@ msgstr "Clear buffer"
 msgid "Find"
 msgstr "Find"
 
+msgid "Replace"
+msgstr "Replace"
+
+msgid "Replace all"
+msgstr "Replace all"
+
 msgid "Processes"
 msgstr "Processes"
 

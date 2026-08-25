@@ -171,12 +171,16 @@ export component SFTPEditor inherits Rectangle {
                     height: 38px;
                     background: Theme.popup-bg;
                     HorizontalLayout {
+                        // 编辑器修改：整条查找/替换栏水平居中（#287）。
+                        alignment: center;
                         padding-left: 8px; padding-right: 8px;
                         padding-top: 5px; padding-bottom: 5px; spacing: 6px;
                         Text { text: @tr("Find"); color: Theme.text-muted; vertical-alignment: center; }
                         TextInput {
-                            horizontal-stretch: 1;
+                            preferred-width: 160px;
                             single-line: true;
+                            // 编辑器修改：文字垂直居中，与同栏按钮/标签对齐。
+                            vertical-alignment: center;
                             text <=> root.editor-find-query;
                             edited => {
                                 root.editor-find-position = -1;
@@ -261,8 +265,10 @@ export component SFTPEditor inherits Rectangle {
                         }
                         Text { text: @tr("Replace"); color: Theme.text-muted; vertical-alignment: center; }
                         TextInput {
-                            horizontal-stretch: 1;
+                            preferred-width: 160px;
                             single-line: true;
+                            // 编辑器修改：文字垂直居中，与同栏按钮/标签对齐。
+                            vertical-alignment: center;
                             text <=> root.editor-replace-text;
                         }
                         Rectangle {

@@ -303,6 +303,12 @@ msgstr "清空缓存"
 msgid "Find"
 msgstr "查找"
 
+msgid "Replace"
+msgstr "替换"
+
+msgid "Replace all"
+msgstr "全部替换"
+
 msgid "Processes"
 msgstr "进程"
 
