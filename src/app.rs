@@ -178,8 +178,9 @@ use crate::ssh::{
 use crate::terminal::c0_letter_key_down;
 use crate::terminal::{
     bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules,
-    encode_command_bar_input, encode_pasted_text, key_to_pty_bytes, paste_requires_large_review,
-    should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste, CsiState, OutputHighlightPreset,
+    encode_command_bar_input, encode_pasted_text, is_terminal_interrupt, key_to_pty_bytes,
+    paste_requires_large_review, should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste,
+    CsiState, OutputHighlightPreset,
     RenderGates, TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
 };
 #[cfg(test)]
@@ -4489,19 +4490,11 @@ fn wire_session_callbacks(
     {
         let weak = window.as_weak();
         window.on_session_dialog_pick_key(move || {
-            let mut dialog = rfd::FileDialog::new()
-                .set_title(t("选择私钥文件", "Choose private key file"));
-            // OpenSSH's standard macOS key names (id_ed25519, id_rsa, …) have
-            // no extension. A native macOS extension filter makes those files
-            // visible but disabled, so leave the picker unfiltered there (#325).
-            // Other platforms retain the narrower existing filter.
-            #[cfg(not(target_os = "macos"))]
-            {
-                dialog = dialog.add_filter(
-                    t("SSH 私钥", "SSH private keys"),
-                    &["ppk", "pem", "key"],
-                );
-            }
+            let mut dialog =
+                rfd::FileDialog::new().set_title(t("选择私钥文件", "Choose private key file"));
+            // OpenSSH's standard key names (id_ed25519, id_rsa, …) usually
+            // have no extension. Extension filters hide or disable those files
+            // in native pickers, so show every file on every platform (#393).
             // Start in ~/.ssh if it exists.
             if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().join(".ssh")) {
                 if home.is_dir() {
@@ -5711,7 +5704,8 @@ fn wire_key_input(
             if !ctrl && !alt {
                 if let Some(c) = key.as_str().chars().next() {
                     let cp = c as u32;
-                    let is_standalone = matches!(cp, 0x08 | 0x09 | 0x0A | 0x0D | 0x1B);
+                    let is_standalone = matches!(cp, 0x08 | 0x09 | 0x0A | 0x0D | 0x1B)
+                        || is_terminal_interrupt(key.as_str());
                     if key.as_str().chars().count() == 1
                         && (0x01..=0x1f).contains(&cp)
                         && !is_standalone
@@ -5753,7 +5747,8 @@ fn wire_key_input(
                     // because the user never pressed M.  Without this exemption
                     // the filter would silently drop the Enter, making it
                     // impossible to confirm nano's "File Name to Write:" prompt.
-                    let always_pass = matches!(cp, 0x09 | 0x0a | 0x0d);
+                    let always_pass = matches!(cp, 0x09 | 0x0a | 0x0d)
+                        || is_terminal_interrupt(key.as_str());
                     if !always_pass
                         && key.as_str().chars().count() == 1
                         && (0x01..=0x1a).contains(&cp)
