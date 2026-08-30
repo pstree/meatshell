@@ -1,6 +1,6 @@
 use crate::terminal::{
     build_row, cell_prefix, char_after_cell_end, char_at_cell_start, detect_scroll,
-    highlight_plain_output, render_term_span, BuiltScreen, CsiState, Line, RenderedRow, TermBuffer,
+    highlight_plain_output, render_term_span, BuiltScreen, CsiState, Line, TermBuffer,
     MAX_HISTORY, RAW_CAP,
 };
 use crate::ui::TermMatch;
@@ -623,8 +623,8 @@ impl TermBuffer {
             for r in 0..rows_u {
                 if all_dirty || self.dirty.as_ref().unwrap()[r] || self.live_cache[r].is_none() {
                     // Row changed since the last render (or was never cached):
-                    // rebuild it and cache the result for the next frame.
-                    let (plain, runs, wrapped) = build_row(s, r, cols);
+                    // rebuild its source line and cache it for the next frame.
+                    let (plain, runs, wrapped) = build_row(s, r as u16, cols);
                     let runs = if is_alt {
                         runs
                     } else {
@@ -634,21 +634,19 @@ impl TermBuffer {
                             &self.custom_highlight_rules,
                         )
                     };
-                    let mut row_spans = Vec::new();
-                    for hs in &runs {
-                        row_spans.extend(render_term_span(hs, r as i32, self.is_dark));
-                    }
-                    self.live_cache[r] = Some(RenderedRow {
-                        line: (plain, runs, wrapped),
-                        spans: row_spans,
-                    });
+                    self.live_cache[r] = Some((plain, runs, wrapped));
                 }
-                let cached = self.live_cache[r].as_ref().unwrap();
-                spans.extend_from_slice(&cached.spans);
-                if !cached.line.1.is_empty() {
+                // Rebuild spans from the cached line every frame: `TermSpan`
+                // embeds a Slint image handle that is not `Send`, so it cannot
+                // be cached inside `TermBuffer` (which crosses threads).
+                let (plain, runs, _wrapped) = self.live_cache[r].as_ref().unwrap();
+                for hs in runs {
+                    spans.extend(render_term_span(hs, r as i32, self.is_dark));
+                }
+                if !runs.is_empty() {
                     last_content = r as i32;
                 }
-                displayed.push(cached.line.0.trim_end().to_string());
+                displayed.push(plain.trim_end().to_string());
             }
             self.dirty = Some(vec![false; rows_u]);
             self.displayed_text = displayed;

@@ -25,9 +25,11 @@ pub(crate) struct TermBuffer {
     pub(crate) history: VecDeque<Line>,
     pub(crate) prev: Vec<Line>,
     /// Per-row render cache for the live screen (index = grid row). `render()`
-    /// reuses a row's cached spans when its content is unchanged since the last
-    /// ingest, so long-press echo no longer rebuilds the whole grid each frame.
-    pub(crate) live_cache: Vec<Option<RenderedRow>>,
+    /// reuses a row's cached source line (skipping `build_row` + highlight)
+    /// when its content is unchanged since the last ingest, so long-press echo
+    /// no longer rebuilds the whole grid each frame. Spans are rebuilt from the
+    /// cached line every frame (they contain `TermSpan`, which is not `Send`).
+    pub(crate) live_cache: Vec<Option<Line>>,
     /// Rows whose content changed since the last cache refresh. `None` = unknown
     /// → treat every row as dirty (first render, resize, theme change, reset).
     pub(crate) dirty: Option<Vec<bool>>,
@@ -112,7 +114,7 @@ pub(crate) struct BuiltScreen {
 }
 
 /// One coloured run within a terminal line.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct HistSpan {
     pub(crate) text: String,
     pub(crate) fg: vt100::Color,
@@ -124,10 +126,3 @@ pub(crate) struct HistSpan {
 }
 
 pub(crate) type Line = (String, Vec<HistSpan>, bool);
-
-/// Cached render of one live screen row: the source line plus its final spans,
-/// reused by `render()` when the row is unchanged since the last ingest.
-pub(crate) struct RenderedRow {
-    pub(crate) line: Line,
-    pub(crate) spans: Vec<TermSpan>,
-}
