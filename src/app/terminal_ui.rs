@@ -165,8 +165,10 @@ pub(super) fn apply_terminal_resize(
                 buf.reflow(new_rows, new_cols);
             }
             // The pre/post-resize screens differ; drop the scroll-detection
-            // snapshot so the next output isn't mis-read as a scroll.
+            // snapshot so the next output isn't mis-read as a scroll, and drop
+            // the row render cache (rows/layout changed).
             buf.prev.clear();
+            buf.invalidate_render_cache();
         }
     }
 }
@@ -246,7 +248,10 @@ pub(super) fn apply_dark_mode(window: &AppWindow, bufs: &TermBuffers, dark: bool
     {
         let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
         for h in handles {
-            h.lock().unwrap().is_dark = dark;
+            let mut buf = h.lock().unwrap();
+            buf.is_dark = dark;
+            // Colours are baked into cached spans at render time.
+            buf.invalidate_render_cache();
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
@@ -265,7 +270,9 @@ pub(super) fn apply_output_highlight(
     {
         let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
         for handle in handles {
-            handle.lock().unwrap().output_highlight = mode;
+            let mut buf = handle.lock().unwrap();
+            buf.output_highlight = mode;
+            buf.invalidate_render_cache();
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
@@ -283,7 +290,9 @@ pub(super) fn apply_custom_output_rules(
     {
         let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
         for handle in handles {
-            handle.lock().unwrap().custom_highlight_rules = compiled.clone();
+            let mut buf = handle.lock().unwrap();
+            buf.custom_highlight_rules = compiled.clone();
+            buf.invalidate_render_cache();
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();

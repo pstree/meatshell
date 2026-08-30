@@ -1,7 +1,7 @@
 use crate::terminal::{
     build_row, cell_prefix, char_after_cell_end, char_at_cell_start, detect_scroll,
-    highlight_plain_output, render_term_span, BuiltScreen, CsiState, Line, TermBuffer, MAX_HISTORY,
-    RAW_CAP,
+    highlight_plain_output, render_term_span, BuiltScreen, CsiState, Line, RenderedRow, TermBuffer,
+    MAX_HISTORY, RAW_CAP,
 };
 use crate::ui::TermMatch;
 
@@ -406,6 +406,7 @@ impl TermBuffer {
             self.sel_anchor = None;
             self.sel_focus = None;
             self.sel_ranges.clear();
+            self.invalidate_render_cache();
         }
         self.cap_raw();
         self.feed_batched(bytes);
@@ -481,6 +482,7 @@ impl TermBuffer {
         self.sel_anchor = None;
         self.sel_focus = None;
         self.sel_ranges.clear();
+        self.invalidate_render_cache();
         self.feed_batched(&stream);
     }
 
@@ -509,6 +511,10 @@ impl TermBuffer {
             // from mixing with the full-screen program's output after a scroll.
             self.view_offset = 0;
             self.prev.clear();
+            // Track row changes on the alt screen too (vim cursor moves dirty
+            // only the affected rows), but keep the scroll-detection snapshot
+            // cleared so leaving the alt screen never captures phantom history.
+            self.mark_dirty_screen(rows, cols);
             return;
         }
         if is_fullscreen_refresh {
@@ -516,6 +522,7 @@ impl TermBuffer {
             // Don't capture lines into history; they'd mix with the next frame.
             self.view_offset = 0;
             self.prev.clear();
+            self.mark_dirty_screen(rows, cols);
             return;
         }
         let curr: Vec<Line> = {
@@ -540,7 +547,47 @@ impl TermBuffer {
                 self.view_offset = self.view_offset.saturating_add(k).min(self.history.len());
             }
         }
-        self.prev = curr;
+        self.mark_dirty(&curr);
+    }
+
+    /// Mark rows whose content changed since the previous chunk as dirty so the
+    /// next render only rebuilds those rows. Keeps `dirty == None` (everything
+    /// dirty) when the cache was invalidated, so a partial diff can't reuse
+    /// stale rows (e.g. after a theme change) before the rebuild happens.
+    fn mark_dirty(&mut self, curr: &[Line]) {
+        if let Some(dirty) = self.dirty.as_mut() {
+            if dirty.len() != curr.len() {
+                dirty.resize(curr.len(), true);
+            }
+            if self.prev_render.len() != curr.len() {
+                dirty.fill(true);
+            } else {
+                for (i, (p, c)) in self.prev_render.iter().zip(curr).enumerate() {
+                    if p != c {
+                        dirty[i] = true;
+                    }
+                }
+            }
+        }
+        self.prev_render = curr.to_vec();
+    }
+
+    /// Build the current screen rows and mark the changed ones dirty.
+    fn mark_dirty_screen(&mut self, rows: u16, cols: u16) {
+        let curr: Vec<Line> = {
+            let s = self.parser.screen();
+            (0..rows).map(|r| build_row(s, r, cols)).collect()
+        };
+        self.mark_dirty(&curr);
+    }
+
+    /// Drop the incremental render cache so the next `render()` rebuilds every
+    /// row. Called when the screen changes in ways ingest diffing cannot see:
+    /// resize reflow, erase-saved-lines, reconnect, theme/highlight changes.
+    pub(crate) fn invalidate_render_cache(&mut self) {
+        self.dirty = None;
+        self.live_cache.clear();
+        self.prev_render.clear();
     }
 
     /// Render the terminal grid for the current scrollback `view_offset`
@@ -555,29 +602,55 @@ impl TermBuffer {
 
         // --- Live view (also alt-screen): render the current grid -----------
         if is_alt || self.view_offset == 0 {
+            let rows_u = rows as usize;
+            // A missing/mismatched dirty map or row cache means the whole screen
+            // must be rebuilt (first render, resize, theme change, reset, erase).
+            let all_dirty = match &self.dirty {
+                Some(d) if d.len() == rows_u => false,
+                _ => true,
+            };
+            if all_dirty {
+                self.dirty = Some(vec![true; rows_u]);
+            }
+            if self.live_cache.len() != rows_u {
+                self.live_cache.resize(rows_u, None);
+            }
+
             let mut spans = Vec::new();
-            let mut displayed = Vec::with_capacity(rows as usize);
+            let mut displayed = Vec::with_capacity(rows_u);
             let mut last_content = 0i32;
             let s = self.parser.screen();
-            for r in 0..rows {
-                let (plain, runs, _wrapped) = build_row(s, r, cols);
-                let runs = if is_alt {
-                    runs
-                } else {
-                    highlight_plain_output(
-                        runs,
-                        self.output_highlight,
-                        &self.custom_highlight_rules,
-                    )
-                };
-                if !runs.is_empty() {
+            for r in 0..rows_u {
+                if all_dirty || self.dirty.as_ref().unwrap()[r] || self.live_cache[r].is_none() {
+                    // Row changed since the last render (or was never cached):
+                    // rebuild it and cache the result for the next frame.
+                    let (plain, runs, wrapped) = build_row(s, r, cols);
+                    let runs = if is_alt {
+                        runs
+                    } else {
+                        highlight_plain_output(
+                            runs,
+                            self.output_highlight,
+                            &self.custom_highlight_rules,
+                        )
+                    };
+                    let mut row_spans = Vec::new();
+                    for hs in &runs {
+                        row_spans.extend(render_term_span(hs, r as i32, self.is_dark));
+                    }
+                    self.live_cache[r] = Some(RenderedRow {
+                        line: (plain, runs, wrapped),
+                        spans: row_spans,
+                    });
+                }
+                let cached = self.live_cache[r].as_ref().unwrap();
+                spans.extend_from_slice(&cached.spans);
+                if !cached.line.1.is_empty() {
                     last_content = r as i32;
                 }
-                for hs in runs {
-                    spans.extend(render_term_span(&hs, r as i32, self.is_dark));
-                }
-                displayed.push(plain.trim_end().to_string());
+                displayed.push(cached.line.0.trim_end().to_string());
             }
+            self.dirty = Some(vec![false; rows_u]);
             self.displayed_text = displayed;
             let rows_used = if is_alt {
                 rows as i32

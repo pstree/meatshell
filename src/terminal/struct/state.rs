@@ -24,6 +24,16 @@ pub(crate) struct TermBuffer {
     pub(crate) sel_ranges: Vec<((usize, u16), (usize, u16))>,
     pub(crate) history: VecDeque<Line>,
     pub(crate) prev: Vec<Line>,
+    /// Per-row render cache for the live screen (index = grid row). `render()`
+    /// reuses a row's cached spans when its content is unchanged since the last
+    /// ingest, so long-press echo no longer rebuilds the whole grid each frame.
+    pub(crate) live_cache: Vec<Option<RenderedRow>>,
+    /// Rows whose content changed since the last cache refresh. `None` = unknown
+    /// → treat every row as dirty (first render, resize, theme change, reset).
+    pub(crate) dirty: Option<Vec<bool>>,
+    /// Baseline screen rows for dirty detection. Kept current on every chunk,
+    /// independently of the scroll-detection `prev` (which clears on alt screen).
+    pub(crate) prev_render: Vec<Line>,
     pub(crate) view_offset: usize,
     /// Fractional scrollback rows not yet applied. Wheel deltas arrive as
     /// pixel fractions of a row (trackpad + macOS momentum decay); keeping
@@ -114,3 +124,10 @@ pub(crate) struct HistSpan {
 }
 
 pub(crate) type Line = (String, Vec<HistSpan>, bool);
+
+/// Cached render of one live screen row: the source line plus its final spans,
+/// reused by `render()` when the row is unchanged since the last ingest.
+pub(crate) struct RenderedRow {
+    pub(crate) line: Line,
+    pub(crate) spans: Vec<TermSpan>,
+}

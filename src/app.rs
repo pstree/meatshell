@@ -4762,6 +4762,9 @@ fn wire_session_callbacks(
                     sel_ranges: Vec::new(),
                     history: VecDeque::new(),
                     prev: Vec::new(),
+                    live_cache: Vec::new(),
+                    dirty: None,
+                    prev_render: Vec::new(),
                     view_offset: 0,
                     scroll_accum: 0.0,
                     displayed_text: Vec::new(),
@@ -5669,6 +5672,7 @@ fn wire_key_input(
                             b.sel_focus = None;
                             b.sel_ranges.clear();
                             b.raw.clear();
+                            b.invalidate_render_cache();
                         }
                     }
                     if let Some(st) =
@@ -6139,6 +6143,7 @@ fn wire_key_input(
                 buf.sel_ranges.clear();
                 buf.displayed_text = Vec::new();
                 buf.raw.clear();
+                buf.invalidate_render_cache();
             }
             if let Some(win) = weak.upgrade() {
                 set_terminal_row(&win, &tid, |row| {
