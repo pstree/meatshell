@@ -548,6 +548,10 @@ impl TermBuffer {
             }
         }
         self.mark_dirty(&curr);
+        // Keep the scroll-detection snapshot for the next chunk. `mark_dirty`
+        // tracks row changes via `prev_render` but must not replace this one:
+        // `prev` is cleared on alt/fullscreen to suppress phantom history.
+        self.prev = curr;
     }
 
     /// Mark rows whose content changed since the previous chunk as dirty so the
