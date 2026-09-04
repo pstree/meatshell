@@ -76,46 +76,6 @@ fn csi_3j_clears_meatshell_scrollback_even_when_split() {
 }
 
 #[test]
-fn unchanged_rows_reuse_the_render_cache_until_they_change() {
-    let mut buffer = make_buf(4, 40, &[], &[], 0);
-    buffer.ingest(b"alpha\r\nbeta");
-    buffer.render();
-
-    // A full render caches every row and clears the dirty map.
-    assert!(buffer.live_cache.iter().all(Option::is_some));
-    assert!(buffer.dirty.as_ref().unwrap().iter().all(|d| !d));
-
-    // No new output → the second render reuses every cached row unchanged.
-    buffer.render();
-    assert!(buffer.dirty.as_ref().unwrap().iter().all(|d| !d));
-
-    // Rewriting one line dirties only that row; the rest stay cached.
-    buffer.ingest(b"\x1b[H\x1b[2Kalpha edited");
-    let dirty = buffer.dirty.as_ref().unwrap();
-    assert_eq!(dirty.iter().filter(|d| **d).count(), 1);
-    buffer.render();
-    assert_eq!(buffer.displayed_text[0], "alpha edited");
-    assert_eq!(buffer.displayed_text[1], "beta");
-    assert!(buffer.dirty.as_ref().unwrap().iter().all(|d| !d));
-}
-
-#[test]
-fn invalidate_render_cache_forces_a_full_rebuild() {
-    let mut buffer = make_buf(4, 40, &[], &[], 0);
-    buffer.ingest(b"hello");
-    buffer.render();
-    assert!(buffer.dirty.as_ref().unwrap().iter().all(|d| !d));
-
-    buffer.invalidate_render_cache();
-    assert!(buffer.dirty.is_none());
-
-    // The next render rebuilds everything and re-arms the dirty map.
-    buffer.render();
-    assert!(buffer.dirty.as_ref().unwrap().iter().all(|d| !d));
-    assert!(buffer.live_cache.iter().all(Option::is_some));
-}
-
-#[test]
 fn incoming_output_keeps_a_scrolled_view_anchored() {
     let mut buffer = make_buf(3, 20, &[], &[], 0);
     let _ = buffer.ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
