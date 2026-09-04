@@ -178,10 +178,10 @@ use crate::ssh::{
 use crate::terminal::c0_letter_key_down;
 use crate::terminal::{
     bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules,
-    encode_command_bar_input, encode_pasted_text, is_terminal_interrupt, key_to_pty_bytes,
-    paste_requires_large_review, should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste,
-    CsiState, OutputHighlightPreset,
-    RenderGates, TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
+    encode_command_bar_input, encode_mouse_event, encode_pasted_text, is_terminal_interrupt,
+    key_to_pty_bytes, paste_requires_large_review, should_drop_bare_ctrl_marker,
+    terminal_uses_bracketed_paste, CsiState, OutputHighlightPreset, RenderGates, TabRenderGate,
+    TermBuffer, TermBufferHandle, TermBuffers,
 };
 #[cfg(test)]
 use crate::terminal::{
@@ -3659,6 +3659,7 @@ fn wire_session_callbacks(
             w.set_dialog_parity("none".into());
             w.set_dialog_flow("none".into());
             w.set_dialog_encoding("UTF-8".into());
+            w.set_dialog_vt100_drawing(false);
             w.set_dialog_disable_shell_integration(false);
             w.set_dialog_note("".into());
             w.set_dialog_editing(false);
@@ -3893,6 +3894,7 @@ fn wire_session_callbacks(
                 w.set_dialog_parity(session.parity.clone().into());
                 w.set_dialog_flow(session.flow_control.clone().into());
                 w.set_dialog_encoding(session.encoding.clone().into());
+                w.set_dialog_vt100_drawing(session.vt100_drawing);
                 w.set_dialog_disable_shell_integration(session.disable_shell_integration);
                 w.set_dialog_note(session.note.clone().into());
                 w.set_dialog_editing(true);
@@ -4294,6 +4296,7 @@ fn wire_session_callbacks(
                 parity: draft.parity.to_string(),
                 flow_control: draft.flow_control.to_string(),
                 encoding: draft.encoding.to_string(),
+                vt100_drawing: draft.vt100_drawing,
                 forwards,
                 triggers,
                 disable_shell_integration: draft.disable_shell_integration,
@@ -4656,8 +4659,9 @@ fn wire_session_callbacks(
                 SessionKind::Telnet => format!("telnet {}:{}", session.host, session.port),
                 SessionKind::Local => format!("local {}", session.name),
             };
-            // Serial / Telnet have no SFTP side-channel.
-            let has_sftp = session.kind == SessionKind::Ssh;
+            // Compatibility mode also suppresses the SFTP side-channel so
+            // bastions that only permit one proxied PTY connection stay alive.
+            let has_sftp = should_start_sftp(&session);
 
             // Seed the per-tab status so the sidebar shows "连接中 host" the
             // moment this tab becomes active (the `changed active-tab-id`
@@ -4705,6 +4709,7 @@ fn wire_session_callbacks(
                 scroll_max: 0,
                 scroll_offset: 0,
                 is_alt_screen: false,
+                mouse_tracked: false,
                 find_matches: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 selection: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 sftp_path: "/".into(),
@@ -4756,10 +4761,13 @@ fn wire_session_callbacks(
                     output_highlight,
                     custom_highlight_rules,
                     json_format_output: store.borrow().json_format_output(),
+                    vt100_drawing: session.vt100_drawing,
+                    charset: crate::terminal::CharsetTracker::default(),
                     interactive_echo_until: std::time::Instant::now(),
                     sel_anchor: None,
                     sel_focus: None,
                     sel_ranges: Vec::new(),
+                    mouse_tracked: false,
                     history: VecDeque::new(),
                     prev: Vec::new(),
                     live_cache: Vec::new(),
@@ -5662,17 +5670,7 @@ fn wire_key_input(
                     {
                         if let Some(h) = term_buf(&ctx.bufs, tab_id.as_str()) {
                             let mut b = h.lock().unwrap();
-                            let (rows, cols) = b.parser.screen().size();
-                            b.parser = vt100::Parser::new(rows, cols, 5000);
-                            b.history.clear();
-                            b.prev.clear();
-                            b.displayed_text.clear();
-                            b.view_offset = 0;
-                            b.sel_anchor = None;
-                            b.sel_focus = None;
-                            b.sel_ranges.clear();
-                            b.raw.clear();
-                            b.invalidate_render_cache();
+                            b.release_scrollback();
                         }
                     }
                     if let Some(st) =
@@ -6132,18 +6130,7 @@ fn wire_key_input(
             let tid = tab_id.to_string();
             if let Some(h) = term_buf(&bufs_clear, &tid) {
                 let mut buf = h.lock().unwrap();
-                let (rows, cols) = buf.parser.screen().size();
-                buf.parser = vt100::Parser::new(rows, cols, 5000);
-                buf.find_query.clear();
-                buf.history = VecDeque::new(); // recycle the session scrollback
-                buf.prev = Vec::new();
-                buf.view_offset = 0;
-                buf.sel_anchor = None;
-                buf.sel_focus = None;
-                buf.sel_ranges.clear();
-                buf.displayed_text = Vec::new();
-                buf.raw.clear();
-                buf.invalidate_render_cache();
+                buf.release_scrollback();
             }
             if let Some(win) = weak.upgrade() {
                 set_terminal_row(&win, &tid, |row| {
@@ -6491,6 +6478,57 @@ fn wire_key_input(
                 rebuild_tab_display(&win, &bufs_sel, &tid);
             }
         });
+    }
+
+    // Mouse events forwarded to the PTY for mouse-tracking TUI apps (btop,
+    // htop, mc). The Slint side only calls this when the remote enabled a mouse
+    // protocol (mouse_protocol_mode != None), so a click inside e.g. btop
+    // highlights/activates the widget under the pointer instead of starting a
+    // local drag-selection. Returns true when bytes were actually written, so
+    // the caller can skip its own local handling.
+    {
+        let bufs_mouse = bufs.clone();
+        let handles_mouse = handles.clone();
+        window.on_terminal_mouse(
+            move |tab_id: SharedString, kind: i32, button: i32, row: i32, col: i32| -> bool {
+                let tid = tab_id.to_string();
+                let Some(bytes) = term_buf(&bufs_mouse, &tid).map(|h| {
+                    let buf = h.lock().unwrap();
+                    let screen = buf.parser.screen();
+                    let (rows, cols) = screen.size();
+                    if buf.mouse_tracked {
+                        let encoding = screen.mouse_protocol_encoding();
+                        let (btn, release) = match kind {
+                            1 => (button as u8, true), // release
+                            2 => (35, false),          // drag motion with button held
+                            _ => (button as u8, false), // press
+                        };
+                        Some(encode_mouse_event(
+                            btn,
+                            release,
+                            col,
+                            row,
+                            cols,
+                            rows,
+                            encoding,
+                        ))
+                    } else {
+                        None
+                    }
+                }) else {
+                    return false;
+                };
+                let Some(bytes) = bytes else {
+                    return false;
+                };
+                if let Some(h) = handles_mouse.borrow().get(&tid) {
+                    h.send_raw(bytes);
+                    true
+                } else {
+                    false
+                }
+            },
+        );
     }
 }
 
