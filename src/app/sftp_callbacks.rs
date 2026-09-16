@@ -40,6 +40,7 @@ fn choose_download_conflict(remote: &str, local_dir: &str) -> Option<DownloadCon
 
 pub(super) fn wire_sftp_callbacks(
     window: &AppWindow,
+    editor: &EditorWindow,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
 ) {
@@ -271,9 +272,7 @@ pub(super) fn wire_sftp_callbacks(
             // behind — single source of truth (#sftp-refresh-selection).
             if let Some(w) = weak.upgrade() {
                 let terminals = w.get_terminals();
-                if let Some(tm) =
-                    terminals.as_any().downcast_ref::<VecModel<TerminalState>>()
-                {
+                if let Some(tm) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() {
                     clear_sftp_selection(tm, &tab_id);
                 }
             }
@@ -428,9 +427,7 @@ pub(super) fn wire_sftp_callbacks(
                 if let Ok(handles) = sftp_handles.lock() {
                     if let Some(h) = handles.get(tab_id.as_str()) {
                         if single {
-                            if let Some(conflict) =
-                                choose_download_conflict(&paths[0], &preset)
-                            {
+                            if let Some(conflict) = choose_download_conflict(&paths[0], &preset) {
                                 h.download(paths[0].clone(), preset.clone(), conflict);
                             }
                         } else {
@@ -704,10 +701,10 @@ pub(super) fn wire_sftp_callbacks(
 
     // 编辑器修改：每次编辑后重建行号，并同步刷新两层语法着色（#81 等）。
     {
-        let weak = window.as_weak();
-        window.on_editor_recount(move |text: SharedString| {
+        let weak = editor.as_weak();
+        editor.on_editor_recount(move |text: SharedString| {
             if let Some(w) = weak.upgrade() {
-                w.set_editor_line_numbers(line_numbers_for(text.as_str()).into());
+                w.set_editor_lines(editor_lines_for(text.as_str()));
                 // 编辑器修改：刷新注释/普通行的语法高亮层。
                 update_editor_text_layers(&w, text.as_str());
             }
@@ -716,7 +713,7 @@ pub(super) fn wire_sftp_callbacks(
     // 编辑器修改：查找定位文本所需的三组辅助查询（#287）。
     // Slint 无法统计行数/切分字符串，因此由 Rust 把字节偏移换算成可视行号，
     // 供界面在点击“上一处/下一处”或输入查询词时把 ScrollView 滚动并居中到匹配行。
-    window.on_editor_line_index_at(|content: SharedString, offset: i32| {
+    editor.on_editor_line_index_at(|content: SharedString, offset: i32| {
         let mut off = offset.max(0) as usize;
         let bytes = content.as_str().as_bytes();
         if off > bytes.len() {
@@ -725,52 +722,55 @@ pub(super) fn wire_sftp_callbacks(
         bytes[..off].iter().filter(|&&b| b == b'\n').count() as i32
     });
     // 编辑器修改：逻辑总行数（换行数 + 1），用于估算单行像素高度。
-    window.on_editor_line_count(|content: SharedString| {
+    editor.on_editor_line_count(|content: SharedString| {
         content.as_str().split('\n').count().max(1) as i32
     });
     // 编辑器修改：字符串的 UTF-8 字节长度，供界面定位匹配文本的选中范围。
-    window.on_editor_byte_length_of(|s: SharedString| s.as_str().len() as i32);
+    editor.on_editor_byte_length_of(|s: SharedString| s.as_str().len() as i32);
 
     // Built-in editor: save (Ctrl+S / button) writes the text back to the
     // remote file (#70). Read-only (view) sessions never save.
     {
         let sftp_handles = sftp_handles.clone();
-        let weak = window.as_weak();
-        window.on_save_file(move || {
-            let Some(w) = weak.upgrade() else { return };
-            if w.get_editor_readonly() {
+        let editor_weak = editor.as_weak();
+        editor.on_save_file(move || {
+            let Some(editor) = editor_weak.upgrade() else {
+                return;
+            };
+            if editor.get_editor_readonly() {
                 return;
             }
-            let path = w.get_editor_path().to_string();
-            let content = w.get_editor_content().to_string();
-            let tab_id = w.get_active_tab_id().to_string();
+            let path = editor.get_editor_path().to_string();
+            let content = editor.get_editor_content().to_string();
+            let tab_id = editor.get_editor_tab_id().to_string();
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab_id) {
                     h.write_text(path, content);
                 }
             }
-            w.set_editor_dirty(false);
+            editor.set_editor_dirty(false);
         });
     }
     // Closing the editor discards unsaved edits. Saving is an explicit action
     // (button / Ctrl+S); silently uploading on X or Esc is surprising and can
     // overwrite a remote file the user only meant to inspect (#287).
     {
-        let weak = window.as_weak();
-        window.on_close_editor(move || {
-            let Some(w) = weak.upgrade() else { return };
-            w.set_editor_open(false);
-            w.set_editor_dirty(false);
-            w.set_editor_find_query("".into());
-            w.set_editor_replace_text("".into());
-            w.set_editor_match_count(0);
-            w.set_editor_find_position(-1);
+        let weak = editor.as_weak();
+        editor.on_close_editor(move || {
+            let Some(editor) = weak.upgrade() else { return };
+            editor.set_editor_open(false);
+            let _ = editor.hide();
+            editor.set_editor_dirty(false);
+            editor.set_editor_find_query("".into());
+            editor.set_editor_replace_text("".into());
+            editor.set_editor_match_count(0);
+            editor.set_editor_find_position(-1);
         });
     }
 
     // Built-in editor find/replace (#287). Keep matching literal and
     // case-sensitive, which is predictable for configuration/source files.
-    window.on_editor_count_matches(|content: SharedString, query: SharedString| {
+    editor.on_editor_count_matches(|content: SharedString, query: SharedString| {
         if query.is_empty() {
             0
         } else {
@@ -780,7 +780,7 @@ pub(super) fn wire_sftp_callbacks(
                 .min(i32::MAX as usize) as i32
         }
     });
-    window.on_editor_find_step(
+    editor.on_editor_find_step(
         |content: SharedString, query: SharedString, current: i32, reverse: bool| {
             if query.is_empty() {
                 return EditorFindResult {
@@ -816,21 +816,21 @@ pub(super) fn wire_sftp_callbacks(
         },
     );
     {
-        let weak = window.as_weak();
-        window.on_editor_replace_all(move |query: SharedString, replacement: SharedString| {
-            let Some(w) = weak.upgrade() else { return };
-            if w.get_editor_readonly() || query.is_empty() {
+        let weak = editor.as_weak();
+        editor.on_editor_replace_all(move |query: SharedString, replacement: SharedString| {
+            let Some(editor) = weak.upgrade() else { return };
+            if editor.get_editor_readonly() || query.is_empty() {
                 return;
             }
-            let replaced = w
+            let replaced = editor
                 .get_editor_content()
                 .replace(query.as_str(), replacement.as_str());
-            w.set_editor_content(replaced.clone().into());
-            w.set_editor_dirty(true);
-            w.set_editor_line_numbers(line_numbers_for(&replaced).into());
+            editor.set_editor_content(replaced.clone().into());
+            editor.set_editor_dirty(true);
+            editor.set_editor_lines(editor_lines_for(&replaced));
             // 编辑器修改：替换可能改变行首注释判定，同步刷新语法高亮层。
-            update_editor_text_layers(&w, &replaced);
-            w.set_editor_match_count(0);
+            update_editor_text_layers(&editor, &replaced);
+            editor.set_editor_match_count(0);
         });
     }
 }
