@@ -3,7 +3,50 @@
 All notable changes are documented here. 本文件记录所有重要变更。
 中英对照（中文在前，English after）.
 
-v0.7.5
+## [0.7.7] - 2026-10-11
+
+- **Telnet 与串口会话支持按会话设置字符编码（#435）。** 此前编码选项（#338）仅对 SSH 生效，通过 Telnet 或串口连接的 GBK 设备始终按 UTF-8 解码而显示乱码。现在 Telnet 与串口会按会话所选编码解码输出、编码输入，多字节字符跨读取被拆分时也不再显示为替换字符。会话编辑器在 SSH / Telnet（高级选项）和串口（主设置区）中提供编码选择，并新增 GB18030、EUC-JP 及西里尔 / 中欧等编码。
+- **Per-session character encoding for Telnet and serial sessions (#435).** The encoding option (#338) only applied to SSH, so GBK equipment reached over Telnet or a serial line always decoded as UTF-8 and showed garbled text. Telnet and serial now decode output and encode input with the session's encoding, and multibyte characters split across reads no longer turn into replacement characters. The session editor offers the encoding picker for SSH / Telnet (Advanced) and serial (main section), with more encodings including GB18030, EUC-JP and Cyrillic / Central European code pages.
+
+- **修复终端字体缺失的符号显示为空白的问题（#461）。** 内置的 Meatshell Mono 不含 ➜、✔、✗ 等符号，而 Slint 不会逐字形回退，导致自定义 PS1 提示符中出现空白。现在终端字体缺失的字符会改用第一个包含该字符的系统字体绘制（Windows 为 Segoe UI Symbol，其他平台使用相应字体）；已覆盖的文本、中日韩字符与 emoji 的渲染和对齐保持不变。
+- **Draw symbols missing from the terminal font with a system fallback (#461).** The bundled Meatshell Mono has no glyphs for ➜, ✔, ✗ and similar symbols, and Slint does not fall back per glyph, so custom PS1 prompts showed blank cells. Characters the terminal font lacks are now drawn with the first installed system font that has them (Segoe UI Symbol on Windows, platform equivalents elsewhere); covered text, CJK and emoji keep their existing rendering and alignment.
+
+- **支持显示终端下划线（SGR 4），包括带下划线的空格（#444）。** 下划线现在以覆盖整个单元格宽度的横线绘制，输入框、登录表单等使用下划线空格的界面能像 PuTTY 一样正确显示。
+- **Render terminal underline (SGR 4), including underlined spaces (#444).** Underlines are now drawn as a cell-wide rule, so input fields, login forms and other screens built from underlined spaces display like they do in PuTTY.
+
+- **修复断开 / 重连时保留终端历史的若干问题。** 后台标签页或侧栏隐藏时断开连接，历史记录不再被误清除，只有关闭标签页时才清除；在 vim 等备用屏幕中断线后重连，新会话的输出不再叠加到旧画面上。（感谢 @nilxbit，#491）
+- **Fix issues with keeping terminal history across disconnects and reconnects.** History is no longer cleared when a session disconnects in a background tab or with the sidebar hidden; it is only cleared when the tab is closed. Reconnecting after a disconnect inside vim or another alternate-screen program no longer draws the new session's output over the old screen. (Thanks @nilxbit, #491)
+
+## [0.7.6] - 2026-10-10
+
+- **修复 macOS 0.7.5 启动即闪退的问题（#486）。** 0.7.5 新增的系统托盘依赖 muda 0.20，而 Slint 的 macOS 菜单栏使用 muda 0.18，两者注册了同名但内存布局不同的 Objective-C 类 `MudaMenuItem`，创建托盘菜单时程序崩溃。macOS 上暂时停用系统托盘，关闭窗口的行为恢复为 0.7.5 之前；Windows 与 Linux 托盘不受影响。
+- **Fix the macOS launch crash in 0.7.5 (#486).** The system tray added in 0.7.5 uses muda 0.20 while Slint's macOS menu bar uses muda 0.18; both register an Objective-C class named `MudaMenuItem` with different layouts, so building the tray menu crashed the app. The tray is disabled on macOS for now and closing a window behaves as it did before 0.7.5; the Windows and Linux tray are unchanged.
+
+- **修复带 Touch Bar 的 Mac 上关闭窗口或退出时弹出“意外退出”的问题（#488）。** AccessKit 释放时会恢复窗口视图的原始类，破坏了 AppKit Touch Bar 在该视图上的 KVO 观察，导致 AppKit 抛出未捕获异常。现在 macOS 上不再释放 AccessKit 适配器，旁白（VoiceOver）等辅助功能保持可用。
+- **Fix the "quit unexpectedly" crash when closing a window or quitting on Touch Bar Macs (#488).** Releasing AccessKit restored the window view's original class, corrupting the KVO observations AppKit's Touch Bar support keeps on that view, and AppKit threw an uncaught exception. The AccessKit adapter is no longer released on macOS; VoiceOver and other accessibility features keep working.
+
+- **修复在 nano / vim 等全屏程序中调整窗口大小后退出时可能崩溃的问题（#490）。** vt100 0.15 调整尺寸时没有修正备用屏幕保存的光标位置，缩小窗口后退出全屏程序，光标会落在屏幕之外并触发崩溃。终端解析库升级到 vt100 0.16.2 修复此问题，并同步升级 unicode-width 0.2，保持中日韩宽字符的列宽计算与解析库一致（#132）。
+- **Fix a possible crash when leaving nano / vim and other full-screen programs after resizing the window (#490).** vt100 0.15 did not clamp the cursor saved by the alternate screen when resizing, so shrinking the window and then leaving a full-screen program put the cursor outside the screen and crashed. The terminal parser is upgraded to vt100 0.16.2, together with unicode-width 0.2 so CJK wide-character column math stays in step with the parser (#132).
+
+- **新增窗口置顶（#450）。** 右上角工具栏新增📌按钮，可让窗口保持在其他应用之上，再次点击取消；置顶状态按窗口区分，不会保存。该窗口的编辑器、进程和系统信息窗口会一同置顶；在 Windows 上，文件选择框和提示框以主窗口为父窗口，置顶时不会被遮挡。
+- **Add an always-on-top pin (#450).** A new 📌 button in the top-right toolbar keeps the window above other applications; click again to unpin. The pin is per window and not saved. The window's editor, process and system-information windows follow it, and on Windows file pickers and message boxes are owned by the main window so they are not hidden behind a pinned window.
+
+- **命令历史打开时默认显示最新命令（#447）。** 历史弹窗现在自动滚动到底部最新的命令（紧邻搜索框），修改搜索条件后回到最新结果，↑/↓ 键盘选择时列表会跟随滚动，选中项始终可见。
+- **Open the command history at the newest entry (#447).** The history popup now opens scrolled to the newest commands at the bottom, next to the search box, returns there when the search changes, and follows the ↑/↓ keyboard selection so the selected entry stays visible.
+
+- **按会话设置 MCP 访问范围（#432）。** 会话编辑器新增“允许 MCP 访问此会话”选项（默认开启）。关闭后 MCP 无法列出、连接该会话，也无法经由它作为跳板；CLI 不受影响。
+- **Per-session MCP access scope (#432).** The session editor gains an "Allow MCP access to this session" option (on by default). When it is off, MCP clients cannot list or connect to the session, or route through it as a jump host; the CLI is unaffected.
+
+- **断开或重新连接 SSH 会话时保留终端历史。** 会话断开后不再清空滚动历史，按回车重新连接时，之前的屏幕内容会并入历史记录，只有关闭标签页时才清除；在查看历史时输入不会再强制跳回底部，除非光标已不在可见区域。（感谢 @nilxbit）
+- **Keep terminal history across SSH disconnects and reconnects.** Scrollback is no longer cleared when a session disconnects; reconnecting with Enter moves the previous screen into history, and history is only cleared when the tab is closed. Typing while scrolled back no longer jumps to the bottom unless the cursor is out of view. (Thanks @nilxbit)
+
+- **串口会话可从本机已检测到的串口中选择。** 新建 / 编辑串口会话时，端口输入框旁新增下拉列表，列出本机可用的串口，仍可手动输入。（感谢 @nilxbit）
+- **Pick serial ports from those detected on this machine.** When creating or editing a serial session, the port field gains a dropdown of the available local serial ports; typing a port by hand still works. (Thanks @nilxbit)
+
+- **代码维护。** 将超过 7600 行的 `src/app.rs` 拆分为按职责划分的模块，行为不变；清理编译警告中的死代码与无用导入（感谢 @lyj404）。
+- **Maintenance.** Split the 7,600-line `src/app.rs` into focused modules with no behaviour change, and removed dead code and unused imports flagged by compiler warnings (thanks @lyj404).
+
+## [0.7.5] - 2026-10-07
 
 新功能 / Features
 
@@ -66,6 +109,7 @@ v0.7.5
 - Include the existing fork history: multi-hop SSH, safe profile/config storage,
   CLI/MCP imports/headless mode, session editor fixes and bounded connection stages
 - Add synthetic loopback tests and external IdP/HTTPS deployment documentation
+
 ## [0.7.4] - 2026-09-21
 
 - **修复会话断开（`exit` 或网络中断）后终端内容被清空的问题（#451）。** 断开连接时，释放缓存曾会新建一个空白的 vt100 解析器，导致"连接已断开，按 Enter 重新连接"提示打印在一块空屏幕上，而不是追加在断开前的原有内容后面。现在断开时只释放体积较大且无上限的原始重放缓冲区与历史滚动记录，当前可见屏幕内容保持不变；重新连接和手动"清空缓存"两个场景仍会像之前一样得到全新空白屏幕。

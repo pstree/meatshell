@@ -9,6 +9,8 @@ mod json_output;
 mod charset;
 #[path = "impls/encoding.rs"]
 mod encoding;
+#[path = "impls/glyph_fallback.rs"]
+mod glyph_fallback;
 #[path = "impls/local.rs"]
 pub(crate) mod local;
 #[path = "impls/output_highlight.rs"]
@@ -33,9 +35,11 @@ pub(crate) mod zmodem;
 #[cfg(windows)]
 pub(crate) use input::c0_letter_key_down;
 #[cfg(test)]
+pub(crate) use input::build_paste_preview;
+#[cfg(test)]
 pub(crate) use input::normalize_pasted_newlines;
 pub(crate) use input::{
-    bare_ctrl_marker_workaround_enabled, build_paste_preview, clear_pending_paste,
+    bare_ctrl_marker_workaround_enabled, clear_pending_paste,
     encode_command_bar_input, encode_mouse_event, encode_pasted_text, is_back_tab,
     is_terminal_interrupt, key_to_pty_bytes, BACK_TAB_BYTES, paste_requires_large_review, should_drop_bare_ctrl_marker,
     store_pending_paste, take_pending_paste, terminal_uses_bracketed_paste, PendingPaste,
@@ -43,6 +47,9 @@ pub(crate) use input::{
 pub(crate) use charset::CharsetTracker;
 pub(crate) use session_log::{SessionLogSpec, SessionLogger};
 pub(crate) use encoding::TerminalEncoding;
+pub(crate) use glyph_fallback::{
+    install_glyph_fallback, Coverage, GlyphFallback, BUNDLED_TERM_FONT,
+};
 pub(crate) use json_output::format_json_output;
 #[cfg(any(target_os = "windows", test))]
 pub(crate) use input::windows_process_ctrl_release;

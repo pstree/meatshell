@@ -34,6 +34,7 @@ pub(super) fn apply_saved_appearance(ctx: &WinCtx) {
     {
         let s = store.borrow();
         let fam = s.font_family().to_string();
+        refresh_glyph_fallback(&fam, window, bufs);
         if !fam.is_empty() {
             window.set_term_font_family(fam.into());
         }
@@ -193,7 +194,11 @@ pub(super) fn wire_session_log_settings(ctx: &WinCtx) {
         let weak = window.as_weak();
         window.on_pick_session_log_dir(move || {
             let start = store.borrow().session_log_dir();
-            let Some(folder) = rfd::FileDialog::new().set_directory(&start).pick_folder() else {
+            let Some(folder) = DialogOwner::of_weak(&weak)
+                .file()
+                .set_directory(&start)
+                .pick_folder()
+            else {
                 return;
             };
             let effective = {
@@ -572,6 +577,7 @@ pub(super) fn wire_terminal_settings(ctx: &WinCtx) {
     {
         let weak = window.as_weak();
         let store = store.clone();
+        let bufs = bufs.clone();
         window.on_set_term_font(move |family: SharedString| {
             {
                 let mut s = store.borrow_mut();
@@ -579,6 +585,8 @@ pub(super) fn wire_terminal_settings(ctx: &WinCtx) {
                 let _ = s.save();
             }
             if let Some(w) = weak.upgrade() {
+                // The new font covers a different glyph set (#461).
+                refresh_glyph_fallback(family.as_str(), &w, &bufs);
                 w.set_term_font_family(family);
             }
         });
@@ -807,7 +815,8 @@ pub(super) fn wire_ui_scale_and_wallpaper(ctx: &WinCtx) {
         let bufs_wp = bufs.clone();
         let proc_weak = proc_win.as_weak();
         window.on_pick_wallpaper_file(move || {
-            let picked = rfd::FileDialog::new()
+            let picked = DialogOwner::of_weak(&weak)
+                .file()
                 .set_title("选择壁纸 / Choose wallpaper")
                 .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
                 .pick_file();

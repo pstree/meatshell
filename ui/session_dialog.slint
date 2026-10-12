@@ -493,6 +493,142 @@ component JumpCombo inherits VerticalLayout {
     }
 }
 
+// SerialPort field with an editable text box + a dropdown of existing serial ports.
+// Type to input a serial port, or click the ▾ to pick one already in use.
+component SerialPortCombo inherits VerticalLayout {
+    in property <string> label;
+    in property <string> placeholder;
+    in-out property <string> value;
+    in property <[string]> serial-ports;       // existing serial_port names
+    spacing: 4px;
+
+    Text {
+        text: root.label;
+        color: Theme.text-secondary;
+        font-size: Theme.fs-sm;
+    }
+
+    Rectangle {
+        height: 32px;
+        border-radius: Theme.radius-sm;
+        border-width: 1px;
+    border-color: ginput.has-focus ? Theme.accent : Theme.border-strong;
+    background: Theme.bg-elevated;
+
+        // Hide on focus: IME preedit is visible before value is committed.
+        if root.value == "" && !ginput.has-focus : Text {
+            x: 10px;
+            width: parent.width - 44px;
+            height: parent.height;
+            overflow: elide;
+            text: root.placeholder;
+            color: Theme.text-muted;
+            font-family: Theme.ui-font-family;
+            font-size: Theme.fs-md;
+            vertical-alignment: center;
+        }
+
+        ginput := TextInput {
+            x: 10px;
+            width: parent.width - 44px;     // room for the ▾ button
+            height: parent.height;
+            text <=> root.value;
+            color: Theme.text-primary;
+            font-family: Theme.ui-font-family;
+            font-size: Theme.fs-md;
+            vertical-alignment: center;
+            single-line: true;
+        }
+
+
+        // ▾ — opens the existing-serial-ports list (no-op when there are none).
+        drop-ta := TouchArea {
+            x: parent.width - 36px;
+            width: 36px;
+            height: parent.height;
+            mouse-cursor: root.serial-ports.length > 0 ? pointer : default;
+            clicked => { if (root.serial-ports.length > 0) { serial-ports-popup.show(); } }
+            Rectangle {
+                width: 28px;
+                height: 28px;
+                border-radius: Theme.radius-sm;
+                background: (drop-ta.has-hover && root.serial-ports.length > 0) ? Theme.bg-hover : transparent;
+                Text {
+                    // Plain Unicode caret — the dialog's CJK UI font has this but
+                    // not the Material icon range, which would tofu (#179).
+                    text: "▼";
+                    color: root.serial-ports.length > 0 ? Theme.text-secondary : Theme.border-strong;
+                    font-size: Theme.fs-xs;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        serial-ports-popup := PopupWindow {
+            x: 0;
+            y: parent.height + 3px;
+            width: parent.width;
+            Rectangle {
+                background: Theme.popup-bg-alt;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: Theme.border-subtle;
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 1px;
+                    for g in root.serial-ports : Rectangle {
+                        height: 28px;
+                        border-radius: Theme.radius-sm;
+                        background: g-ta.has-hover ? Theme.bg-hover : transparent;
+                        g-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.value = g; serial-ports-popup.close(); }
+                        }
+                        Text {
+                            x: 10px;
+                            width: parent.width - 20px;
+                            text: g;
+                            color: Theme.text-primary;
+                            font-size: Theme.fs-md;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Terminal character encoding picker (#338, #435). Shared by SSH/Telnet (in
+// the Advanced section) and serial (main section: serial has no Advanced).
+// Values are encoding_rs / WHATWG labels; unknown labels fall back to UTF-8.
+component EncodingPicker inherits VerticalLayout {
+    in-out property <string> value: "UTF-8";
+    spacing: 4px;
+    Text {
+        text: @tr("Terminal character encoding");
+        color: Theme.text-secondary;
+        font-size: Theme.fs-sm;
+    }
+    ComboBox {
+        model: [
+            "UTF-8", "GBK", "GB18030", "Big5", "Shift_JIS", "EUC-JP", "EUC-KR",
+            "Windows-1252", "ISO-8859-1", "ISO-8859-2", "Windows-1251", "KOI8-R",
+            "Windows-1250", "Windows-1256", "Windows-874",
+        ];
+        current-value: root.value;
+        selected(value) => { root.value = value; }
+    }
+    Text {
+        text: @tr("Use GBK for servers configured for GB2312 or GBK output.");
+        color: Theme.text-muted;
+        font-size: Theme.fs-xs;
+    }
+    Rectangle { height: 6px; }
+}
+
 // A fixed-height row keeps the drop position independent of text length.
 export component JumpRow inherits Rectangle {
     in property <JumpHop> hop;
@@ -599,6 +735,7 @@ export component SessionDialog inherits ModalLayer {
     callback delete-jump(int);
     callback move-jump(int, int);
     in-out property <string> draft-serial-port;
+    in property <[string]> session-serial-ports;   // existing serial-ports for the dropdown
     in-out property <string> draft-baud: "115200";
     in-out property <string> draft-data-bits: "8";
     in-out property <string> draft-stop-bits: "1";
@@ -1225,12 +1362,11 @@ export component SessionDialog inherits ModalLayer {
             }
 
             // ── Serial-only fields ──────────────────────────────────────────
-            if root.draft-kind == "serial" : LabeledInput {
-                input-background: Theme.bg-elevated;
-                idle-border: Theme.border-strong;
+            if root.draft-kind == "serial" : SerialPortCombo {
                 label: @tr("Serial port");
                 placeholder: "COM3  /  /dev/ttyUSB0";
                 value <=> root.draft-serial-port;
+                serial-ports: root.session-serial-ports;
             }
 
             if root.draft-kind == "serial" : LabeledInput {
@@ -1277,6 +1413,12 @@ export component SessionDialog inherits ModalLayer {
                 }
             }
 
+            // Serial has no Advanced section; console gear (switches, PLCs)
+            // often talks GBK, so the encoding lives here for it (#435).
+            if root.draft-kind == "serial" : EncodingPicker {
+                value <=> root.draft-encoding;
+            }
+
             // ── Advanced (collapsed by default): proxy + port forwarding ────
             // Not offered for serial (nothing to configure) or RDP (its extras
             // live in the main section, and the SSH-only parts do not apply).
@@ -1305,25 +1447,9 @@ export component SessionDialog inherits ModalLayer {
                 }
             }
 
-            // ── Terminal character encoding (SSH only) (#338) ───────────────
-            if root.show-advanced && root.draft-kind == "ssh" : VerticalLayout {
-                spacing: 4px;
-                Text {
-                    text: @tr("Terminal character encoding");
-                    color: Theme.text-secondary;
-                    font-size: Theme.fs-sm;
-                }
-                ComboBox {
-                    model: ["UTF-8", "GBK", "Big5", "Shift_JIS", "EUC-KR", "Windows-1252"];
-                    current-value: root.draft-encoding;
-                    selected(value) => { root.draft-encoding = value; }
-                }
-                Text {
-                    text: @tr("Use GBK for servers configured for GB2312 or GBK output.");
-                    color: Theme.text-muted;
-                    font-size: Theme.fs-xs;
-                }
-                Rectangle { height: 6px; }
+            // ── Terminal character encoding (SSH / Telnet) (#338, #435) ─────
+            if root.show-advanced && (root.draft-kind == "ssh" || root.draft-kind == "telnet") : EncodingPicker {
+                value <=> root.draft-encoding;
             }
 
             // ── VT100 line drawing (all session kinds) (#376) ───────────────
