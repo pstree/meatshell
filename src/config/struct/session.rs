@@ -76,6 +76,46 @@ fn default_rdp_height() -> u16 {
     720
 }
 
+/// Per-session override of the global session-log setting (#265).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionLogMode {
+    /// Follow the global "record session logs" setting.
+    #[default]
+    Default,
+    /// Always log this session.
+    On,
+    /// Never log this session.
+    Off,
+}
+
+impl SessionLogMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionLogMode::Default => "default",
+            SessionLogMode::On => "on",
+            SessionLogMode::Off => "off",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "on" => SessionLogMode::On,
+            "off" => SessionLogMode::Off,
+            _ => SessionLogMode::Default,
+        }
+    }
+
+    /// Effective on/off given the global default.
+    pub fn resolve(self, global_enabled: bool) -> bool {
+        match self {
+            SessionLogMode::Default => global_enabled,
+            SessionLogMode::On => true,
+            SessionLogMode::Off => false,
+        }
+    }
+}
+
 /// How a session authenticates.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -125,9 +165,22 @@ pub struct Session {
     pub proxy: String,
     /// Optional SSH jump host (bastion): the id of another saved SSH session to
     /// tunnel this connection through, like OpenSSH's ProxyJump. Empty = direct.
-    /// Single hop only; the jump session supplies its own host/user/auth (#211).
+    /// The jump session may reference another jump. The full chain is validated
+    /// before connecting; each hop supplies its own host/user/auth (#211).
     #[serde(default)]
     pub jump_session_id: String,
+    /// Explicit connection order (first hop first). When non-empty, this list
+    /// replaces inherited jump references without modifying the saved hops.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jump_session_ids: Vec<String>,
+    /// Opt in to revealing saved credentials in the editor; always masked on open.
+    #[serde(default)]
+    pub allow_secret_reveal: bool,
+    /// Expose this session to MCP clients (#432). When false, MCP tools treat
+    /// it as nonexistent and refuse routes that use it as a jump host. The CLI
+    /// is unaffected. Absent in older configs → true, preserving behaviour.
+    #[serde(default = "default_true")]
+    pub mcp_access: bool,
     #[serde(default)]
     pub last_used: Option<String>,
     /// Optional folder/group name to organize sessions in the list (#41).
@@ -192,6 +245,11 @@ pub struct Session {
     #[serde(default = "default_vt100_drawing")]
     pub vt100_drawing: bool,
 
+    /// Record this session's terminal output to a log file (#265):
+    /// follow the global setting, or force on/off.
+    #[serde(default)]
+    pub session_log: SessionLogMode,
+
     // --- SSH port forwarding / tunnels (#56) --------------------------------
     /// Tunnels established automatically when this SSH session connects.
     #[serde(default)]
@@ -201,10 +259,9 @@ pub struct Session {
     #[serde(default)]
     pub triggers: Vec<SessionTrigger>,
 
-    /// Skip the shell-integration setup (the cwd-follow PROMPT_COMMAND hook + the
-    /// remote resource monitor). Those assume a POSIX shell; on a Windows server
-    /// whose shell is pwsh/cmd the injected hook breaks the shell. Turn this on
-    /// for such servers (#140).
+    /// Skip shell-integration setup (the cwd-follow hook + remote resource
+    /// monitor). Those assume a POSIX shell and can interfere with Windows
+    /// shells or interactive auto-login scripts. SFTP remains available.
     #[serde(default)]
     pub disable_shell_integration: bool,
     /// Free-form note for this session — somewhere to stash extra info (jump-host
@@ -219,7 +276,13 @@ pub struct Session {
 /// for dynamic it is ignored (the SOCKS client picks the destination).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PortForward {
+    /// Stable identifier for a saved rule, including across edits and deletes.
+    #[serde(default)]
+    pub id: String,
     pub kind: String,
+    /// Start this saved tunnel when the SSH connection is established.
+    #[serde(default = "default_forward_auto_start")]
+    pub auto_start: bool,
     /// Optional label to tell rules apart (#100). Empty = unnamed.
     #[serde(default)]
     pub name: String,
@@ -232,6 +295,10 @@ pub struct PortForward {
     pub host: String,
     #[serde(default)]
     pub host_port: u16,
+}
+
+fn default_forward_auto_start() -> bool {
+    true
 }
 
 /// Automatically send a response when literal terminal output is observed.
@@ -251,6 +318,38 @@ fn default_true() -> bool {
     true
 }
 
+#[cfg(test)]
+mod session_log_mode_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_against_global_default() {
+        assert!(SessionLogMode::Default.resolve(true));
+        assert!(!SessionLogMode::Default.resolve(false));
+        assert!(SessionLogMode::On.resolve(false));
+        assert!(!SessionLogMode::Off.resolve(true));
+    }
+
+    #[test]
+    fn missing_field_deserializes_as_default() {
+        let mut value = serde_json::to_value(Session::new_empty()).unwrap();
+        value.as_object_mut().unwrap().remove("session_log");
+        let session: Session = serde_json::from_value(value).unwrap();
+        assert_eq!(session.session_log, SessionLogMode::Default);
+    }
+
+    #[test]
+    fn round_trips_through_strings() {
+        for mode in [
+            SessionLogMode::Default,
+            SessionLogMode::On,
+            SessionLogMode::Off,
+        ] {
+            assert_eq!(SessionLogMode::from_str(mode.as_str()), mode);
+        }
+    }
+}
+
 impl Session {
     pub fn new_empty() -> Self {
         Self {
@@ -265,6 +364,9 @@ impl Session {
             private_key_inline: Secret::default(),
             proxy: String::new(),
             jump_session_id: String::new(),
+            jump_session_ids: Vec::new(),
+            allow_secret_reveal: false,
+            mcp_access: true,
             last_used: None,
             group: String::new(),
             kind: SessionKind::Ssh,
@@ -282,6 +384,7 @@ impl Session {
             rdp_height: default_rdp_height(),
             encoding: default_encoding(),
             vt100_drawing: default_vt100_drawing(),
+            session_log: SessionLogMode::Default,
             forwards: Vec::new(),
             triggers: Vec::new(),
             disable_shell_integration: false,
