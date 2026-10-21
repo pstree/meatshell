@@ -34,18 +34,6 @@ pub(crate) struct TermBuffer {
     pub(crate) mouse_tracked: bool,
     pub(crate) history: VecDeque<Line>,
     pub(crate) prev: Vec<Line>,
-    /// Per-row render cache for the live screen (index = grid row). `render()`
-    /// reuses a row's cached source line (skipping `build_row` + highlight)
-    /// when its content is unchanged since the last ingest, so long-press echo
-    /// no longer rebuilds the whole grid each frame. Spans are rebuilt from the
-    /// cached line every frame (they contain `TermSpan`, which is not `Send`).
-    pub(crate) live_cache: Vec<Option<Line>>,
-    /// Rows whose content changed since the last cache refresh. `None` = unknown
-    /// → treat every row as dirty (first render, resize, theme change, reset).
-    pub(crate) dirty: Option<Vec<bool>>,
-    /// Baseline screen rows for dirty detection. Kept current on every chunk,
-    /// independently of the scroll-detection `prev` (which clears on alt screen).
-    pub(crate) prev_render: Vec<Line>,
     pub(crate) view_offset: usize,
     /// Fractional scrollback rows not yet applied. Wheel deltas arrive as
     /// pixel fractions of a row (trackpad + macOS momentum decay); keeping
@@ -137,7 +125,7 @@ pub(crate) struct BuiltScreen {
 }
 
 /// One coloured run within a terminal line.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub(crate) struct HistSpan {
     pub(crate) text: String,
     pub(crate) fg: vt100::Color,
