@@ -723,6 +723,35 @@ impl ConfigStore {
 
     pub fn remove(&mut self, id: &str) {
         self.cache.sessions.retain(|s| s.id != id);
+        self.cache.sftp_places.remove(id);
+    }
+
+    /// SFTP bookmarks / recent folders saved for a session (#500).
+    pub fn sftp_places(&self, session_id: &str) -> crate::config::SftpPlaces {
+        self.cache
+            .sftp_places
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Edit a session's SFTP places; empty entries are dropped so the config
+    /// only carries sessions that actually have something saved.
+    pub fn update_sftp_places<R>(
+        &mut self,
+        session_id: &str,
+        f: impl FnOnce(&mut crate::config::SftpPlaces) -> R,
+    ) -> R {
+        let places = self
+            .cache
+            .sftp_places
+            .entry(session_id.to_string())
+            .or_default();
+        let out = f(places);
+        if places.is_empty() {
+            self.cache.sftp_places.remove(session_id);
+        }
+        out
     }
 
     pub fn get(&self, id: &str) -> Option<&Session> {
@@ -863,6 +892,35 @@ impl ConfigStore {
 
     pub fn set_extra_paste_shortcuts_enabled(&mut self, enabled: bool) {
         self.cache.extra_paste_shortcuts_disabled = !enabled;
+    }
+
+    /// Customised shortcut overrides (action id → chord string).
+    pub fn keybindings(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.cache.keybindings
+    }
+
+    /// Set (`Some`) or drop back to the default (`None`) one action's chord.
+    pub fn set_keybinding(&mut self, action: &str, chord: Option<String>) {
+        match chord {
+            Some(c) => {
+                self.cache.keybindings.insert(action.to_string(), c);
+            }
+            None => {
+                self.cache.keybindings.remove(action);
+            }
+        }
+    }
+
+    pub fn reset_keybindings(&mut self) {
+        self.cache.keybindings.clear();
+    }
+
+    pub fn editor_embedded(&self) -> bool {
+        self.cache.editor_embedded
+    }
+
+    pub fn set_editor_embedded(&mut self, embedded: bool) {
+        self.cache.editor_embedded = embedded;
     }
 
     pub fn zen_mode(&self) -> bool {
@@ -1071,6 +1129,30 @@ impl ConfigStore {
 
     pub fn remove_wsl_profile(&mut self, id: &str) {
         self.cache.wsl_profiles.retain(|profile| profile.id != id);
+    }
+
+    pub fn custom_agents(&self) -> &[CustomAgent] {
+        &self.cache.custom_agents
+    }
+
+    /// Add a user-defined agent launcher (#427). Returns false (and adds
+    /// nothing) when the name or command is blank.
+    pub fn add_custom_agent(&mut self, name: &str, command: &str, directory: &str) -> bool {
+        let (name, command) = (name.trim(), command.trim());
+        if name.is_empty() || command.is_empty() {
+            return false;
+        }
+        self.cache.custom_agents.push(CustomAgent {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            command: command.to_string(),
+            directory: directory.trim().to_string(),
+        });
+        true
+    }
+
+    pub fn remove_custom_agent(&mut self, id: &str) {
+        self.cache.custom_agents.retain(|agent| agent.id != id);
     }
 
     pub fn quick_panel_open(&self) -> bool {
@@ -1584,7 +1666,8 @@ impl ConfigStore {
     /// folder so expanding one folder does not accidentally expand the rest.
     pub fn set_session_group_collapsed(&mut self, name: &str, collapsed: bool) {
         if self.cache.collapsed_session_groups.is_none() {
-            let mut groups = vec!["system".to_string()];
+            // Built-in groups: local shells, and the detected agent CLIs (#427).
+            let mut groups = vec!["system".to_string(), "agents".to_string()];
             if self
                 .cache
                 .sessions
@@ -2482,6 +2565,33 @@ mod tests {
     }
 
     #[test]
+    fn issue_500_sftp_places_are_per_session_pruned_and_persisted() {
+        let mut store = temp_store();
+        // Legacy configs have no places.
+        store.cache = serde_json::from_str("{}").unwrap();
+        assert!(store.sftp_places("a").is_empty());
+
+        assert!(store.update_sftp_places("a", |p| p.toggle_bookmark("/var/log/")));
+        store.update_sftp_places("a", |p| p.record_visit("/etc"));
+        store.update_sftp_places("b", |p| p.record_visit("/srv"));
+        assert_eq!(store.sftp_places("a").bookmarks, ["/var/log"]);
+        assert_eq!(store.sftp_places("b").recent, ["/srv"]);
+
+        // Emptied entries are dropped rather than left as `{}` in the file.
+        store.update_sftp_places("b", |p| p.clear_recent());
+        assert!(!store.cache.sftp_places.contains_key("b"));
+
+        // Round-trips through the on-disk JSON.
+        let json = serde_json::to_string(&store.cache).unwrap();
+        let back: ConfigFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sftp_places.get("a").unwrap().recent, ["/etc"]);
+
+        // Deleting the session deletes its places.
+        store.remove("a");
+        assert!(store.sftp_places("a").is_empty());
+    }
+
+    #[test]
     fn issue_300_interface_defaults_and_ranges_are_safe() {
         let mut store = temp_store();
 
@@ -2503,6 +2613,19 @@ mod tests {
         assert!(!store.paste_confirm_enabled());
         assert!(!store.extra_paste_shortcuts_enabled());
         assert!(store.zen_mode());
+    }
+
+    #[test]
+    fn issue_494_editor_embedded_defaults_off_and_round_trips() {
+        let mut store = temp_store();
+        // Existing configs keep the detached editor window.
+        store.cache = serde_json::from_str("{}").unwrap();
+        assert!(!store.editor_embedded());
+
+        store.set_editor_embedded(true);
+        let json = serde_json::to_string(&store.cache).unwrap();
+        store.cache = serde_json::from_str(&json).unwrap();
+        assert!(store.editor_embedded());
     }
 
     #[test]

@@ -5,10 +5,14 @@
 //!   * Drive the 1-Hz system sampler.
 //!   * Manage the tab list + per-tab `SessionHandle` map.
 //!   * Route Slint callbacks to the right domain module.
+mod agents;
 mod auth_dialogs;
 mod aux_windows;
 pub(crate) mod core;
 mod dock_stacks;
+mod drag_out;
+mod editor_host;
+mod editor_tabs;
 mod file_drop;
 mod fonts;
 mod helpers;
@@ -33,9 +37,9 @@ mod session_runtime;
 mod session_trigger;
 mod settings_callbacks;
 mod sftp_callbacks;
-// qian 分支特性：SFTP 内置编辑器语法高亮层刷新（EditorWindow 架构下保留）。
-mod sftp_editor;
+mod sftp_places;
 mod sftp_ui;
+mod shortcuts;
 mod sidebar;
 mod single_instance;
 mod tab_callbacks;
@@ -43,6 +47,7 @@ mod tab_transfer;
 mod term_output;
 mod terminal_ui;
 mod tray;
+mod update;
 mod tunnel_callbacks;
 mod webdav;
 mod window;
@@ -51,6 +56,8 @@ mod window_events;
 use self::auth_dialogs::*;
 use self::aux_windows::*;
 use self::dock_stacks::*;
+use self::editor_host::*;
+use self::editor_tabs::*;
 use self::file_drop::*;
 use self::fonts::*;
 use self::helpers::*;
@@ -69,7 +76,6 @@ use self::session_runtime::*;
 use self::session_trigger::*;
 use self::settings_callbacks::*;
 use self::sftp_callbacks::*;
-use self::sftp_editor::*;
 use self::sftp_ui::*;
 use self::sidebar::*;
 use self::tab_callbacks::*;
@@ -258,6 +264,7 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
         window_states: Rc::new(RefCell::new(HashMap::new())),
         tab_routes: Arc::new(Mutex::new(HashMap::new())),
         first_window_done: Cell::new(false),
+        update: RefCell::new(update::State::default()),
     });
 
     // IPC listener: forwarded "new-window" requests arrive on the listener
@@ -330,6 +337,9 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
     #[cfg(windows)]
     crate::app::jump_list::register_new_window_task();
 
+    #[cfg(windows)]
+    crate::update::windows::cleanup_stale_downloads();
+    crate::update::inplace::cleanup_after_update();
     open_window(core.clone(), false, None)?;
     let tray_timer = tray::install(core.clone());
 
@@ -352,6 +362,7 @@ pub fn run(_intent: crate::app::launch::LaunchIntent) -> Result<()> {
     // hard-exit unconditionally. The event-loop error path goes through here
     // too: propagating with `?` would hand the runtime to the TLS destructor
     // chain, where a wedged blocking thread could hang the process forever.
+    update::cleanup(&core);
     NEW_WINDOW_CORE.with(|c| *c.borrow_mut() = None);
     tray::clear();
     drop(tray_timer);

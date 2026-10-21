@@ -172,6 +172,7 @@ pub(super) fn open_window(
         store.borrow().sftp_follow_cd(),
     ));
     wire_interface_toggles(&ctx, &sftp_follow_cd);
+    super::shortcuts::wire_shortcuts(&ctx);
     wire_session_log_settings(&ctx);
 
     // Interface setting: collapse the sidebars by default (#78). Seed the
@@ -185,6 +186,8 @@ pub(super) fn open_window(
     window.set_sessions(ModelRc::from(sessions_model.clone()));
     sync_sessions_to_model(&store.borrow(), &sessions_model);
     window.set_wsl_profiles(wsl_profile_model(&store.borrow()));
+    window.set_launch_shells(launch_shell_model(&store.borrow()));
+    super::agents::wire_agent_launchers(&ctx, &sessions_model);
     listen_for_config_changes(&ctx, &sessions_model);
     wire_wsl_profiles(&ctx, &sessions_model);
     wire_webdav_download(&ctx, &sessions_model);
@@ -202,6 +205,9 @@ pub(super) fn open_window(
 
     let terminals_model: Rc<VecModel<TerminalState>> = Rc::new(VecModel::default());
     window.set_terminals(ModelRc::from(terminals_model.clone()));
+    // Files open as editor tabs (#494); see editor_tabs.rs.
+    let editor_docs_model: Rc<VecModel<EditorDoc>> = Rc::new(VecModel::default());
+    window.set_editor_docs(ModelRc::from(editor_docs_model.clone()));
 
     // Split-pane layout tree (v0.5). Starts as a single pane owning the welcome
     // tab; tab opens/closes/moves mutate it and re-flatten into the `panes`
@@ -639,46 +645,7 @@ pub(super) fn open_window(
     wire_auth_prompts(&ctx);
 
     wire_downloads_and_links(&ctx, &tab_statuses, &local_snap, &local_net_hist);
-    // Query the GitHub releases API on a background thread; if a newer version
-    // exists, flip the banner on. Best-effort: any network/parse error is
-    // silently ignored and the app keeps working on the current version.
-    // Skipped entirely when the user turned the check off (#184). Runs only
-    // for the first window of the process: the old `registry.count() == 1`
-    // guard re-fired the check whenever the count returned to 1 after a
-    // close-then-open. The flag is set regardless of the enabled setting, so
-    // a disabled check is never deferred to a later window either.
-    let first_window = !core.first_window_done.get();
-    core.first_window_done.set(true);
-    if first_window && store.borrow().update_check_enabled() {
-        let weak = window.as_weak();
-        std::thread::spawn(move || {
-            let body =
-                match ureq::get("https://api.github.com/repos/yituorou/meatshell/releases/latest")
-                    .set("User-Agent", "meatshell-update-check")
-                    .timeout(std::time::Duration::from_secs(8))
-                    .call()
-                {
-                    Ok(resp) => resp.into_string().unwrap_or_default(),
-                    Err(_) => return,
-                };
-            let json: serde_json::Value = match serde_json::from_str(&body) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let tag = json["tag_name"].as_str().unwrap_or("").to_string();
-            let newer = matches!(
-                (parse_version(&tag), parse_version(env!("CARGO_PKG_VERSION"))),
-                (Some(latest), Some(cur)) if latest > cur
-            );
-            if !newer {
-                return;
-            }
-            let _ = weak.upgrade_in_event_loop(move |w| {
-                w.set_update_version(tag.into());
-                w.set_update_available(true);
-            });
-        });
-    }
+    super::update::wire(&core, &window);
 
     // Transfer records (download/upload progress + history) shown in the popup.
     let transfers_model: Rc<VecModel<TransferInfo>> = Rc::new(VecModel::default());
@@ -738,6 +705,19 @@ pub(super) fn open_window(
         &editor_win,
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
+    );
+    super::sftp_places::wire_sftp_places(&window, store.clone(), tab_statuses.clone());
+    wire_editor_tabs(
+        &window,
+        EditorTabModels {
+            docs: editor_docs_model.clone(),
+            tabs: tabs_model.clone(),
+            layout: layout.clone(),
+            content_size: content_size.clone(),
+            panes: panes_model.clone(),
+            splitters: splitters_model.clone(),
+        },
+        sftp_handles.clone(),
     );
     wire_key_input(
         &window,

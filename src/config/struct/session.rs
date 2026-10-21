@@ -68,6 +68,32 @@ fn default_vt100_drawing() -> bool {
     false
 }
 
+/// Terminal type reported to the server (#498): the SSH `pty-req` TERM, the
+/// Telnet TERMINAL-TYPE reply (RFC 1091) and `$TERM` for local shells.
+pub const DEFAULT_TERM_TYPE: &str = "xterm-256color";
+
+fn default_term_type() -> String {
+    DEFAULT_TERM_TYPE.to_string()
+}
+
+/// A usable terminal type, or the default. Terminfo names are short ASCII
+/// words (`xterm-256color`, `vt100`, `screen.xterm-256color`); anything else —
+/// empty, oversized, spaces or control bytes from a hand-edited config — falls
+/// back to the default rather than being sent to the server.
+pub fn normalize_term_type(raw: &str) -> &str {
+    let term = raw.trim();
+    let valid = !term.is_empty()
+        && term.len() <= 64
+        && term
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'));
+    if valid {
+        term
+    } else {
+        DEFAULT_TERM_TYPE
+    }
+}
+
 fn default_rdp_width() -> u16 {
     1280
 }
@@ -199,6 +225,12 @@ pub struct Session {
     pub local_distribution: String,
     #[serde(default)]
     pub local_working_dir: String,
+    /// Program a generated local session runs inside its shell, e.g. the
+    /// resolved path of an agent CLI launched from the welcome page (#427).
+    /// The shell stays open after the program exits. Never set on saved
+    /// sessions, so it is left out of the config file when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub local_command: String,
 
     // --- Serial-only fields (ignored unless kind == Serial) -----------------
     /// Serial device path, e.g. "COM3" (Windows) or "/dev/ttyUSB0" (Linux).
@@ -245,6 +277,12 @@ pub struct Session {
     #[serde(default = "default_vt100_drawing")]
     pub vt100_drawing: bool,
 
+    /// Terminal type (`TERM`) announced to the server (#498). Some programs
+    /// (e.g. older telnet targets) only work with plain `xterm`. Absent in
+    /// older configs → `xterm-256color`, the value always used before.
+    #[serde(default = "default_term_type")]
+    pub term_type: String,
+
     /// Record this session's terminal output to a log file (#265):
     /// follow the global setting, or force on/off.
     #[serde(default)]
@@ -264,6 +302,16 @@ pub struct Session {
     /// shells or interactive auto-login scripts. SFTP remains available.
     #[serde(default)]
     pub disable_shell_integration: bool,
+    /// Who the SFTP panel works as (#438): "" = the login user (the `sftp`
+    /// subsystem), "sudo" = root, by running sftp-server through sudo, or
+    /// "custom" = run `sftp_command` as the SFTP server, like WinSCP's
+    /// "SFTP server" setting.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sftp_mode: String,
+    /// SFTP server command for `sftp_mode == "custom"`, e.g.
+    /// `sudo -u www-data /usr/lib/openssh/sftp-server`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sftp_command: String,
     /// Free-form note for this session — somewhere to stash extra info (jump-host
     /// details, credentials hints, owner, etc.). Shown only in the edit dialog.
     /// (B站 suggestion)
@@ -350,7 +398,54 @@ mod session_log_mode_tests {
     }
 }
 
+#[cfg(test)]
+mod term_type_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_valid_terminfo_names() {
+        for term in [
+            "xterm",
+            "xterm-256color",
+            "vt100",
+            "screen.xterm-256color",
+            "rxvt-unicode+x",
+        ] {
+            assert_eq!(normalize_term_type(term), term);
+        }
+        assert_eq!(normalize_term_type("  xterm  "), "xterm");
+    }
+
+    #[test]
+    fn falls_back_to_default_for_unusable_values() {
+        let long = "x".repeat(65);
+        for term in [
+            "",
+            "   ",
+            "xterm 256",
+            "x\u{1b}term",
+            "xterm;rm",
+            long.as_str(),
+        ] {
+            assert_eq!(normalize_term_type(term), DEFAULT_TERM_TYPE);
+        }
+    }
+
+    #[test]
+    fn missing_field_deserializes_as_default() {
+        let mut value = serde_json::to_value(Session::new_empty()).unwrap();
+        value.as_object_mut().unwrap().remove("term_type");
+        let session: Session = serde_json::from_value(value).unwrap();
+        assert_eq!(session.term_type, DEFAULT_TERM_TYPE);
+    }
+}
+
 impl Session {
+    /// The terminal type to announce for this session (#498).
+    pub fn effective_term_type(&self) -> &str {
+        normalize_term_type(&self.term_type)
+    }
+
     pub fn new_empty() -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -372,6 +467,7 @@ impl Session {
             kind: SessionKind::Ssh,
             local_distribution: String::new(),
             local_working_dir: String::new(),
+            local_command: String::new(),
             serial_port: String::new(),
             baud_rate: default_baud(),
             data_bits: default_data_bits(),
@@ -384,10 +480,13 @@ impl Session {
             rdp_height: default_rdp_height(),
             encoding: default_encoding(),
             vt100_drawing: default_vt100_drawing(),
+            term_type: default_term_type(),
             session_log: SessionLogMode::Default,
             forwards: Vec::new(),
             triggers: Vec::new(),
             disable_shell_integration: false,
+            sftp_mode: String::new(),
+            sftp_command: String::new(),
             note: String::new(),
         }
     }

@@ -76,6 +76,180 @@ component SftpMenuItem inherits Rectangle {
     }
 }
 
+// One folder in the places menu: click jumps there; bookmarks also get a
+// remove button (#500).
+component SftpPlaceRow inherits Rectangle {
+    in property <string> path;
+    in property <string> icon;
+    in property <bool> current;      // the folder the panel is showing
+    in property <bool> removable;
+    callback go();
+    callback remove();
+    height: 26px;
+    border-radius: Theme.radius-sm;
+    background: row-ta.has-hover ? Theme.bg-hover : transparent;
+    row-ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.go(); }
+    }
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 4px;
+        spacing: 6px;
+        Text {
+            width: 16px;
+            text: root.icon;
+            font-family: "Material Icons";
+            color: root.current ? Theme.accent : Theme.text-secondary;
+            font-size: Theme.fs-sm;
+            vertical-alignment: center;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.path;
+            color: root.current ? Theme.accent : Theme.text-primary;
+            font-size: Theme.fs-sm;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        if root.removable && row-ta.has-hover : Rectangle {
+            width: 20px;
+            border-radius: Theme.radius-sm;
+            background: rm-ta.has-hover ? Theme.bg-active : transparent;
+            rm-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.remove(); }
+            }
+            Text {
+                text: "\u{E5CD}"; // close
+                font-family: "Material Icons";
+                color: Theme.text-secondary;
+                font-size: Theme.fs-xs;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+// Toolbar button that opens the path bookmarks + recent folders menu (#500).
+// Used by both the wide and the compact toolbar layouts.
+component SftpPlacesButton inherits Rectangle {
+    in property <[string]> bookmarks;
+    in property <[string]> recent;
+    in property <string> current-path;
+    callback opened();
+    callback navigate(string);
+    callback remove-bookmark(string);
+    callback clear-recent();
+    // Menu geometry: section headers 22px, rows 26px + 1px spacing.
+    property <length> rows-h:
+        22px + max(1, root.bookmarks.length) * 27px
+        + 8px
+        + 22px + max(1, root.recent.length) * 27px
+        + (root.recent.length > 0 ? 27px : 0px);
+    width: 24px; height: 22px;
+    border-radius: Theme.radius-sm;
+    background: places-ta.has-hover ? Theme.bg-hover : transparent;
+    places-ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.opened();
+            places-menu.show();
+        }
+    }
+    Text { text: "\u{E889}"; // history
+           font-family: "Material Icons";
+           color: Theme.text-secondary; font-size: Theme.fs-sm;
+           horizontal-alignment: center; vertical-alignment: center; }
+    places-menu := PopupWindow {
+        x: min(0px, root.width - self.width);
+        y: root.height + 2px;
+        width: 320px;
+        height: min(380px, root.rows-h + 8px);
+        Rectangle {
+            background: Theme.popup-bg;
+            border-radius: Theme.radius-sm;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000060;
+            ScrollView {
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 1px;
+                    Text {
+                        height: 22px;
+                        text: @tr("Bookmarks");
+                        color: Theme.text-muted;
+                        font-size: Theme.fs-xs;
+                        vertical-alignment: center;
+                    }
+                    if root.bookmarks.length == 0 : Text {
+                        height: 26px;
+                        text: @tr("None yet. Click ☆ to bookmark the current folder.");
+                        color: Theme.text-muted;
+                        font-size: Theme.fs-xs;
+                        vertical-alignment: center;
+                    }
+                    for b in root.bookmarks : SftpPlaceRow {
+                        path: b;
+                        icon: "\u{E838}"; // star
+                        current: b == root.current-path;
+                        removable: true;
+                        go => { root.navigate(b); }
+                        remove => { root.remove-bookmark(b); }
+                    }
+                    Rectangle { height: 8px; }
+                    Text {
+                        height: 22px;
+                        text: @tr("Recent");
+                        color: Theme.text-muted;
+                        font-size: Theme.fs-xs;
+                        vertical-alignment: center;
+                    }
+                    if root.recent.length == 0 : Text {
+                        height: 26px;
+                        text: @tr("Folders you open will show up here.");
+                        color: Theme.text-muted;
+                        font-size: Theme.fs-xs;
+                        vertical-alignment: center;
+                    }
+                    for r in root.recent : SftpPlaceRow {
+                        path: r;
+                        icon: "\u{E889}"; // history
+                        current: r == root.current-path;
+                        go => { root.navigate(r); }
+                    }
+                    if root.recent.length > 0 : SftpMenuItem {
+                        label: @tr("Clear recent");
+                        icon: "\u{E0B8}"; // clear_all
+                        clicked => { root.clear-recent(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Star toggle: bookmark / un-bookmark the folder the panel is showing (#500).
+component SftpStarButton inherits Rectangle {
+    in property <bool> bookmarked;
+    callback toggled();
+    width: 24px; height: 22px;
+    border-radius: Theme.radius-sm;
+    background: star-ta.has-hover ? Theme.bg-hover : transparent;
+    star-ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+    }
+    Text { text: root.bookmarked ? "\u{E838}" : "\u{E83A}"; // star / star_border
+           font-family: "Material Icons";
+           color: root.bookmarked ? Theme.warning : Theme.text-secondary;
+           font-size: Theme.fs-sm;
+           horizontal-alignment: center; vertical-alignment: center; }
+}
+
 // ---------------------------------------------------------------------------
 // SftpPanel — left directory tree + right file listing
 // ---------------------------------------------------------------------------
@@ -141,6 +315,14 @@ export component SftpPanel inherits Rectangle {
     property <bool> show-group-col: root.show-group && root.fit-group;
     property <int> selected-row: -1;       // clicked/highlighted file-list row (#70)
     in property <int> selected-count;      // number of checked entries (#100)
+    // Shift+click range selection: the anchor is the last row plainly clicked
+    // or toggled; a Shift+click checks every row from the anchor to the
+    // clicked one. `shift-click-pending` lets the `clicked` handler skip its
+    // normal action when `pointer-event` already handled a Shift+press.
+    property <int> select-anchor: -1;
+    property <bool> shift-click-pending: false;
+    // One native drag per press (#504); reset on the next press/release.
+    property <bool> drag-out-started: false;
     // Panel-level right-click context menu (#84). One menu for the whole list:
     // an empty `menu-target` means the click landed on whitespace, which greys
     // out the item-specific actions (download/rename/…) but keeps new/refresh.
@@ -175,11 +357,26 @@ export component SftpPanel inherits Rectangle {
     callback toggle-collapsed();    // minimise / restore the panel
     callback navigate(string);
     callback download(string);
+    // Double-click on a file (#493): open it in the built-in editor when it
+    // is text, otherwise download it.
+    callback open-file(string);
     callback upload-clicked(string /* remote dir */, bool /* folder */);
     callback refresh(string);
     callback tree-expand(string);   // toggle expand/collapse + navigate
     callback delete(string);        // remove a remote file/dir
     callback toggle-select(int);    // toggle a row's multi-select checkbox (#100)
+    callback select-range(int /* from */, int /* to */); // Shift+click: check exactly rows from..to
+    // Path bookmarks + recent folders for this session (#500).
+    in property <[string]> bookmarks;
+    in property <[string]> recent;
+    in property <bool> bookmarked;      // current-path is bookmarked
+    callback toggle-bookmark(string);
+    callback remove-bookmark(string);
+    callback clear-recent();
+    callback places-refresh();
+    // Row `i` was dragged out of the list (#504): Rust starts the OS drag
+    // with that row, or with every checked row when it is one of them.
+    callback drag-out(int);
     callback download-selected();   // download all checked entries (#100)
     callback delete-selected();     // delete all checked entries (#100)
     callback copy-to-target(string /* path */, string /* target tab */);
@@ -216,6 +413,7 @@ export component SftpPanel inherits Rectangle {
         path-input.text = root.current-path;
         compact-path-input.text = root.current-path;
         root.selected-row = -1;
+        root.select-anchor = -1;
     }
 
     // Drag empty space to re-dock; interactive widgets (file list, tree, toolbar
@@ -391,6 +589,23 @@ export component SftpPanel inherits Rectangle {
                         single-line: true;
                         accepted => { root.navigate(self.text); }
                     }
+                }
+
+                // Bookmark the current folder / open bookmarks + recent (#500).
+                SftpStarButton {
+                    visible: root.panel-mode == "files" && !root.narrow-toolbar;
+                    bookmarked: root.bookmarked;
+                    toggled => { root.toggle-bookmark(root.current-path); }
+                }
+                SftpPlacesButton {
+                    visible: root.panel-mode == "files" && !root.narrow-toolbar;
+                    bookmarks: root.bookmarks;
+                    recent: root.recent;
+                    current-path: root.current-path;
+                    opened => { root.places-refresh(); }
+                    navigate(p) => { root.navigate(p); }
+                    remove-bookmark(p) => { root.remove-bookmark(p); }
+                    clear-recent => { root.clear-recent(); }
                 }
 
                 // Copy the current path to the clipboard.
@@ -636,6 +851,19 @@ export component SftpPanel inherits Rectangle {
                             single-line: true;
                             accepted => { root.navigate(self.text); }
                         }
+                    }
+                    SftpStarButton {
+                        bookmarked: root.bookmarked;
+                        toggled => { root.toggle-bookmark(root.current-path); }
+                    }
+                    SftpPlacesButton {
+                        bookmarks: root.bookmarks;
+                        recent: root.recent;
+                        current-path: root.current-path;
+                        opened => { root.places-refresh(); }
+                        navigate(p) => { root.navigate(p); }
+                        remove-bookmark(p) => { root.remove-bookmark(p); }
+                        clear-recent => { root.clear-recent(); }
                     }
                 }
             }
@@ -926,8 +1154,8 @@ export component SftpPanel inherits Rectangle {
                     ScrollView {
                         width: parent.width;
                         height: parent.height;
-                        viewport-width: self.visible-width;
-                        viewport-height: max(self.visible-height, file-list.preferred-height);
+                        content-width: self.visible-width;
+                        content-height: max(self.visible-height, file-list.preferred-height);
 
                         file-list := VerticalLayout {
                             spacing: 0;
@@ -956,15 +1184,43 @@ export component SftpPanel inherits Rectangle {
 
                                 row-ta := TouchArea {
                                     mouse-cursor: pointer;
-                                    clicked => { root.selected-row = i; }
+                                    // Drag the row out of the window into the
+                                    // OS file manager (#504): once the pointer
+                                    // travels a few px with the button held.
+                                    moved => {
+                                        if (self.pressed && !root.drag-out-started
+                                                && (abs(self.mouse-x - self.pressed-x) > 6px
+                                                    || abs(self.mouse-y - self.pressed-y) > 6px)) {
+                                            root.drag-out-started = true;
+                                            root.drag-out(i);
+                                        }
+                                    }
+                                    clicked => {
+                                        root.selected-row = i;
+                                        if (root.shift-click-pending) {
+                                            root.shift-click-pending = false;
+                                        } else {
+                                            root.select-anchor = i;
+                                        }
+                                    }
                                     double-clicked => {
                                         if (entry.is-dir) {
                                             root.navigate(entry.full-path);
                                         } else {
-                                            root.download(entry.full-path);
+                                            root.open-file(entry.full-path);
                                         }
                                     }
                                     pointer-event(ev) => {
+                                        if (ev.kind == PointerEventKind.down || ev.kind == PointerEventKind.up) {
+                                            root.drag-out-started = false;
+                                        }
+                                        if (ev.kind == PointerEventKind.down
+                                                && ev.button == PointerEventButton.left
+                                                && ev.modifiers.shift) {
+                                            root.shift-click-pending = true;
+                                            root.select-range(root.select-anchor < 0 ? i : root.select-anchor, i);
+                                            if (root.select-anchor < 0) { root.select-anchor = i; }
+                                        }
                                         if (ev.kind == PointerEventKind.down
                                                 && ev.button == PointerEventButton.right) {
                                             root.selected-row = i;
@@ -994,7 +1250,23 @@ export component SftpPanel inherits Rectangle {
                                         background: entry.selected ? Theme.accent : transparent;
                                         cb-ta := TouchArea {
                                             mouse-cursor: pointer;
-                                            clicked => { root.toggle-select(i); }
+                                            clicked => {
+                                                if (root.shift-click-pending) {
+                                                    root.shift-click-pending = false;
+                                                } else {
+                                                    root.toggle-select(i);
+                                                    root.select-anchor = i;
+                                                }
+                                            }
+                                            pointer-event(ev) => {
+                                                if (ev.kind == PointerEventKind.down
+                                                        && ev.button == PointerEventButton.left
+                                                        && ev.modifiers.shift) {
+                                                    root.shift-click-pending = true;
+                                                    root.select-range(root.select-anchor < 0 ? i : root.select-anchor, i);
+                                                    if (root.select-anchor < 0) { root.select-anchor = i; }
+                                                }
+                                            }
                                         }
                                         if entry.selected : Text {
                                             text: "\u{E5CA}"; // check
@@ -1215,8 +1487,8 @@ export component SftpPanel inherits Rectangle {
             ScrollView {
                 width: parent.width;
                 height: parent.height;
-                viewport-width: self.visible-width;
-                viewport-height: max(self.visible-height, tunnel-body.preferred-height);
+                content-width: self.visible-width;
+                content-height: max(self.visible-height, tunnel-body.preferred-height);
 
                 tunnel-body := VerticalLayout {
                     padding: 10px;

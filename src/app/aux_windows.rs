@@ -14,7 +14,7 @@ pub(super) fn wire_monitor_windows(ctx: &WinCtx) {
         // ✕ hides the window (data keeps flowing into the shared model).
         let weak = proc_win.as_weak();
         let main_weak = window.as_weak();
-        proc_win.on_close(move || {
+        proc_win.on_close_window(move || {
             if let Some(main) = main_weak.upgrade() {
                 main.set_process_window_open(false);
             }
@@ -90,7 +90,7 @@ pub(super) fn wire_monitor_windows(ctx: &WinCtx) {
     {
         let weak = sys_win.as_weak();
         let main_weak = window.as_weak();
-        sys_win.on_close(move || {
+        sys_win.on_close_window(move || {
             if let Some(main) = main_weak.upgrade() {
                 main.set_system_info_window_open(false);
             }
@@ -149,10 +149,11 @@ pub(super) fn wire_monitor_windows(ctx: &WinCtx) {
 
 /// Editor window close, drag and resize callbacks.
 pub(super) fn wire_editor_window_chrome(ctx: &WinCtx) {
-    let WinCtx {
-        window, editor_win, ..
-    } = ctx;
+    let WinCtx { editor_win, .. } = ctx;
     {
+        // The OS close button goes through the unsaved-changes check; the
+        // actual close (`close-editor`) is wired with the other editor logic
+        // in `editor_host::wire_editor_window`.
         let close_request = editor_win.as_weak();
         editor_win.window().on_close_requested(move || {
             if let Some(editor) = close_request.upgrade() {
@@ -160,9 +161,9 @@ pub(super) fn wire_editor_window_chrome(ctx: &WinCtx) {
             }
             slint::CloseRequestResponse::KeepWindowShown
         });
-        // NOTE: `close-editor` is wired in `wire_sftp_callbacks` (it also
-        // clears the dirty flag and the find/replace state); don't set it
-        // here too — a second setter would silently replace that handler.
+        // NOTE: `close-editor` is wired in `editor_host::wire_editor_window`
+        // (it also clears the dirty flag and the find/replace state); don't
+        // set it here too — a second setter would silently replace it.
     }
     {
         let weak = editor_win.as_weak();

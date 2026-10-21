@@ -290,6 +290,9 @@ pub(super) fn apply_session_event_to_window(
                 // re-sorts the existing rows and must preserve the selection.
                 t.sftp_selected_count = 0;
             });
+            // The folder really opened: record it in this session's recent
+            // folders and update the bookmark star for the new path (#500).
+            win.invoke_sftp_record_visit(tab_id.into(), path.clone().into());
         }
         SessionEvent::SftpStatus(msg) => {
             update_terminal(&|t| t.sftp_status = msg.clone().into());
@@ -310,19 +313,20 @@ pub(super) fn apply_session_event_to_window(
             error,
         } => {
             if error.is_empty() {
-                // Open the built-in viewer/editor (#70).
-                // 编辑器修改：打开文件时初始化语法高亮层（注释行/普通行着色）。
-                update_editor_text_layers(editor, &content);
-                editor.set_editor_tab_id(tab_id.into());
-                editor.set_editor_path(path.into());
-                editor.set_editor_name(name.into());
-                editor_syntax::refresh(editor, &content);
-                editor.set_editor_content(content.into());
-                editor.set_editor_readonly(!edit);
-                editor.set_editor_dirty(false);
-                editor.set_editor_open(true);
-                let _ = editor.show();
-                editor.window().with_winit_window(|ww| ww.focus_window());
+                // Open the built-in viewer/editor (#70): as an editor tab in
+                // this window or in the detached editor window, per
+                // Settings → SFTP (#494).
+                if win.get_editor_embedded() {
+                    win.invoke_open_editor_tab(
+                        tab_id.into(),
+                        path.into(),
+                        name.into(),
+                        content.into(),
+                        !edit,
+                    );
+                } else {
+                    open_document(editor, tab_id, path, name, content, edit);
+                }
             } else {
                 // Couldn't open as text. The SFTP status line alone is easy to
                 // miss (looks like "nothing happened"), so also print the reason
@@ -346,6 +350,11 @@ pub(super) fn apply_session_event_to_window(
                 );
                 update_terminal(&|t| t.sftp_status = error.clone().into());
             }
+        }
+        SessionEvent::SftpDownloadInstead { path } => {
+            // Double-clicked file that isn't editable text (#493): run the
+            // regular download, exactly as the Download menu entry would.
+            win.invoke_sftp_download(tab_id.into(), path.into());
         }
         SessionEvent::SftpTreeUpdate(nodes) => {
             let slint_nodes: Vec<SftpTreeNode> = nodes

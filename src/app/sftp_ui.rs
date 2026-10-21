@@ -173,6 +173,82 @@ pub(super) fn collect_sftp_selected(
     paths
 }
 
+/// What a drag starting on `row` carries (#504): every checked entry when the
+/// row is one of several checked ones, otherwise just that row.
+pub(super) fn drag_out_items(
+    w: &AppWindow,
+    tab_id: &str,
+    row: i32,
+) -> Vec<super::drag_out::DragItem> {
+    let terminals = w.get_terminals();
+    let Some(tm) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() else {
+        return Vec::new();
+    };
+    let Some(term) = (0..tm.row_count())
+        .filter_map(|i| tm.row_data(i))
+        .find(|t| t.id.as_str() == tab_id)
+    else {
+        return Vec::new();
+    };
+    let Some(entry) = usize::try_from(row)
+        .ok()
+        .and_then(|i| term.sftp_entries.row_data(i))
+    else {
+        return Vec::new();
+    };
+    if entry.selected && term.sftp_selected_count > 1 {
+        // macOS needs to know folders up front (the drag's file types).
+        let dirs: std::collections::HashSet<String> = (0..term.sftp_entries.row_count())
+            .filter_map(|i| term.sftp_entries.row_data(i))
+            .filter(|e| e.is_dir)
+            .map(|e| e.full_path.to_string())
+            .collect();
+        collect_sftp_selected(tm, tab_id)
+            .into_iter()
+            .map(|remote| super::drag_out::DragItem {
+                is_dir: dirs.contains(&remote),
+                remote,
+            })
+            .collect()
+    } else {
+        vec![super::drag_out::DragItem {
+            remote: entry.full_path.to_string(),
+            is_dir: entry.is_dir,
+        }]
+    }
+}
+
+/// Shift+click range selection: make the checked set exactly the rows between
+/// `from` and `to` inclusive (either order, clamped to the list). Only rows
+/// whose state changes are written back, so large listings don't re-render
+/// every row. Returns the resulting checked count.
+pub(super) fn apply_range_selection(entries: &VecModel<SftpEntry>, from: i32, to: i32) -> usize {
+    let len = entries.row_count();
+    if len == 0 {
+        return 0;
+    }
+    let clamp = |v: i32| (v.max(0) as usize).min(len - 1);
+    let (lo, hi) = {
+        let (a, b) = (clamp(from), clamp(to));
+        (a.min(b), a.max(b))
+    };
+    let mut n = 0;
+    for i in 0..len {
+        let Some(mut e) = entries.row_data(i) else {
+            continue;
+        };
+        let want = (lo..=hi).contains(&i);
+        if want {
+            n += 1;
+        }
+        if e.selected != want {
+            e.selected = want;
+            entries.set_row_data(i, e);
+        }
+    }
+    n
+}
+
 /// Uncheck every SFTP entry for a tab and reset its selected-count (#100).
 pub(super) fn clear_sftp_selection(terminals: &VecModel<TerminalState>, tab_id: &str) {
     for ti in 0..terminals.row_count() {

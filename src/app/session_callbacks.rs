@@ -180,8 +180,11 @@ pub(super) fn wire_session_callbacks(
             w.set_dialog_rdp_height("720".into());
             w.set_dialog_encoding("UTF-8".into());
             w.set_dialog_vt100_drawing(false);
+            w.set_dialog_term_type(crate::config::DEFAULT_TERM_TYPE.into());
             w.set_dialog_session_log("default".into());
             w.set_dialog_disable_shell_integration(false);
+            w.set_dialog_sftp_mode("".into());
+            w.set_dialog_sftp_command("".into());
             w.set_dialog_note("".into());
             w.set_dialog_editing(false);
             w.set_dialog_open(true);
@@ -453,8 +456,11 @@ pub(super) fn wire_session_callbacks(
                 w.set_dialog_rdp_height(session.rdp_height.to_string().into());
                 w.set_dialog_encoding(session.encoding.clone().into());
                 w.set_dialog_vt100_drawing(session.vt100_drawing);
+                w.set_dialog_term_type(session.effective_term_type().into());
                 w.set_dialog_session_log(session.session_log.as_str().into());
                 w.set_dialog_disable_shell_integration(session.disable_shell_integration);
+                w.set_dialog_sftp_mode(session.sftp_mode.clone().into());
+                w.set_dialog_sftp_command(session.sftp_command.clone().into());
                 w.set_dialog_note(session.note.clone().into());
                 w.set_dialog_editing(true);
                 w.set_dialog_open(true);
@@ -1167,13 +1173,23 @@ pub(super) fn wire_session_callbacks(
         let tab_routes = tab_routes.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
-            let session = if id.starts_with("system:") {
-                match builtin_local_sessions(store.borrow().wsl_profiles())
-                    .into_iter()
-                    .find(|s| s.id == id)
-                {
+            let builtin =
+                id.starts_with("system:") || id.starts_with(super::agents::AGENT_ID_PREFIX);
+            let session = if builtin {
+                match resolve_builtin_session(&store.borrow(), &id) {
                     Some(s) => s,
-                    None => return,
+                    None => {
+                        // An agent uninstalled since meatshell detected it.
+                        if let (Some(name), Some(w)) = (
+                            super::agents::agent_name(&store.borrow(), &id),
+                            weak.upgrade(),
+                        ) {
+                            w.set_ssh_import_hint(
+                                format!("{} {name}", t("未找到", "Not found:")).into(),
+                            );
+                        }
+                        return;
+                    }
                 }
             } else {
                 match store.borrow().get(&id).cloned() {
@@ -1291,6 +1307,15 @@ pub(super) fn wire_session_callbacks(
                 sftp_sort_key: "".into(),
                 sftp_sort_dir: 0,
                 sftp_available: has_sftp,
+                sftp_bookmarks: {
+                    let places = store.borrow().sftp_places(&id);
+                    super::sftp_places::string_model(&places.bookmarks)
+                },
+                sftp_recent: {
+                    let places = store.borrow().sftp_places(&id);
+                    super::sftp_places::string_model(&places.recent)
+                },
+                sftp_bookmarked: false,
                 font_size: 0,
                 tunnels: ModelRc::from(std::rc::Rc::new(VecModel::<TunnelInfo>::default())),
                 sftp_collapsed: !has_sftp || sftp_collapsed_default,
@@ -1480,12 +1505,14 @@ pub(super) fn wire_session_callbacks(
                 // Two separate borrows: the builtin fallback must not run while
                 // the store lookup's RefCell borrow is still alive.
                 let saved = store.borrow().get(&session_id).map(|s| s.name.clone());
-                saved.or_else(|| {
-                    session_models::builtin_local_sessions(store.borrow().wsl_profiles())
-                        .into_iter()
-                        .find(|s| s.id == session_id)
-                        .map(|s| s.name)
-                })
+                saved
+                    .or_else(|| {
+                        session_models::builtin_local_sessions(store.borrow().wsl_profiles())
+                            .into_iter()
+                            .find(|s| s.id == session_id)
+                            .map(|s| s.name)
+                    })
+                    .or_else(|| super::agents::agent_name(&store.borrow(), &session_id))
             } else {
                 tab_titles.borrow_mut().insert(tab_id.clone(), name.clone());
                 Some(name)
@@ -1550,6 +1577,8 @@ pub(super) fn listen_for_config_changes(ctx: &WinCtx, sessions_model: &Rc<VecMod
                 let Some(w) = weak.upgrade() else { return };
                 // Rebuild the list with the window's current search filter.
                 sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
+                // Custom agents (#427): launch menu and Settings list.
+                w.invoke_refresh_agent_launchers();
                 // Re-apply the theme to the chrome AND every open terminal buffer.
                 apply_dark_mode(&w, &bufs, theme_pref_is_dark(&store.borrow()));
                 // Language translations are process-global; refresh our flag only.
@@ -1558,6 +1587,8 @@ pub(super) fn listen_for_config_changes(ctx: &WinCtx, sessions_model: &Rc<VecMod
                 w.set_cmd_bar_hidden(store.borrow().cmd_bar_hidden());
                 // Persisted terminal font size (settings stepper) is global too.
                 w.set_term_font_size(store.borrow().font_size() as f32);
+                // Docked vs detached editor (#494) is a global preference.
+                w.set_editor_embedded(store.borrow().editor_embedded());
                 if let Some(editor) = editor_weak.upgrade() {
                     sync_editor_theme(&w, &editor);
                     if editor.get_editor_open() {
@@ -1604,6 +1635,7 @@ pub(super) fn wire_wsl_profiles(ctx: &WinCtx, sessions_model: &Rc<VecModel<Sessi
                 let _ = s.save();
                 if let Some(w) = weak.upgrade() {
                     w.set_wsl_profiles(wsl_profile_model(&s));
+                    w.set_launch_shells(launch_shell_model(&s));
                     sync_sessions_for_window(&weak, &s, &sessions_model);
                 }
             }
@@ -1622,6 +1654,7 @@ pub(super) fn wire_wsl_profiles(ctx: &WinCtx, sessions_model: &Rc<VecModel<Sessi
                 let _ = s.save();
                 if let Some(w) = weak.upgrade() {
                     w.set_wsl_profiles(wsl_profile_model(&s));
+                    w.set_launch_shells(launch_shell_model(&s));
                     sync_sessions_for_window(&weak, &s, &sessions_model);
                 }
             }

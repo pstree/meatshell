@@ -407,6 +407,82 @@ pub(super) fn wire_sftp_callbacks(
             }
         });
     }
+    // SFTP multi-select: Shift+click range. Like a file manager, the checked
+    // set becomes exactly rows `from..=to` (either order); everything else is
+    // unchecked.
+    {
+        let weak = window.as_weak();
+        window.on_sftp_select_range(move |tab_id: SharedString, from: i32, to: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let terminals = w.get_terminals();
+            let Some(tm) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() else {
+                return;
+            };
+            for ti in 0..tm.row_count() {
+                let Some(row) = tm.row_data(ti) else { continue };
+                if row.id.as_str() != tab_id.as_str() {
+                    continue;
+                }
+                if let Some(em) = row
+                    .sftp_entries
+                    .as_any()
+                    .downcast_ref::<VecModel<SftpEntry>>()
+                {
+                    let n = apply_range_selection(em, from, to);
+                    let mut r = row.clone();
+                    r.sftp_selected_count = n as i32;
+                    tm.set_row_data(ti, r);
+                }
+                break;
+            }
+        });
+    }
+    // Drag rows out of the file list into the OS file manager (#504).
+    // Windows and macOS; on Linux the gesture is ignored.
+    if super::drag_out::SUPPORTED {
+        let sftp_handles = sftp_handles.clone();
+        let weak = window.as_weak();
+        window.on_sftp_drag_out(move |tab_id: SharedString, row: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let items = drag_out_items(&w, tab_id.as_str(), row);
+            let commands = sftp_handles
+                .lock()
+                .ok()
+                .and_then(|h| h.get(tab_id.as_str()).map(|h| h.commands.clone()));
+            let Some(commands) = commands.filter(|_| !items.is_empty()) else {
+                return;
+            };
+            // The OS drag consumed the button-up; release Slint's pointer
+            // grab so the row doesn't stay "pressed". Off-window, so it
+            // never counts as a click.
+            let release = |weak: slint::Weak<AppWindow>| {
+                if let Some(w) = weak.upgrade() {
+                    w.window().dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                        position: slint::LogicalPosition::new(-1.0, -1.0),
+                        button: slint::platform::PointerEventButton::Left,
+                    });
+                }
+            };
+            let weak = w.as_weak();
+            if cfg!(target_os = "macos") {
+                // AppKit starts the session from the mouse event being
+                // handled right now and returns at once; the drag then runs
+                // on its own.
+                if super::drag_out::start(w.window(), commands, items) {
+                    slint::Timer::single_shot(std::time::Duration::ZERO, move || release(weak));
+                }
+            } else {
+                // Start on a fresh event-loop turn rather than inside Slint's
+                // pointer-move dispatch: DoDragDrop runs its own modal loop.
+                slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+                    if let Some(w) = weak.upgrade() {
+                        super::drag_out::start(w.window(), commands, items);
+                    }
+                    release(weak);
+                });
+            }
+        });
+    }
     // SFTP multi-select: download all checked entries into one folder (#100).
     {
         let sftp_handles = sftp_handles.clone();
@@ -584,6 +660,17 @@ pub(super) fn wire_sftp_callbacks(
             }
         });
     }
+    // Double-click on a file (#493): edit it if it is text, else download.
+    {
+        let sftp_handles = sftp_handles.clone();
+        window.on_sftp_open_file(move |tab_id: SharedString, path: SharedString| {
+            if let Ok(handles) = sftp_handles.lock() {
+                if let Some(h) = handles.get(tab_id.as_str()) {
+                    h.open_or_download(path.to_string());
+                }
+            }
+        });
+    }
     {
         let sftp_handles = sftp_handles.clone();
         window.on_sftp_edit(move |tab_id: SharedString, path: SharedString| {
@@ -717,141 +804,9 @@ pub(super) fn wire_sftp_callbacks(
         });
     }
 
-    // Refresh editor syntax after edits. The debounced callback keeps typing
-    // responsive while the native TextInput owns selection and IME handling.
-    {
-        let weak = editor.as_weak();
-        editor.on_editor_highlight(move |text: SharedString| {
-            if let Some(w) = weak.upgrade() {
-                editor_syntax::refresh(&w, text.as_str());
-                // 编辑器修改：刷新注释/普通行的语法高亮层。
-                update_editor_text_layers(&w, text.as_str());
-            }
-        });
-    }
-    // 编辑器修改：查找定位文本所需的三组辅助查询（#287）。
-    // Slint 无法统计行数/切分字符串，因此由 Rust 把字节偏移换算成可视行号，
-    // 供界面在点击“上一处/下一处”或输入查询词时把 ScrollView 滚动并居中到匹配行。
-    editor.on_editor_line_index_at(|content: SharedString, offset: i32| {
-        let mut off = offset.max(0) as usize;
-        let bytes = content.as_str().as_bytes();
-        if off > bytes.len() {
-            off = bytes.len();
-        }
-        bytes[..off].iter().filter(|&&b| b == b'\n').count() as i32
-    });
-    // 编辑器修改：逻辑总行数（换行数 + 1），用于估算单行像素高度。
-    editor.on_editor_line_count(|content: SharedString| {
-        content.as_str().split('\n').count().max(1) as i32
-    });
-    // 编辑器修改：字符串的 UTF-8 字节长度，供界面定位匹配文本的选中范围。
-    editor.on_editor_byte_length_of(|s: SharedString| s.as_str().len() as i32);
-
-    // Built-in editor: save (Ctrl+S / button) writes the text back to the
-    // remote file (#70). Read-only (view) sessions never save.
-    {
-        let sftp_handles = sftp_handles.clone();
-        let editor_weak = editor.as_weak();
-        editor.on_save_file(move || {
-            let Some(editor) = editor_weak.upgrade() else {
-                return;
-            };
-            if editor.get_editor_readonly() {
-                return;
-            }
-            let path = editor.get_editor_path().to_string();
-            let content = editor.get_editor_content().to_string();
-            let tab_id = editor.get_editor_tab_id().to_string();
-            if let Ok(handles) = sftp_handles.lock() {
-                if let Some(h) = handles.get(&tab_id) {
-                    h.write_text(path, content);
-                }
-            }
-            editor.set_editor_dirty(false);
-        });
-    }
-    // Closing the editor discards unsaved edits. Saving is an explicit action
-    // (button / Ctrl+S); silently uploading on X or Esc is surprising and can
-    // overwrite a remote file the user only meant to inspect (#287).
-    {
-        let weak = editor.as_weak();
-        editor.on_close_editor(move || {
-            let Some(editor) = weak.upgrade() else { return };
-            editor.set_editor_open(false);
-            let _ = editor.hide();
-            editor.set_editor_dirty(false);
-            editor.set_editor_find_query("".into());
-            editor.set_editor_replace_text("".into());
-            editor.set_editor_match_count(0);
-            editor.set_editor_find_position(-1);
-        });
-    }
-
-    // Built-in editor find/replace (#287). Keep matching literal and
-    // case-sensitive, which is predictable for configuration/source files.
-    editor.on_editor_count_matches(|content: SharedString, query: SharedString| {
-        if query.is_empty() {
-            0
-        } else {
-            content
-                .matches(query.as_str())
-                .count()
-                .min(i32::MAX as usize) as i32
-        }
-    });
-    editor.on_editor_find_step(
-        |content: SharedString, query: SharedString, current: i32, reverse: bool| {
-            if query.is_empty() {
-                return EditorFindResult {
-                    start: 0,
-                    end: 0,
-                    count: 0,
-                };
-            }
-            let positions: Vec<usize> = content
-                .match_indices(query.as_str())
-                .map(|(index, _)| index)
-                .collect();
-            let selected = if reverse {
-                positions
-                    .iter()
-                    .rev()
-                    .copied()
-                    .find(|position| current < 0 || *position < current as usize)
-                    .or_else(|| positions.last().copied())
-            } else {
-                positions
-                    .iter()
-                    .copied()
-                    .find(|position| current < 0 || *position > current as usize)
-                    .or_else(|| positions.first().copied())
-            };
-            let start = selected.unwrap_or(0).min(i32::MAX as usize) as i32;
-            EditorFindResult {
-                start,
-                end: start.saturating_add(query.len().min(i32::MAX as usize) as i32),
-                count: positions.len().min(i32::MAX as usize) as i32,
-            }
-        },
-    );
-    {
-        let weak = editor.as_weak();
-        editor.on_editor_replace_all(move |query: SharedString, replacement: SharedString| {
-            let Some(editor) = weak.upgrade() else { return };
-            if editor.get_editor_readonly() || query.is_empty() {
-                return;
-            }
-            let replaced = editor
-                .get_editor_content()
-                .replace(query.as_str(), replacement.as_str());
-            editor_syntax::refresh(&editor, &replaced);
-            editor.set_editor_content(replaced.clone().into());
-            editor.set_editor_dirty(true);
-            // 编辑器修改：替换可能改变行首注释判定，同步刷新语法高亮层。
-            update_editor_text_layers(&editor, &replaced);
-            editor.set_editor_match_count(0);
-        });
-    }
+    // Built-in editor (#70), detached-window mode. Editor tabs (#494) are
+    // wired in editor_tabs::wire_editor_tabs.
+    wire_editor_window(editor, sftp_handles);
 }
 
 // ---------------------------------------------------------------------------

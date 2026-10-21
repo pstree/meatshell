@@ -166,8 +166,8 @@ export component QuickDockPanel inherits Rectangle {
 
         Flickable {
             vertical-stretch: 1;
-            viewport-width: self.width;
-            viewport-height: max(self.height, list.preferred-height);
+            content-width: self.width;
+            content-height: max(self.height, list.preferred-height);
             list := VerticalLayout {
                 padding: 6px; spacing: 2px; alignment: start;
                 if root.commands.length == 0 : Text {
@@ -388,6 +388,8 @@ export component TerminalView inherits Rectangle {
     // Temporary on-device diagnostics for #312. Rust redacts printable text.
     callback diagnose-key-event(string, bool, bool, bool, bool);
     callback cycle-tab(bool /* reverse */);
+    // Customisable shortcuts: key event → action id ("" = send to shell).
+    callback match-shortcut(string, bool, bool, bool, bool, bool) -> string;
     // Ctrl+Shift+N (⌘⇧N on macOS) — open a new application window (#multi-window).
     callback new-window-key();
     // Font zoom: Ctrl+= / Ctrl+- / Ctrl+0 (⌘ on macOS). Direction:
@@ -395,15 +397,28 @@ export component TerminalView inherits Rectangle {
     callback zoom-key(int /* direction */, bool /* window-wide */);
     // Ctrl+Alt+Z (⌘⌥Z on macOS) — toggle zen (focus) mode.
     callback zen-key();
+    // Alt+Enter (⌥↩ on macOS) — toggle terminal fullscreen (#495).
+    callback fullscreen-key();
     callback terminal-resize(float, float);
     callback sftp-navigate(string);
     callback sftp-download(string);
+    callback sftp-open-file(string);                // double-click a file (#493)
     callback sftp-upload-clicked(string, bool);
     callback sftp-refresh(string);
     callback sftp-tree-expand(string);
     callback sftp-delete(string);
     in property <int> sftp-selected-count;          // checked-entry count (#100)
     callback sftp-toggle-select(int);               // toggle a row's checkbox (#100)
+    callback sftp-select-range(int, int);           // Shift+click range select
+    // Path bookmarks + recent folders (#500).
+    in property <[string]> sftp-bookmarks;
+    in property <[string]> sftp-recent;
+    in property <bool> sftp-bookmarked;
+    callback sftp-toggle-bookmark(string);
+    callback sftp-remove-bookmark(string);
+    callback sftp-clear-recent();
+    callback sftp-places-refresh();
+    callback sftp-drag-out(int);                    // drag rows to Explorer (#504)
     callback sftp-download-selected();              // download checked entries (#100)
     callback sftp-delete-selected();                // delete checked entries (#100)
     callback sftp-copy-to-target(string, string);
@@ -701,7 +716,7 @@ export component TerminalView inherits Rectangle {
                 //    lapsed.  Without the Flickable, every wheel lands on
                 //    body-touch-overlay below, which always claims I-beam.
                 // 2. Scroll ownership: the captured wheel also scrolled
-                //    viewport-y natively (flick physics included), fighting the
+                //    content-y natively (flick physics included), fighting the
                 //    Rust-managed view_offset and the `changed spans` snap-back.
                 //    All scrolling already flows through terminal-scroll /
                 //    terminal-scroll-to, so the Flickable only ever added drift.
@@ -719,7 +734,7 @@ export component TerminalView inherits Rectangle {
                     // Vertical placement of the content inside the clip: newest
                     // output pinned to the bottom edge (negative), alt-screen
                     // top-aligned (0).  Replaces the old imperative
-                    // `flickable.viewport-y = height - viewport-height` sync —
+                    // `flickable.content-y = height - content-height` sync —
                     // as a binding it can no longer drift between rebuilds.
                     property <length> view-y: root.is-alt-screen
                         ? 0px
@@ -816,7 +831,7 @@ export component TerminalView inherits Rectangle {
                                 if (root.selecting) {
                                     // Position of the cursor within the *visible*
                                     // viewport (body-touch sits on the grid Rectangle
-                                    // at content y=8px; viewport-y offsets the scroll).
+                                    // at content y=8px; content-y offsets the scroll).
                                     root.select-update(
                                         floor(self.mouse-y / root.cell-h),
                                         floor(self.mouse-x / root.cell-w));
@@ -1182,78 +1197,61 @@ export component TerminalView inherits Rectangle {
                     // So `control` already gives ⌘ shortcuts on macOS for free, and
                     // the physical Ctrl (meta on macOS) is what must reach the shell
                     // so ^C/^X work in nano/vim (#158).
-                    // ── Cycle tabs: Ctrl+Tab / Ctrl+Shift+Tab (#294) ──
-                    // On macOS Slint reports the physical Ctrl key as `meta`.
-                    if ((Theme.is-mac ? event.modifiers.meta : event.modifiers.control)
-                            && (event.text == Key.Tab || event.text == Key.Backtab)) {
-                        root.cycle-tab(event.modifiers.shift || event.text == Key.Backtab);
+                    //
+                    // App shortcuts are user-customisable: Rust resolves the
+                    // event against the keymap (src/app/shortcuts.rs) and
+                    // returns an action id, or "" when the key belongs to the
+                    // shell. That includes the alt-screen rule (plain Ctrl+V
+                    // reaches vim) and the extra paste chords (#300).
+                    let act = root.match-shortcut(event.text, event.modifiers.control,
+                        event.modifiers.meta, event.modifiers.alt, event.modifiers.shift,
+                        root.is-alt-screen);
+                    // Hidden (inactive tab) views that still hold focus reject
+                    // the window-scoped actions so the window-level fallback
+                    // applies them to the visible session (#zoom, #zen).
+                    if (!root.visible && (act == "zen" || act == "fullscreen"
+                            || act == "zoom-in" || act == "zoom-out" || act == "zoom-reset"
+                            || act == "zoom-in-all" || act == "zoom-out-all"
+                            || act == "zoom-reset-all")) {
+                        reject
+                    } else if (act == "next-tab" || act == "prev-tab") {
+                        root.cycle-tab(act == "prev-tab");
                         accept
-                    // ── Find: ⌘F / Ctrl+F (mirrors right-click → Find) ──
-                    } else if (event.modifiers.control && !event.modifiers.shift
-                            && (event.text == "f" || event.text == "F"
-                                || event.text == "\u{0006}")) {
+                    } else if (act == "find") {
                         root.find-active = true;
                         accept
-                    // ── Jump to command-history search: ⌘⇧R / Ctrl+Shift+R (#140) ──
-                    } else if (event.modifiers.control && event.modifiers.shift
-                            && (event.text == "r" || event.text == "R"
-                                || event.text == "\u{0012}")) {
+                    } else if (act == "history-search") {
                         root.history-open = true;
                         accept
-                    // ── New window: ⌘⇧N / Ctrl+Shift+N (#multi-window) ──
-                    // `control` is Cmd on macOS (Slint modifier swap, #158), so
-                    // this single condition gives ⌘⇧N there and Ctrl+Shift+N
-                    // elsewhere. Intercepted here — before send-key — so the
-                    // keystroke never reaches the remote shell.
-                    } else if (event.modifiers.control && event.modifiers.shift
-                            && (event.text == "n" || event.text == "N"
-                                || event.text == "\u{000e}")) {
+                    // Intercepted before send-key so the keystroke never
+                    // reaches the remote shell.
+                    } else if (act == "new-window") {
                         root.new-window-key();
                         accept
-                    // ── Zen (focus) mode: Ctrl+Alt+Z toggles (#zen). Hidden
-                    // views reject it so the window-level fallback handles it.
-                    } else if (root.visible && event.modifiers.control && event.modifiers.alt
-                            && (event.text == "z" || event.text == "Z"
-                                || event.text == "\u{001a}")) {
+                    } else if (act == "zen") {
                         root.zen-key();
                         accept
-                    // ── Font zoom: Ctrl+= / Ctrl+- / Ctrl+0 (⌘ on macOS) ──
-                    // Zooms this session only; adding Alt zooms every session
-                    // in the window. Alt (not Shift) because Ctrl+Shift is the
-                    // IME-switch hotkey on Chinese Windows and gets swallowed.
-                    // A hidden (inactive tab) view that still holds focus
-                    // rejects these so the window-level fallback zooms the
-                    // visible session (#zoom).
-                    } else if (root.visible && event.modifiers.control && event.modifiers.alt
-                            && (event.text == "=" || event.text == "+"
-                                || event.text == "-" || event.text == "\u{001f}"
-                                || event.text == "0")) {
-                        root.zoom-key(event.text == "-" || event.text == "\u{001f}" ? -1
-                            : event.text == "0" ? 0 : 1, true);
+                    } else if (act == "fullscreen") {
+                        root.fullscreen-key();
                         accept
-                    } else if (root.visible && event.modifiers.control
-                            && (event.text == "=" || event.text == "+")) {
-                        root.zoom-key(1, false);
+                    } else if (act == "zoom-in" || act == "zoom-out" || act == "zoom-reset"
+                            || act == "zoom-in-all" || act == "zoom-out-all"
+                            || act == "zoom-reset-all") {
+                        root.zoom-key(
+                            (act == "zoom-in" || act == "zoom-in-all") ? 1
+                                : (act == "zoom-out" || act == "zoom-out-all") ? -1 : 0,
+                            act == "zoom-in-all" || act == "zoom-out-all"
+                                || act == "zoom-reset-all");
                         accept
-                    } else if (root.visible && event.modifiers.control
-                            && (event.text == "-" || event.text == "\u{001f}")) {
-                        root.zoom-key(-1, false);
+                    // ^C to the PTY — the same bytes as the physical Ctrl+C,
+                    // whichever chord the user bound it to.
+                    } else if (act == "interrupt") {
+                        root.send-key("c", true, false, false);
                         accept
-                    } else if (root.visible && event.modifiers.control && event.text == "0") {
-                        root.zoom-key(0, false);
-                        accept
-                    // ── Copy: ⌘C (macOS, no Shift) / Ctrl+Shift+C ──
-                    } else if (event.modifiers.control
-                            && (!event.modifiers.alt || root.extra-paste-shortcuts-enabled)
-                            && (Theme.is-mac ? !event.modifiers.shift : event.modifiers.shift)
-                            && (event.text == "c" || event.text == "C"
-                                || event.text == "\u{0003}")) {
+                    } else if (act == "copy") {
                         root.copy-terminal-text();
                         accept
-                    // ── Paste: Ctrl+Shift+V / ⌘Shift+V ──
-                    } else if (event.modifiers.control && event.modifiers.shift
-                            && (event.text == "v" || event.text == "V"
-                                || event.text == "\u{0016}")) {
+                    } else if (act == "paste") {
                         root.paste-from-clipboard();
                         // Clipboard access on Windows can deliver WM_KILLFOCUS.
                         // Restore focus explicitly so the cursor keeps blinking.
@@ -1276,6 +1274,10 @@ export component TerminalView inherits Rectangle {
                             && event.modifiers.shift && event.text == Key.Insert) {
                         root.paste-from-clipboard();
                         ime-input.focus();
+                        accept
+                    // ── macOS: swallow any other ⌘ combo (control == Cmd here) so it
+                    // isn't typed into the shell as a literal character. ──
+                    } else if (Theme.is-mac && event.modifiers.control) {
                         accept
                     // ── Local history navigation ────────────────────────────
                     // Only Rust can authoritatively tell whether this normal
@@ -1555,15 +1557,15 @@ export component TerminalView inherits Rectangle {
                     clip: true;
                     TouchArea {
                         scroll-event(event) => {
-                            command-scroll.viewport-y = clamp(
-                                command-scroll.viewport-y + event.delta-y,
-                                min(0px, command-scroll.visible-height - command-scroll.viewport-height), 0px);
+                            command-scroll.content-y = clamp(
+                                command-scroll.content-y + event.delta-y,
+                                min(0px, command-scroll.visible-height - command-scroll.content-height), 0px);
                             accept
                         }
                     }
                     command-scroll := ScrollView {
-                        viewport-width: self.visible-width;
-                        viewport-height: max(self.visible-height, cmd-input.preferred-height);
+                        content-width: self.visible-width;
+                        content-height: max(self.visible-height, cmd-input.preferred-height);
                         cmd-input := TextInput {
                             x: 8px;
                             width: max(1px, command-scroll.visible-width - 16px);
@@ -1576,13 +1578,13 @@ export component TerminalView inherits Rectangle {
                             wrap: char-wrap;
                             page-height: command-scroll.visible-height;
                             cursor-position-changed(position) => {
-                                let cursor-y = position.y + command-scroll.viewport-y;
+                                let cursor-y = position.y + command-scroll.content-y;
                                 if (cursor-y < 0px) {
-                                    command-scroll.viewport-y = min(0px, command-scroll.viewport-y - cursor-y);
+                                    command-scroll.content-y = min(0px, command-scroll.content-y - cursor-y);
                                 } else if (cursor-y > command-scroll.visible-height - self.font-size) {
-                                    command-scroll.viewport-y = max(
-                                        min(0px, command-scroll.visible-height - command-scroll.viewport-height),
-                                        command-scroll.viewport-y - (cursor-y - command-scroll.visible-height + self.font-size));
+                                    command-scroll.content-y = max(
+                                        min(0px, command-scroll.visible-height - command-scroll.content-height),
+                                        command-scroll.content-y - (cursor-y - command-scroll.visible-height + self.font-size));
                                 }
                             }
                             // Preserve pasted newlines. A single-line input rewrites
@@ -1620,9 +1622,15 @@ export component TerminalView inherits Rectangle {
                                 // (#140). Esc closes it / returns to terminal. (The
                                 // Ctrl+E/K/U line-editing below stays on Ctrl — those
                                 // are the standard readline bindings on macOS too.)
-                                } else if ((Theme.is-mac ? e.modifiers.meta : e.modifiers.control)
-                                        && (e.text == Key.Tab || e.text == Key.Backtab)) {
-                                    root.cycle-tab(e.modifiers.shift || e.text == Key.Backtab);
+                                } else if (root.match-shortcut(e.text, e.modifiers.control,
+                                                e.modifiers.meta, e.modifiers.alt,
+                                                e.modifiers.shift, false) == "next-tab") {
+                                    root.cycle-tab(false);
+                                    accept
+                                } else if (root.match-shortcut(e.text, e.modifiers.control,
+                                                e.modifiers.meta, e.modifiers.alt,
+                                                e.modifiers.shift, false) == "prev-tab") {
+                                    root.cycle-tab(true);
                                     accept
                                 } else if ((Theme.is-mac ? e.modifiers.meta : e.modifiers.control)
                                         && (e.text == "r" || e.text == "R" || e.text == "\u{0012}")) {
@@ -1783,8 +1791,8 @@ export component TerminalView inherits Rectangle {
                 drop-shadow-color: #00000070;
                 TouchArea {}  // swallow clicks
                 Flickable {
-                    viewport-width: self.width;
-                    viewport-height: max(self.height, qc-col.preferred-height);
+                    content-width: self.width;
+                    content-height: max(self.height, qc-col.preferred-height);
                     qc-col := VerticalLayout {
                         padding: 4px;
                         alignment: start;
@@ -2034,27 +2042,27 @@ export component TerminalView inherits Rectangle {
                     // easy-to-find spot no matter how tall the list is (#131).
                     h-flick := Flickable {
                     vertical-stretch: 1;
-                    viewport-width: self.width;
-                    viewport-height: max(self.height, h-col.preferred-height);
+                    content-width: self.width;
+                    content-height: max(self.height, h-col.preferred-height);
                     // The newest commands are at the bottom, next to the search box
                     // and the command input, so open scrolled there (#447). Scrolling
                     // by hand replaces this binding until the popup reopens.
-                    viewport-y: min(0px, self.height - self.viewport-height);
+                    content-y: min(0px, self.height - self.content-height);
                     // Keep the ↑/↓ keyboard selection visible (#447).
                     property <int> follow-selected: root.history-selected;
                     changed follow-selected => { self.reveal-row(self.follow-selected); }
                     public function scroll-to-newest() {
-                        self.viewport-y = min(0px, self.height - self.viewport-height);
+                        self.content-y = min(0px, self.height - self.content-height);
                     }
                     function reveal-row(row: int) {
                         if (row < 0 || row >= root.history-view.length) { return; }
                         // Rows are 28px tall below h-col's 4px top padding.
                         let top = 4px + row * 28px;
                         let bottom = top + 28px;
-                        if (top < -self.viewport-y) {
-                            self.viewport-y = -top;
-                        } else if (bottom > self.height - self.viewport-y) {
-                            self.viewport-y = self.height - bottom;
+                        if (top < -self.content-y) {
+                            self.content-y = -top;
+                        } else if (bottom > self.height - self.content-y) {
+                            self.content-y = self.height - bottom;
                         }
                     }
                     h-col := VerticalLayout {
@@ -2341,11 +2349,21 @@ export component TerminalView inherits Rectangle {
             }
             navigate(path)      => { root.sftp-navigate(path); }
             download(path)      => { root.sftp-download(path); }
+            open-file(path)     => { root.sftp-open-file(path); }
             upload-clicked(dir, folder) => { root.sftp-upload-clicked(dir, folder); }
             refresh(path)       => { root.sftp-refresh(path); }
             tree-expand(path)   => { root.sftp-tree-expand(path); }
             delete(path)        => { root.sftp-delete(path); }
             toggle-select(i)    => { root.sftp-toggle-select(i); }
+            select-range(a, b)  => { root.sftp-select-range(a, b); }
+            bookmarks: root.sftp-bookmarks;
+            recent: root.sftp-recent;
+            bookmarked: root.sftp-bookmarked;
+            toggle-bookmark(p)  => { root.sftp-toggle-bookmark(p); }
+            remove-bookmark(p)  => { root.sftp-remove-bookmark(p); }
+            clear-recent()      => { root.sftp-clear-recent(); }
+            places-refresh()    => { root.sftp-places-refresh(); }
+            drag-out(i)         => { root.sftp-drag-out(i); }
             download-selected() => { root.sftp-download-selected(); }
             delete-selected()   => { root.sftp-delete-selected(); }
             copy-to-target(path, target) => { root.sftp-copy-to-target(path, target); }

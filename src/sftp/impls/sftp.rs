@@ -32,6 +32,7 @@ use crate::config::{AuthMethod, Session};
 use crate::i18n::t;
 use crate::ssh::{format_mtime, format_size, RemoteEntry, RemoteTreeNode, SessionEvent};
 
+use super::elevation::Elevation;
 use super::transfer::{DownloadConflict, SftpCommand, SftpHandle};
 
 impl SftpHandle {
@@ -101,6 +102,10 @@ impl SftpHandle {
     pub fn read_text(&self, remote: String, edit: bool) {
         let _ = self.commands.send(SftpCommand::ReadText { remote, edit });
     }
+    /// Double-click on a file: edit it if it is text, else download (#493).
+    pub fn open_or_download(&self, remote: String) {
+        let _ = self.commands.send(SftpCommand::OpenOrDownload { remote });
+    }
     pub fn write_text(&self, remote: String, content: String) {
         let _ = self
             .commands
@@ -137,6 +142,13 @@ fn chmod_attributes(mode: u32) -> FileAttributes {
 /// channel / handshake (or an explicit "permission denied"). For that family we
 /// give a plain-language hint instead of the raw russh error (#190).
 fn friendly_sftp_error(err: &anyhow::Error) -> String {
+    // SFTP privileges problems (#438) already say what to fix.
+    if let Some(elevation) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<super::elevation::ElevationError>())
+    {
+        return elevation.to_string();
+    }
     let chain = err
         .chain()
         .map(|e| e.to_string().to_lowercase())
@@ -428,26 +440,42 @@ async fn run_sftp(
         return Err(anyhow!(t("SFTP 认证失败", "SFTP authentication failed")));
     }
 
-    // --- Open the sftp subsystem channel -----------------------------------
-    let channel = crate::ssh::network_stage(
+    // --- Decide who SFTP works as (#438) ----------------------------------
+    // Login user via the `sftp` subsystem by default; root via sudo, or a
+    // custom SFTP server command, when the session asks for it.
+    let elevation = Elevation::resolve(&handle, &session, password.as_str()).await?;
+
+    // --- Open the SFTP channel ---------------------------------------------
+    let stream = crate::ssh::network_stage(
         &format!("open SFTP channel at {}:{}", session.host, session.port),
-        handle.channel_open_session(),
-    )
-    .await?;
-    crate::ssh::network_stage(
-        &format!("request SFTP subsystem at {}:{}", session.host, session.port),
-        channel.request_subsystem(true, "sftp"),
+        elevation.open_stream(&handle),
     )
     .await?;
     let sftp = crate::ssh::network_stage(
         &format!("SFTP handshake at {}:{}", session.host, session.port),
-        SftpSession::new(channel.into_stream()),
+        SftpSession::new(stream),
     )
-    .await?;
+    .await
+    .map_err(|err| {
+        if elevation.is_custom() {
+            tracing::warn!("sftp handshake over custom server failed: {err:#}");
+            elevation.handshake_error()
+        } else {
+            err
+        }
+    })?;
+    if !elevation.label().is_empty() {
+        tracing::info!(
+            "sftp {}:{} opened{}",
+            session.host,
+            session.port,
+            elevation.label()
+        );
+    }
     // Share the session + connection so transfers can run on their own task,
     // leaving the command loop free to list/switch directories meanwhile (#116-2).
     let sftp = std::sync::Arc::new(sftp);
-    let handle = std::sync::Arc::new(handle);
+    let handle = std::sync::Arc::new(SftpLink { handle, elevation });
 
     // Owner/group names live for the whole SFTP connection so every listing
     // after the first can paint names without another `getent` round-trip.
@@ -815,7 +843,11 @@ async fn run_sftp(
                     }
                     let _ = &sftp; // listing session kept alive; transfer uses `handle`
                     let res: Result<bool> = async {
-                        let st = exec_remote(&handle, &cmd).await.context("tar on remote")?;
+                        let st = handle
+                            .elevation
+                            .exec_shell(&handle.handle, &cmd)
+                            .await
+                            .context("tar on remote")?;
                         if st != 0 {
                             return Err(anyhow!(t("远端 tar 打包失败", "remote tar failed")));
                         }
@@ -825,7 +857,10 @@ async fn run_sftp(
                     .await;
                     // Best-effort cleanup of the remote temp tar — success, failure
                     // or cancel all reach here, so no junk is left on the server (#100).
-                    let _ = exec_remote(&handle, &format!("rm -f {}", sh_quote(&tmp))).await;
+                    let _ = handle
+                        .elevation
+                        .exec_shell(&handle.handle, &format!("rm -f {}", sh_quote(&tmp)))
+                        .await;
                     match res {
                         Ok(true) => {
                             let _ = events.send(SessionEvent::SftpStatus(format!(
@@ -1352,6 +1387,32 @@ async fn run_sftp(
                     error,
                 });
             }
+            SftpCommand::OpenOrDownload { remote } => {
+                let name = base_name(&remote);
+                let _ = events.send(SessionEvent::SftpStatus(format!(
+                    "{} {}...",
+                    t("打开", "Opening"),
+                    name
+                )));
+                // Same checks as "Edit": anything the built-in editor would
+                // refuse (binary, not UTF-8, too large, unreadable) is
+                // downloaded instead, without an error message.
+                match read_text_guarded(&sftp, &remote).await {
+                    Ok(content) => {
+                        let _ = events.send(SessionEvent::SftpFileText {
+                            path: remote,
+                            name,
+                            content,
+                            edit: true,
+                            error: String::new(),
+                        });
+                    }
+                    Err(reason) => {
+                        tracing::debug!("double-click {remote}: not opened as text ({reason})");
+                        let _ = events.send(SessionEvent::SftpDownloadInstead { path: remote });
+                    }
+                }
+            }
             SftpCommand::WriteText { remote, content } => {
                 let name = base_name(&remote);
                 match write_text_file(&sftp, &remote, &content).await {
@@ -1370,12 +1431,284 @@ async fn run_sftp(
                     }
                 }
             }
+            // Drag-out to the OS file manager (#504). Both run on their own
+            // task so the panel keeps listing while Explorer copies.
+            SftpCommand::WalkForExport { roots, reply } => {
+                let sftp = sftp.clone();
+                transfers.spawn(async move {
+                    let result = walk_for_export(&sftp, &roots)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = reply.send(result);
+                });
+            }
+            SftpCommand::StreamFile { remote, chunks, progress } => {
+                // One Transfers row per drag; its Cancel button flips this flag.
+                cancels
+                    .lock()
+                    .unwrap()
+                    .entry(progress.id.clone())
+                    .or_insert_with(|| progress.cancel.clone());
+                progress.emit_progress(&events, true);
+                let handle = handle.clone();
+                let events = events.clone();
+                transfers.spawn(async move {
+                    if let Err(e) =
+                        stream_file_impl(&handle, &remote, &chunks, &progress, &events).await
+                    {
+                        let message = format!("{e:#}");
+                        if !progress.cancel.load(Ordering::Relaxed) {
+                            progress.fail(format!("{}: {message}", base_name(&remote)));
+                        }
+                        let _ = chunks.send(Err(message)).await;
+                    }
+                });
+            }
+            SftpCommand::FinishDragTransfer(progress) => {
+                cancels.lock().unwrap().remove(&progress.id);
+                progress.emit_final(&events);
+            }
         }
     }
 
     transfers.abort_all();
     while transfers.join_next().await.is_some() {}
     crate::ssh::disconnect_ssh(&handle, "bye").await;
+    Ok(())
+}
+
+/// Upper bounds for one drag-out (#504), so dropping `/` by accident cannot
+/// make the walk run (and the UI wait) forever.
+const MAX_EXPORT_ENTRIES: usize = 50_000;
+const MAX_EXPORT_DEPTH: usize = 64;
+
+/// Stat the dragged `roots` and walk folders depth-first, returning every
+/// folder before its contents. Relative paths start at each root's own name.
+async fn walk_for_export(
+    sftp: &SftpSession,
+    roots: &[String],
+) -> Result<Vec<super::transfer::ExportEntry>> {
+    use super::transfer::ExportEntry;
+    let is_dir = |perms: Option<u32>| (perms.unwrap_or(0) & 0o170_000) == 0o040_000;
+    let mut out = Vec::new();
+    for root in roots {
+        let meta = sftp
+            .metadata(root)
+            .await
+            .with_context(|| format!("stat {root}"))?;
+        let name = base_name(root);
+        let root_is_dir = is_dir(meta.permissions);
+        out.push(ExportEntry {
+            remote: root.clone(),
+            relative: name.clone(),
+            is_dir: root_is_dir,
+            size: if root_is_dir { 0 } else { meta.size.unwrap_or(0) },
+            mtime: meta.mtime.unwrap_or(0) as u64,
+        });
+        if !root_is_dir {
+            continue;
+        }
+        let mut stack = vec![(root.clone(), name, 1usize)];
+        while let Some((dir, rel, depth)) = stack.pop() {
+            if depth > MAX_EXPORT_DEPTH {
+                anyhow::bail!("{dir}: {}", t("目录层级过深", "folder nesting is too deep"));
+            }
+            let mut children = list_dir_impl(sftp, &dir)
+                .await
+                .with_context(|| format!("list {dir}"))?;
+            // Stable, readable order in Explorer's progress dialog.
+            children.sort_by(|a, b| a.name.cmp(&b.name));
+            for child in children {
+                if out.len() >= MAX_EXPORT_ENTRIES {
+                    anyhow::bail!(
+                        "{} ({MAX_EXPORT_ENTRIES}+)",
+                        t("文件数量过多", "too many files")
+                    );
+                }
+                let child_rel = format!("{rel}/{}", child.name);
+                out.push(ExportEntry {
+                    remote: child.full_path.clone(),
+                    relative: child_rel.clone(),
+                    is_dir: child.is_dir,
+                    size: if child.is_dir { 0 } else { child.size },
+                    mtime: child.modified as u64,
+                });
+                if child.is_dir {
+                    stack.push((child.full_path, child_rel, depth + 1));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Transfer state codes understood by the Transfers panel.
+const TRANSFER_ACTIVE: u8 = 0;
+const TRANSFER_DONE: u8 = 1;
+const TRANSFER_FAILED: u8 = 2;
+const TRANSFER_CANCELLED: u8 = 4;
+
+impl super::transfer::DragTransfer {
+    /// Bytes to show as an in-progress row, or `None` when nothing should be
+    /// emitted (finished already, or throttled to one update per 150 ms).
+    pub(crate) fn progress_update(&self, force: bool) -> Option<u64> {
+        let mut report = self.report.lock().unwrap();
+        if report.finished {
+            return None;
+        }
+        let now = Instant::now();
+        if !force
+            && report
+                .last_emit
+                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(150))
+        {
+            return None;
+        }
+        report.last_emit = Some(now);
+        report.started = true;
+        Some(self.done.load(Ordering::Relaxed))
+    }
+
+    /// The row's final `(state, bytes, message)`, once. `None` if the drag
+    /// never transferred anything (no row was created) or already finished.
+    pub(crate) fn final_update(&self) -> Option<(u8, u64, String)> {
+        let mut report = self.report.lock().unwrap();
+        if report.finished {
+            return None;
+        }
+        report.finished = true;
+        if !report.started {
+            return None;
+        }
+        let done = self.done.load(Ordering::Relaxed);
+        Some(if let Some(error) = &report.error {
+            (TRANSFER_FAILED, done, error.clone())
+        } else if self.cancel.load(Ordering::Relaxed) || self.interrupted.load(Ordering::Relaxed) {
+            (TRANSFER_CANCELLED, done, String::new())
+        } else {
+            (TRANSFER_DONE, self.total.max(done), String::new())
+        })
+    }
+
+    /// Remember the first failure; it decides the final row.
+    pub(crate) fn fail(&self, message: String) {
+        let mut report = self.report.lock().unwrap();
+        if report.error.is_none() {
+            report.error = Some(message);
+        }
+    }
+
+    fn emit_progress(&self, events: &UnboundedSender<SessionEvent>, force: bool) {
+        if let Some(done) = self.progress_update(force) {
+            emit_transfer(events, &self.id, &self.name, false, done, self.total, TRANSFER_ACTIVE, "");
+        }
+    }
+
+    fn emit_final(&self, events: &UnboundedSender<SessionEvent>) {
+        if let Some((state, done, message)) = self.final_update() {
+            emit_transfer(events, &self.id, &self.name, false, done, self.total, state, &message);
+        }
+    }
+}
+
+/// Stream `remote` into `chunks` in file order over a dedicated SFTP
+/// channel, keeping up to ~1 MB of READ requests in flight like
+/// `download_impl`. Delivered bytes count toward the drag's Transfers row.
+/// Stops when the receiver goes away (Explorer cancelled) or the row's
+/// Cancel button is pressed.
+async fn stream_file_impl(
+    handle: &SftpLink,
+    remote: &str,
+    chunks: &tokio::sync::mpsc::Sender<std::result::Result<Vec<u8>, String>>,
+    progress: &super::transfer::DragTransfer,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<()> {
+    use futures::stream::FuturesOrdered;
+
+    const CHUNK: usize = 32 * 1024;
+    const MAX_INFLIGHT: usize = 32;
+
+    let stream = handle
+        .elevation
+        .open_stream(&handle.handle)
+        .await
+        .context("open sftp channel")?;
+    let raw = Arc::new(RawSftpSession::new(stream));
+    raw.init().await.context("sftp handshake")?;
+    let total = raw
+        .stat(remote)
+        .await
+        .ok()
+        .and_then(|a| a.attrs.size)
+        .unwrap_or(0);
+    let fhandle = raw
+        .open(remote, OpenFlags::READ, FileAttributes::default())
+        .await
+        .with_context(|| format!("open remote {remote}"))?
+        .handle;
+
+    // Fixed-size reads in order. When the size is unknown (or the file grew),
+    // keep reading past `total` until a short/empty read signals EOF.
+    let mut next_off = 0u64;
+    let mut eof = false;
+    let mut inflight = FuturesOrdered::new();
+    loop {
+        while !eof && inflight.len() < MAX_INFLIGHT && (total == 0 || next_off < total) {
+            let off = next_off;
+            let want = if total == 0 {
+                CHUNK
+            } else {
+                ((total - off) as usize).min(CHUNK)
+            };
+            next_off += want as u64;
+            let raw = raw.clone();
+            let h = fhandle.clone();
+            inflight.push_back(async move {
+                let mut data = Vec::with_capacity(want);
+                let mut o = off;
+                let end = off + want as u64;
+                while o < end {
+                    match raw.read(h.clone(), o, (end - o) as u32).await {
+                        Ok(d) if d.data.is_empty() => break,
+                        Ok(d) => {
+                            o += d.data.len() as u64;
+                            data.extend_from_slice(&d.data);
+                        }
+                        Err(SftpError::Status(s)) if s.status_code == StatusCode::Eof => break,
+                        Err(e) => return Err(anyhow!("read remote: {e}")),
+                    }
+                }
+                Ok::<(Vec<u8>, bool), anyhow::Error>((data, (o - off) < want as u64))
+            });
+            // Unknown size: one request at a time is enough to find EOF.
+            if total == 0 {
+                break;
+            }
+        }
+        if progress.cancel.load(Ordering::Relaxed) {
+            let _ = raw.close(fhandle).await;
+            anyhow::bail!("{}", t("已取消", "Cancelled"));
+        }
+        let Some(result) = inflight.next().await else { break };
+        let (data, short) = result?;
+        let n = data.len() as u64;
+        if !data.is_empty() {
+            if chunks.send(Ok(data)).await.is_err() {
+                // Receiver dropped: Explorer cancelled or skipped this file.
+                progress.interrupted.store(true, Ordering::Relaxed);
+                break;
+            }
+            progress.done.fetch_add(n, Ordering::Relaxed);
+            progress.emit_progress(events, false);
+        }
+        if short {
+            eof = true;
+            if inflight.is_empty() {
+                break;
+            }
+        }
+    }
+    let _ = raw.close(fhandle).await;
     Ok(())
 }
 
@@ -1392,16 +1725,18 @@ enum EditorTextRejection {
     InvalidUtf8,
 }
 
+/// Control characters other than tab / LF / CR (and DEL): the file is binary.
+fn has_control_bytes(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&byte| {
+        (byte < 0x20 && byte != b'\t' && byte != b'\n' && byte != b'\r') || byte == 0x7f
+    })
+}
+
 fn validate_editor_text(bytes: Vec<u8>) -> std::result::Result<String, EditorTextRejection> {
     if bytes.len() > MAX_BUILTIN_EDITOR_BYTES {
         return Err(EditorTextRejection::TooLarge);
     }
-    if bytes
-        .iter()
-        .any(|&byte| {
-            (byte < 0x20 && byte != b'\t' && byte != b'\n' && byte != b'\r') || byte == 0x7f
-        })
-    {
+    if has_control_bytes(&bytes) {
         return Err(EditorTextRejection::Binary);
     }
 
@@ -1483,6 +1818,12 @@ async fn read_text_guarded(
         if count == 0 {
             break;
         }
+        // Binary files usually show it in the first chunk: stop reading
+        // instead of pulling up to 512 KB first (matters for #493, where every
+        // double-clicked file is tried as text before it is downloaded).
+        if has_control_bytes(&chunk[..count]) {
+            return Err(editor_rejection_message(EditorTextRejection::Binary));
+        }
         lines += chunk[..count].iter().filter(|&&byte| byte == b'\n').count();
         if lines > MAX_BUILTIN_EDITOR_LINES {
             return Err(editor_rejection_message(EditorTextRejection::TooManyLines));
@@ -1531,27 +1872,6 @@ fn local_file_name_utf8(path: &Path) -> Result<String> {
 /// untrusted — without quoting, a crafted name like `; rm -rf ~` would run.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Run a one-shot command on the remote over its own exec channel and return
-/// the exit status. Stdout/stderr are drained and discarded.
-async fn exec_remote(handle: &client::Handle<SftpClientHandler>, cmd: &str) -> Result<u32> {
-    let mut ch = handle
-        .channel_open_session()
-        .await
-        .context("open exec channel")?;
-    ch.exec(true, cmd.as_bytes())
-        .await
-        .context("exec remote command")?;
-    let mut status = 0u32;
-    while let Some(msg) = ch.wait().await {
-        match msg {
-            russh::ChannelMsg::ExitStatus { exit_status } => status = exit_status,
-            russh::ChannelMsg::Close => break,
-            _ => {}
-        }
-    }
-    Ok(status)
 }
 
 async fn exec_remote_output(
@@ -1775,7 +2095,7 @@ async fn cleanup_import_path(path: &Path) {
 
 async fn stage_remote_for_copy(
     sftp: &SftpSession,
-    handle: &client::Handle<SftpClientHandler>,
+    handle: &SftpLink,
     remote: &str,
     events: &UnboundedSender<SessionEvent>,
 ) -> Result<(PathBuf, PathBuf)> {
@@ -2220,7 +2540,7 @@ fn emit_transfer(
 /// transfer was cancelled. In both the cancel and error cases the partial
 /// local file is removed so no half-downloaded junk is left behind.
 async fn download_impl(
-    handle: &client::Handle<SftpClientHandler>,
+    handle: &SftpLink,
     remote: &str,
     local: &str,
     name: &str,
@@ -2233,15 +2553,12 @@ async fn download_impl(
     const CHUNK: usize = 32 * 1024;
     const MAX_INFLIGHT: usize = 32; // ~1 MB outstanding hides the RTT
 
-    let channel = handle
-        .channel_open_session()
+    let stream = handle
+        .elevation
+        .open_stream(&handle.handle)
         .await
         .context("open sftp download channel")?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .context("request sftp subsystem")?;
-    let raw = Arc::new(RawSftpSession::new(channel.into_stream()));
+    let raw = Arc::new(RawSftpSession::new(stream));
     raw.init().await.context("sftp download handshake")?;
 
     let total = raw
@@ -2395,7 +2712,7 @@ async fn download_impl(
 /// so a hostile server can't escape the chosen folder.
 async fn download_dir(
     sftp: &SftpSession,
-    handle: &client::Handle<SftpClientHandler>,
+    handle: &SftpLink,
     remote_root: &str,
     local_parent: &str,
     events: &UnboundedSender<SessionEvent>,
@@ -2471,7 +2788,7 @@ async fn remove_dir_recursive(sftp: &SftpSession, root: &str) -> Result<()> {
 /// "already exists" error is ignored), then upload its files with the pipelined
 /// path. Symlinks and other special files are skipped.
 async fn upload_dir(
-    handle: &client::Handle<SftpClientHandler>,
+    handle: &SftpLink,
     sftp: &SftpSession,
     local_root: &Path,
     remote_parent: &str,
@@ -2515,7 +2832,7 @@ async fn upload_dir(
 /// which hides the latency and brings us within a single order of magnitude of
 /// native scp.
 async fn upload_pipelined(
-    handle: &client::Handle<SftpClientHandler>,
+    handle: &SftpLink,
     local: &Path,
     remote: &str,
     name: &str,
@@ -2538,15 +2855,12 @@ async fn upload_pipelined(
 
     // Dedicated raw SFTP channel for the transfer (keeps the browse session
     // responsive and lets us issue concurrent WRITE requests).
-    let channel = handle
-        .channel_open_session()
+    let stream = handle
+        .elevation
+        .open_stream(&handle.handle)
         .await
         .context("open sftp upload channel")?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .context("request sftp subsystem")?;
-    let raw = Arc::new(RawSftpSession::new(channel.into_stream()));
+    let raw = Arc::new(RawSftpSession::new(stream));
     raw.init().await.context("sftp upload handshake")?;
 
     let fhandle = raw
@@ -2648,6 +2962,21 @@ struct SftpClientHandler {
     port: u16,
     events: UnboundedSender<SessionEvent>,
     host_key_wait: crate::ssh::HostKeyWait,
+}
+
+/// The SFTP connection plus how its SFTP channels are opened (#438). Derefs to
+/// the SSH handle, so helpers that only run plain commands take it as is.
+struct SftpLink {
+    handle: client::Handle<SftpClientHandler>,
+    elevation: Elevation,
+}
+
+impl std::ops::Deref for SftpLink {
+    type Target = client::Handle<SftpClientHandler>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
 }
 
 impl crate::ssh::HandshakeHandler for SftpClientHandler {
@@ -2801,6 +3130,40 @@ mod sanitize_tests {
         assert_eq!(attrs.size, None);
         assert_eq!(attrs.atime, None);
         assert_eq!(attrs.mtime, None);
+    }
+
+    #[test]
+    fn double_click_text_detection_keeps_text_and_rejects_binaries() {
+        // #493: the same check decides between "open in editor" and "download".
+        for text in [
+            "plain\n",
+            "tabs\tand\r\nCRLF",
+            "中文 UTF-8 ✓\n",
+            "#!/bin/sh\necho hi\n",
+            "",
+        ] {
+            assert!(!super::has_control_bytes(text.as_bytes()), "{text:?}");
+            assert_eq!(validate_editor_text(text.as_bytes().to_vec()), Ok(text.to_string()));
+        }
+        for binary in [
+            &b"\x89PNG\r\n\x1a\n"[..],
+            &b"\x7fELF\x02\x01"[..],
+            &b"PK\x03\x04"[..],
+            &b"text\0with nul"[..],
+        ] {
+            assert!(super::has_control_bytes(binary), "{binary:?}");
+            assert_eq!(
+                validate_editor_text(binary.to_vec()),
+                Err(EditorTextRejection::Binary)
+            );
+        }
+        // GBK text has no control bytes but is not UTF-8: downloaded, not garbled.
+        let gbk = vec![0xc4, 0xe3, 0xba, 0xc3];
+        assert!(!super::has_control_bytes(&gbk));
+        assert_eq!(
+            validate_editor_text(gbk),
+            Err(EditorTextRejection::InvalidUtf8)
+        );
     }
 
     #[test]
