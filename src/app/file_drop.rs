@@ -66,15 +66,27 @@ pub(super) fn handle_file_drop(
     path: std::path::PathBuf,
     hovered_pos: Option<(f32, f32)>,
 ) {
-    let Some((client_x, client_y)) = hovered_pos else {
-        // No CursorMoved was ever observed for this drag (e.g. the file was
-        // dropped the instant it entered the window). Without a position we
-        // cannot tell which panel it landed on, so do nothing rather than
-        // guess — matches the previous no-op rather than uploading to the
-        // wrong place.
-        return;
-    };
-    handle_file_drop_at(win, sftp_handles, path, client_x, client_y);
+    match hovered_pos {
+        Some((client_x, client_y)) => {
+            handle_file_drop_at(win, sftp_handles, path, client_x, client_y);
+        }
+        None => {
+            // No usable drop point. On Wayland there never is one: the DnD
+            // carrier our winit build uses (wayland-native-dnd) turns
+            // `wl_data_device` into plain `HoveredFile` / `DroppedFile` events
+            // and drops the protocol's hover coordinates outright — its
+            // `motion` handler deliberately emits nothing because winit 0.30
+            // has no hover-motion event. Waiting for a `CursorMoved` therefore
+            // waits forever, and the upload silently never happened (#356).
+            //
+            // The drop still landed on *this* window, whose main area is the
+            // terminal panel, so upload to the active session instead of
+            // discarding the file. `upload_to_active_session` keeps every
+            // safety gate (welcome tab, unknown/no SFTP directory, offline
+            // session), so this can only ever write into a live SFTP session.
+            upload_to_active_session(win, sftp_handles, path);
+        }
+    }
 }
 
 /// Shared drop-position → upload logic for both platform front-ends above.
@@ -98,7 +110,23 @@ pub(super) fn handle_file_drop_at(
     if !contains_logical(term, client_x, client_y) {
         return; // dropped outside the terminal panel — ignore
     }
+    upload_to_active_session(win, sftp_handles, path);
+}
 
+/// Upload `path` into the active session's current remote directory, mirroring
+/// it into every other online session when session-sync is enabled (#sync).
+///
+/// This is the part of a drop that needs no coordinates, so it is shared by the
+/// positional path (X11/macOS/Windows) and the position-less Wayland fallback.
+pub(super) fn upload_to_active_session(
+    win: &AppWindow,
+    sftp_handles: &SftpHandles,
+    path: std::path::PathBuf,
+) {
+    let active = win.get_active_tab_id().to_string();
+    if active.is_empty() || active == "welcome" {
+        return;
+    }
     let dir = active_sftp_path(win, &active);
     if dir.is_empty() {
         return;

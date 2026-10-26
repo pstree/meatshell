@@ -129,15 +129,40 @@ pub(super) fn install_window_event_hook(
                         // the focused Slint TextInput keeps owning text input as before.
                         slint_window.with_winit_window(|window| window.set_ime_allowed(true));
                     }
+                    WEvent::HoveredFile(_) => {
+                        // A drag has just entered the window. Whatever
+                        // `CursorMoved` we remember belongs to the pointer
+                        // session *before* the drag started, so it must not be
+                        // used as the drop point — the window may well have been
+                        // scrolled, resized or re-laid-out since.
+                        //
+                        // Clearing it is also what makes Wayland behave
+                        // correctly: its DnD carrier emits HoveredFile /
+                        // HoveredFileCancelled / DroppedFile but never a
+                        // CursorMoved during the drag (winit 0.30 exposes no
+                        // hover-motion event), so the value stays None and the
+                        // drop falls back to uploading to the active session.
+                        // X11 and macOS do deliver real pointer motion while
+                        // hovering, so they refill it below and keep the exact
+                        // drop point (#356).
+                        last_cursor_logical = None;
+                    }
+                    WEvent::HoveredFileCancelled => {
+                        last_cursor_logical = None;
+                    }
                     WEvent::DroppedFile(path) => {
                         if let Some(win) = weak.upgrade() {
                             // On Windows the handler queries the OS cursor
                             // position itself (see `cursor_pos`), since OLE
                             // drag-and-drop hover suppresses WM_MOUSEMOVE.
-                            // On macOS/X11/Wayland the compositor delivers
-                            // pointer motion during drag-hover as ordinary
-                            // CursorMoved events, so the last one we saw is
-                            // the drop point (#356).
+                            // macOS/X11 use the position recorded by the
+                            // CursorMoved events seen while hovering; Wayland
+                            // has none and uploads to the active session.
+                            //
+                            // The value is deliberately *not* cleared here:
+                            // dropping several files arrives as one DroppedFile
+                            // per file, and every one of them needs the same
+                            // hover position to be tested against the panel.
                             handle_file_drop(&win, &sh, path.clone(), last_cursor_logical);
                         }
                     }
