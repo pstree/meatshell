@@ -181,6 +181,7 @@ pub(super) fn open_window(
     wire_webdav_upload(&ctx);
     wire_terminal_settings(&ctx);
     wire_ui_scale_and_wallpaper(&ctx);
+    super::color_theme::wire(&ctx);
 
     let sessions_model: Rc<VecModel<SessionInfo>> = Rc::new(VecModel::default());
     window.set_sessions(ModelRc::from(sessions_model.clone()));
@@ -199,6 +200,7 @@ pub(super) fn open_window(
         title: t("新标签页", "New tab").into(),
         kind: "welcome".into(),
         connected: false,
+        local: false,
     });
     window.set_tabs(ModelRc::from(tabs_model.clone()));
     window.set_active_tab_id("welcome".into());
@@ -632,6 +634,12 @@ pub(super) fn open_window(
         core.tab_routes.clone(),
         tab_titles.clone(),
         editor_win.clone(),
+    );
+    super::save_tab_session::wire(
+        &window,
+        store.clone(),
+        registry.clone(),
+        sessions_model.clone(),
     );
 
     wire_sidebar_refresh_and_theme(

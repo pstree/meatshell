@@ -254,55 +254,88 @@ pub(super) fn active_terminal_panel_rects(
     ))
 }
 
-/// The SFTP file-list rectangle inside the active terminal panel. Kept for a
-/// future dedicated SFTP drop target; the shell-page drop currently accepts the
-/// whole terminal panel instead of just this region (#drag-onto-shell).
-#[allow(dead_code)]
-pub(super) fn active_sftp_file_list_rect(win: &AppWindow) -> Option<LogicalRect> {
-    let (_active, term, term_state) = active_terminal_panel_rects(win)?;
-    if term_state.sftp_collapsed {
+/// The split view's local-pane rectangle for the active terminal tab, or `None`
+/// when the panel is hidden, collapsed, or the tab is not in the split view.
+///
+/// Mirrors the layout in `ui/terminal_view.slint` (24px status strip, docked
+/// panel at the chosen edge) and `ui/sftp_panel.slint` (toolbar + content +
+/// 18px status bar; the local half is `local-w` wide). Used to route OS file
+/// drops: dropping on the local half copies files into that local folder,
+/// dropping anywhere else uploads them to the remote directory.
+pub(super) fn active_sftp_local_pane_rect(win: &AppWindow) -> Option<(String, LogicalRect)> {
+    if panels_hidden(win) {
+        return None;
+    }
+    let (active, term, state) = active_terminal_panel_rects(win)?;
+    if state.sftp_collapsed || !state.sftp_dual {
         return None;
     }
 
-    // TerminalView starts with a 24px connection-status line (hidden in zen
-    // mode); SFTP docks inside the remaining dock-region. This mirrors
-    // ui/terminal_view.slint.
-    let strip = if panels_hidden(win) { 0.0 } else { 24.0 };
-    let dock_region = LogicalRect {
+    // TerminalView starts with a 24px connection-status strip; the SFTP panel
+    // is docked inside the region below it.
+    let region = LogicalRect {
         x: term.x,
-        y: term.y + strip,
+        y: term.y + 24.0,
         w: term.w,
-        h: (term.h - strip).max(0.0),
+        h: (term.h - 24.0).max(0.0),
     };
     let dock = win.get_sftp_dock().to_string();
-    let mut panel = LogicalRect {
-        x: dock_region.x,
-        y: dock_region.y,
-        w: if dock == "left" || dock == "right" {
-            side_sftp_width(term_state.sftp_panel_width)
-        } else {
-            dock_region.w
-        },
-        h: if dock == "left" || dock == "right" {
-            dock_region.h
-        } else {
-            term_state.sftp_panel_height
-        },
+    let vertical = dock == "left" || dock == "right";
+    let panel_w = if vertical {
+        side_sftp_width(state.sftp_panel_width)
+    } else {
+        region.w
     };
-    if dock == "right" {
-        panel.x = dock_region.x + (dock_region.w - panel.w).max(0.0);
-    } else if dock == "bottom" {
-        panel.y = dock_region.y + (dock_region.h - panel.h).max(0.0);
-    }
+    let panel_h = if vertical {
+        region.h
+    } else {
+        state.sftp_panel_height
+    };
+    let panel = LogicalRect {
+        x: if dock == "right" {
+            region.x + (region.w - panel_w).max(0.0)
+        } else {
+            region.x
+        },
+        y: if dock == "bottom" {
+            region.y + (region.h - panel_h).max(0.0)
+        } else {
+            region.y
+        },
+        w: panel_w,
+        h: panel_h,
+    };
 
-    // SftpPanel layout: toolbar 34, then file headers 20 + separator 1; when the
-    // tree is shown (top/bottom docks), the file list starts after tree 160 + sep.
-    let show_tree = dock != "left" && dock != "right";
-    panel.y += 34.0 + 20.0 + 1.0;
-    panel.h = (panel.h - 34.0 - 20.0 - 1.0).max(0.0);
-    if show_tree {
-        panel.x += 160.0 + 1.0;
-        panel.w = (panel.w - 160.0 - 1.0).max(0.0);
+    // SftpPanel: toolbar (62px in the two-row compact layout), content, 18px
+    // status bar. The split view hides the tree, so the compact threshold is
+    // the bare 560px.
+    let toolbar = if panel.w < 560.0 { 62.0 } else { 34.0 };
+    let content_h = (panel.h - toolbar - 18.0).max(0.0);
+    // Mirrors `local-w` in ui/sftp_panel.slint: 0 = even split.
+    let wanted = if state.sftp_local_pane_width > 0.0 {
+        state.sftp_local_pane_width
+    } else {
+        panel.w / 2.0
+    };
+    let local_w = wanted.clamp(160.0, (panel.w - 200.0).max(160.0));
+
+    Some((
+        active,
+        LogicalRect {
+            x: panel.x,
+            y: panel.y + toolbar,
+            w: local_w,
+            h: content_h,
+        },
+    ))
+}
+
+/// `(tab id, local folder)` when `(x, y)` is over the split view's local pane.
+pub(super) fn sftp_local_pane_hit(win: &AppWindow, x: f32, y: f32) -> Option<(String, String)> {
+    let (tab, rect) = active_sftp_local_pane_rect(win)?;
+    if !contains_logical(rect, x, y) {
+        return None;
     }
-    Some(panel)
+    let dir = current_path(win, &tab);
+    (!dir.is_empty()).then_some((tab, dir))
 }

@@ -40,6 +40,15 @@ export struct WslProfileInfo {
     directory: string,
 }
 
+// One colour theme preset in Settings › Wallpaper & theme. `swatch` is the
+// dot shown next to the name.
+export struct ColorThemeItem {
+    id: string,
+    name-en: string,
+    name-zh: string,
+    swatch: color,
+}
+
 // A user-defined agent launcher (#427).
 export struct CustomAgentInfo {
     id: string,
@@ -346,6 +355,124 @@ component CursorColorInput inherits Rectangle {
     }
 }
 
+// Colour dot used by the colour theme picker.
+component ThemeDot inherits Rectangle {
+    in property <color> swatch;
+    width: 12px;
+    height: 12px;
+    border-radius: 6px;
+    background: root.swatch;
+    border-width: 1px;
+    border-color: Theme.border-strong;
+}
+
+// Colour theme dropdown: the current theme's dot + name, opening a list of
+// presets with a check on the selected one.
+component ColorThemePicker inherits Rectangle {
+    in property <[ColorThemeItem]> items;
+    in property <string> current;
+    in property <bool> lang-en;
+    callback selected(string);
+    height: 30px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: picker-ta.has-hover ? Theme.border-strong : Theme.border-subtle;
+    background: Theme.bg-elevated;
+
+    picker-ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { theme-list.show(); }
+    }
+    // The current theme's row; all rows are stacked and only the match shows.
+    for item in root.items : Rectangle {
+        x: 0; y: 0;
+        width: parent.width - 26px;
+        height: parent.height;
+        visible: item.id == root.current;
+        HorizontalLayout {
+            padding-left: 10px;
+            spacing: 8px;
+            alignment: start;
+            VerticalLayout { alignment: center; ThemeDot { swatch: item.swatch; } }
+            Text {
+                text: root.lang-en ? item.name-en : item.name-zh;
+                color: Theme.text-primary;
+                font-size: 12px * Theme.panel-font;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+    Text {
+        x: parent.width - 24px;
+        width: 18px;
+        height: parent.height;
+        text: "\u{E5CF}"; // expand_more
+        font-family: "Material Icons";
+        font-size: 16px * Theme.panel-font;
+        color: Theme.text-secondary;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+
+    theme-list := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: root.width;
+        height: min(root.items.length * 28px + 10px, 360px);
+        Rectangle {
+            background: Theme.popup-bg;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000060;
+            ScrollView {
+                content-width: self.visible-width;
+                content-height: list.preferred-height;
+                list := VerticalLayout {
+                    padding: 5px;
+                    spacing: 0;
+                    for item in root.items : Rectangle {
+                        height: 28px;
+                        border-radius: 5px;
+                        background: item.id == root.current
+                            ? Theme.bg-active
+                            : (row-ta.has-hover ? Theme.bg-hover : transparent);
+                        row-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.selected(item.id);
+                                theme-list.close();
+                            }
+                        }
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 8px;
+                            VerticalLayout { alignment: center; ThemeDot { swatch: item.swatch; } }
+                            Text {
+                                text: root.lang-en ? item.name-en : item.name-zh;
+                                color: Theme.text-primary;
+                                font-size: 12px * Theme.panel-font;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Text {
+                                text: item.id == root.current ? "\u{E5CA}" : ""; // check
+                                font-family: "Material Icons";
+                                font-size: 15px * Theme.panel-font;
+                                color: Theme.text-primary;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // A macOS-style wallpaper thumbnail: a rounded, clipped preview (passed via
 // @children) with a selection ring + check badge. The label sits below it in
 // the page, not inside.
@@ -416,6 +543,10 @@ export component InterfacePanel inherits Rectangle {
     in property <bool> session-log-dir-custom;
     in-out property <bool> paste-confirm-enabled: true;
     in-out property <bool> extra-paste-shortcuts-enabled: true;
+    // SSH keepalive (Settings › Connection, #515).
+    in-out property <bool> ssh-keepalive-enabled: true;
+    in-out property <int> ssh-keepalive-interval: 30;
+    in-out property <int> ssh-keepalive-max: 3;
     in-out property <bool> zen-mode: false;
     in-out property <bool> welcome-as-sidebar;
     in-out property <bool> quick-commands-as-sidebar;
@@ -446,10 +577,22 @@ export component InterfacePanel inherits Rectangle {
     in-out property <bool> mcp-use-saved-credentials: true;
     in-out property <bool> mcp-allow-commands: true;
     in-out property <bool> mcp-allow-file-transfers: true;
+    // Ready-to-paste MCP client entry with this executable's path (Rust).
+    in property <string> mcp-config-json;
+    callback copy-text(string);
+    property <bool> mcp-json-copied: false;
     in-out property <float> wallpaper-overlay;   // frosted-panel opacity 0.30-1.00
     // Active wallpaper id: "" / "builtin:light" / "builtin:dark" / a file path.
     in property <string> current-wallpaper;
     in property <string> custom-wallpaper-name;   // basename for the file row
+    // Colour theme presets + immersive colours (Wallpaper & theme page).
+    in property <[ColorThemeItem]> color-themes;
+    in property <string> color-theme: "default";
+    in-out property <string> color-theme-custom: "#4A90E2";
+    in property <bool> immersive-colors: true;
+    callback set-color-theme(string);
+    callback set-color-theme-custom(string) -> bool;
+    callback set-immersive-colors(bool);
     in property <[WslProfileInfo]> wsl-profiles;
     in-out property <string> wsl-new-name: "WSL";
     in-out property <string> wsl-new-distribution;
@@ -503,6 +646,7 @@ export component InterfacePanel inherits Rectangle {
     callback open-session-log-dir();
     callback set-paste-confirm-enabled(bool);
     callback set-extra-paste-shortcuts-enabled(bool);
+    callback set-ssh-keepalive(bool /* enabled */, int /* interval s */, int /* max missed */);
     callback set-zen-mode(bool);
     callback set-welcome-as-sidebar(bool);
     callback set-quick-commands-as-sidebar(bool);
@@ -560,9 +704,14 @@ export component InterfacePanel inherits Rectangle {
                     clicked => { root.ifd-page = "output"; }
                 }
                 NavItem {
-                    icon: "\u{E1BC}"; label: root.lang-en ? "Wallpaper" : "壁纸";
+                    icon: "\u{E1BC}"; label: root.lang-en ? "Wallpaper & theme" : "壁纸与主题";
                     active: root.ifd-page == "wallpaper";
                     clicked => { root.ifd-page = "wallpaper"; }
+                }
+                NavItem {
+                    icon: "\u{E8BE}"; label: root.lang-en ? "Connection" : "连接";
+                    active: root.ifd-page == "connection";
+                    clicked => { root.ifd-page = "connection"; }
                 }
                 NavItem {
                     icon: "\u{E2C7}"; label: "SFTP";
@@ -1041,11 +1190,46 @@ export component InterfacePanel inherits Rectangle {
                 spacing: 0;
                 alignment: start;
 
+                SectionHeader { text: root.lang-en ? "COLOR THEME" : "配色主题"; height: 24px; }
+                SettingRow {
+                    label: root.lang-en ? "Color theme" : "配色主题";
+                    desc: root.lang-en
+                        ? "Accent and surface colors. Follows the light/dark switch."
+                        : "强调色与面板配色，随浅色 / 深色切换。";
+                    show-divider: root.color-theme == "custom";
+                    ColorThemePicker {
+                        width: 220px;
+                        items: root.color-themes;
+                        current: root.color-theme;
+                        lang-en: root.lang-en;
+                        selected(id) => { root.set-color-theme(id); }
+                    }
+                }
+                if root.color-theme == "custom" : SettingRow {
+                    label: root.lang-en ? "Custom color" : "自定义颜色";
+                    desc: root.lang-en
+                        ? "Hex color (#RRGGBB) used as the accent; surfaces pick up a hint of it."
+                        : "十六进制颜色（#RRGGBB），作为强调色，并轻微染到面板上。";
+                    show-divider: false;
+                    CursorColorInput {
+                        value <=> root.color-theme-custom;
+                        preview-color: Theme.palette-dark.accent;
+                        apply-color(hex) => { return root.set-color-theme-custom(hex); }
+                    }
+                }
+                if root.immersive-colors && root.current-wallpaper != "" : Text {
+                    text: root.lang-en
+                        ? "Immersive colors are on, so the wallpaper's colors override the theme accent. Turn them off below to use the theme with this wallpaper."
+                        : "已开启沉浸式配色，壁纸颜色会覆盖主题强调色。在下方关闭后，可在保留壁纸的同时使用该主题。";
+                    color: Theme.text-muted; font-size: 11px * Theme.panel-font; wrap: word-wrap;
+                }
+                Rectangle { height: 16px; }
+
                 SectionHeader { text: root.lang-en ? "WALLPAPER" : "壁纸"; height: 24px; }
                 Text {
                     text: root.lang-en
-                        ? "Pick a wallpaper — the interface tints itself to match (accent, panels, light/dark)."
-                        : "选一张壁纸,界面会沉浸式地适配它的颜色(强调色、面板、深浅)。";
+                        ? "Pick a wallpaper. With immersive colors on, the interface tints itself to match (accent, panels, light/dark)."
+                        : "选一张壁纸。开启沉浸式配色时，界面会适配它的颜色（强调色、面板、深浅）。";
                     color: Theme.text-muted; font-size: 11px * Theme.panel-font; wrap: word-wrap;
                 }
                 Rectangle { height: 12px; }
@@ -1233,6 +1417,20 @@ export component InterfacePanel inherits Rectangle {
                 }
 
                 Rectangle { height: 16px; }
+                SectionHeader { text: root.lang-en ? "IMMERSIVE" : "沉浸式"; height: 22px; }
+                SettingRow {
+                    label: root.lang-en ? "Immersive colors" : "沉浸式配色";
+                    desc: root.lang-en
+                        ? "Recolor the interface from the wallpaper. Off keeps the wallpaper but uses the color theme and your light/dark choice."
+                        : "根据壁纸重新着色界面。关闭后保留壁纸，但使用配色主题和你选择的浅色 / 深色。";
+                    show-divider: false;
+                    Switch {
+                        on: root.immersive-colors;
+                        toggled(v) => { root.set-immersive-colors(v); }
+                    }
+                }
+
+                Rectangle { height: 16px; }
                 SectionHeader { text: root.lang-en ? "OVERLAY" : "遮罩"; height: 22px; }
                 SettingRow {
                     label: root.lang-en ? "Wallpaper transparency" : "壁纸遮罩透明度";
@@ -1351,6 +1549,57 @@ export component InterfacePanel inherits Rectangle {
                     color: root.renderer-restart-required ? Theme.accent : Theme.text-muted;
                     font-size: 11px * Theme.panel-font;
                     wrap: word-wrap;
+                }
+            }
+
+            // --- Connection page (#515) -------------------------------
+            if root.ifd-page == "connection" : VerticalLayout {
+                padding-left: 20px;
+                padding-right: 20px;
+                padding-top: 14px;
+                spacing: 0;
+                alignment: start;
+
+                SectionHeader { text: root.lang-en ? "SSH KEEPALIVE" : "SSH 保活"; height: 24px; }
+                SettingRow {
+                    label: root.lang-en ? "Send keepalives" : "发送保活包";
+                    desc: root.lang-en
+                        ? "Stops NAT, firewalls and gateways from dropping idle SSH / SFTP connections, and reports a dead connection instead of waiting for a keypress. Applies to new connections."
+                        : "防止空闲的 SSH / SFTP 连接被 NAT、防火墙或网关回收，连接断开时也能及时提示，而不是等到按键才发现。对新建连接生效。";
+                    show-divider: root.ssh-keepalive-enabled;
+                    Switch {
+                        on: root.ssh-keepalive-enabled;
+                        toggled(v) => {
+                            root.ssh-keepalive-enabled = v;
+                            root.set-ssh-keepalive(v, root.ssh-keepalive-interval, root.ssh-keepalive-max);
+                        }
+                    }
+                }
+                if root.ssh-keepalive-enabled : SettingRow {
+                    label: root.lang-en ? "Interval" : "发送间隔";
+                    desc: root.lang-en ? "Send a keepalive after the server has been silent this long."
+                                       : "服务器持续无数据多久后发送一次保活包。";
+                    Stepper {
+                        value: root.ssh-keepalive-interval; minimum: 5; maximum: 300; step: 5; unit: "s";
+                        changed(v) => {
+                            root.ssh-keepalive-interval = v;
+                            root.set-ssh-keepalive(true, v, root.ssh-keepalive-max);
+                        }
+                    }
+                }
+                if root.ssh-keepalive-enabled : SettingRow {
+                    label: root.lang-en ? "Unanswered keepalives" : "最大无响应次数";
+                    desc: root.lang-en
+                        ? "Disconnect after this many keepalives in a row get no reply (about " + (root.ssh-keepalive-max + 1) * root.ssh-keepalive-interval + " s)."
+                        : "连续这么多次保活包无响应后断开连接(约 " + (root.ssh-keepalive-max + 1) * root.ssh-keepalive-interval + " 秒)。";
+                    show-divider: false;
+                    Stepper {
+                        value: root.ssh-keepalive-max; minimum: 2; maximum: 10; step: 1;
+                        changed(v) => {
+                            root.ssh-keepalive-max = v;
+                            root.set-ssh-keepalive(true, root.ssh-keepalive-interval, v);
+                        }
+                    }
                 }
             }
 
@@ -1795,6 +2044,9 @@ export component InterfacePanel inherits Rectangle {
                 padding-left: 20px;
                 padding-right: 20px;
                 padding-top: 14px;
+                // Room below the config snippet so it scrolls clear of the
+                // card's bottom edge / resize grip.
+                padding-bottom: 24px;
                 spacing: 0;
                 alignment: start;
                 SectionHeader { text: "MODEL CONTEXT PROTOCOL"; height: 24px; }
@@ -1863,13 +2115,64 @@ export component InterfacePanel inherits Rectangle {
                     wrap: word-wrap;
                 }
                 Rectangle { height: 18px; }
+                SectionHeader { text: root.lang-en ? "CLIENT CONFIGURATION" : "客户端配置"; height: 22px; }
                 Text {
                     text: root.lang-en
-                        ? "Command: meatshell mcp serve\nTransport: stdio (local process only)"
-                        : "启动命令：meatshell mcp serve\n传输方式：stdio（仅本机进程）";
+                        ? "Add this entry under \"mcpServers\" in your MCP client's config (for example claude_desktop_config.json). Transport: stdio, local process only."
+                        : "把这段配置加到 MCP 客户端配置的 \"mcpServers\" 下（例如 claude_desktop_config.json）。传输方式：stdio，仅本机进程。";
                     color: Theme.text-muted;
-                    font-family: Theme.term-font-family;
-                    font-size: 12px * Theme.panel-font;
+                    font-size: 11px * Theme.panel-font;
+                    wrap: word-wrap;
+                }
+                Rectangle { height: 8px; }
+                // The snippet, with a copy button in its top-right corner.
+                Rectangle {
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.border-subtle;
+                    background: Theme.bg-elevated;
+                    height: mcp-json-text.preferred-height + 24px;
+                    mcp-json-text := Text {
+                        x: 12px;
+                        y: 12px;
+                        width: parent.width - 12px - 44px;
+                        text: root.mcp-config-json;
+                        color: Theme.text-primary;
+                        font-family: Theme.term-font-family;
+                        font-size: 12px * Theme.panel-font;
+                        wrap: char-wrap;
+                    }
+                    copy-btn := Rectangle {
+                        x: parent.width - self.width - 6px;
+                        y: 6px;
+                        width: 30px;
+                        height: 26px;
+                        border-radius: 5px;
+                        background: copy-ta.has-hover ? Theme.bg-hover : transparent;
+                        Text {
+                            text: root.mcp-json-copied ? "\u{E5CA}" : "\u{E14D}"; // check / content_copy
+                            font-family: "Material Icons";
+                            font-size: 16px * Theme.panel-font;
+                            color: root.mcp-json-copied ? Theme.success : Theme.text-secondary;
+                            width: 100%;
+                            height: 100%;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        copy-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.copy-text(root.mcp-config-json);
+                                root.mcp-json-copied = true;
+                            }
+                        }
+                    }
+                    // Flip the check back to the copy icon after a moment.
+                    Timer {
+                        interval: 1500ms;
+                        running: root.mcp-json-copied;
+                        triggered => { root.mcp-json-copied = false; }
+                    }
                 }
             }
 

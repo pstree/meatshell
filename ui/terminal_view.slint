@@ -307,6 +307,17 @@ export component TerminalView inherits Rectangle {
     in property <bool> sftp-available: true;
     in property <[TunnelInfo]> tunnels: [];
 
+    // Split (dual-pane) view: local folder on the left, remote on the right.
+    in property <bool> sftp-dual: false;
+    in property <string> sftp-local-path: "";
+    in property <[SftpEntry]> sftp-local-entries;
+    in property <string> sftp-local-status: "";
+    in property <bool> sftp-local-loading: false;
+    in property <int> sftp-local-selected-count;
+    // Split-view divider: 0 = even split (default), else an explicit width.
+    in property <length> sftp-local-pane-width: 0px;
+    callback persist-sftp-local-pane-width(length);
+
     // Per-session now (#v0.5): the AppWindow stores these in each TerminalState
     // and writes back via the set-* callbacks, so each tab/pane keeps its own SFTP
     // size + collapse state (resizing/collapsing one no longer affects the others).
@@ -404,6 +415,7 @@ export component TerminalView inherits Rectangle {
     callback sftp-download(string);
     callback sftp-open-file(string);                // double-click a file (#493)
     callback sftp-upload-clicked(string, bool);
+    callback sftp-paste-upload(string);             // upload clipboard files (#508)
     callback sftp-refresh(string);
     callback sftp-tree-expand(string);
     callback sftp-delete(string);
@@ -439,6 +451,20 @@ export component TerminalView inherits Rectangle {
     callback sftp-copy-path(string);
     callback sftp-new-folder(string);
     callback sftp-new-file(string);
+    // Split (dual-pane) view: local pane + two-way transfers.
+    callback sftp-toggle-dual();
+    callback sftp-local-navigate(string);
+    callback sftp-local-up();
+    callback sftp-local-home();
+    callback sftp-local-refresh();
+    callback sftp-local-open(string);
+    callback sftp-local-toggle-select(int);
+    callback sftp-local-select-range(int, int);
+    callback sftp-local-copy-path(string);
+    callback sftp-local-upload(string);
+    callback sftp-local-upload-selected();
+    callback sftp-download-to-local(string);
+    callback sftp-download-selected-to-local();
     callback paste-from-clipboard();
     callback copy-terminal-text();
     callback clear-terminal();              // wipe this session's screen buffer
@@ -2354,6 +2380,14 @@ export component TerminalView inherits Rectangle {
             download(path)      => { root.sftp-download(path); }
             open-file(path)     => { root.sftp-open-file(path); }
             upload-clicked(dir, folder) => { root.sftp-upload-clicked(dir, folder); }
+            paste-upload(dir)   => { root.sftp-paste-upload(dir); }
+            match-shortcut(t, c, m, a, s) => { return root.match-shortcut(t, c, m, a, s, false); }
+            // A key typed while the file list had focus belongs to the shell:
+            // send it and move focus back to the terminal.
+            forward-key(key, ctrl, alt, shift) => {
+                root.send-key(key, ctrl, alt, shift);
+                root.focus-pending = true;
+            }
             refresh(path)       => { root.sftp-refresh(path); }
             tree-expand(path)   => { root.sftp-tree-expand(path); }
             delete(path)        => { root.sftp-delete(path); }
@@ -2388,6 +2422,27 @@ export component TerminalView inherits Rectangle {
             copy-path(path)     => { root.sftp-copy-path(path); }
             new-folder(dir)     => { root.sftp-new-folder(dir); }
             new-file(dir)       => { root.sftp-new-file(dir); }
+            dual: root.sftp-dual;
+            local-path: root.sftp-local-path;
+            local-entries: root.sftp-local-entries;
+            local-status: root.sftp-local-status;
+            local-loading: root.sftp-local-loading;
+            local-selected-count: root.sftp-local-selected-count;
+            local-pane-default: root.sftp-local-pane-width;
+            persist-local-pane-width(v) => { root.persist-sftp-local-pane-width(v); }
+            toggle-dual()          => { root.sftp-toggle-dual(); }
+            local-navigate(path)   => { root.sftp-local-navigate(path); }
+            local-up()             => { root.sftp-local-up(); }
+            local-home()           => { root.sftp-local-home(); }
+            local-refresh()        => { root.sftp-local-refresh(); }
+            local-open(path)       => { root.sftp-local-open(path); }
+            local-toggle-select(i) => { root.sftp-local-toggle-select(i); }
+            local-select-range(a, b) => { root.sftp-local-select-range(a, b); }
+            local-copy-path(path)  => { root.sftp-local-copy-path(path); }
+            local-upload(path)     => { root.sftp-local-upload(path); }
+            local-upload-selected() => { root.sftp-local-upload-selected(); }
+            download-to-local(path) => { root.sftp-download-to-local(path); }
+            download-selected-to-local() => { root.sftp-download-selected-to-local(); }
         }
 
         // Drag-to-dock snap overlay — four edge zones; the one under the cursor

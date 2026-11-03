@@ -569,6 +569,7 @@ impl ConfigStore {
             key,
         };
         drop(load_lock);
+        store.apply_ssh_keepalive();
         // Persist the migration so it runs exactly once (and so a later opt-out —
         // e.g. turning the welcome sidebar back off — isn't reverted next launch).
         if migrated {
@@ -1401,6 +1402,8 @@ impl ConfigStore {
         self.cache.update_check_disabled = !enabled;
     }
     /// Update download mirrors; the built-in list until the user edits it.
+    /// Desktop only: headless builds have no `update` module.
+    #[cfg(not(feature = "headless"))]
     pub fn update_mirrors(&self) -> Vec<String> {
         self.cache.update_mirrors.clone().unwrap_or_else(|| {
             crate::update::mirror::DEFAULT_MIRRORS
@@ -1456,6 +1459,27 @@ impl ConfigStore {
     pub fn set_wallpaper_overlay(&mut self, v: f32) {
         self.cache.wallpaper_overlay = v.clamp(0.30, 1.0);
     }
+    /// Colour theme preset id; "" = the default MeatShell palette.
+    pub fn color_theme(&self) -> &str {
+        &self.cache.color_theme
+    }
+    pub fn set_color_theme(&mut self, id: impl Into<String>) {
+        self.cache.color_theme = id.into();
+    }
+    /// `#RRGGBB` of the custom colour theme ("" = not set yet).
+    pub fn color_theme_custom(&self) -> &str {
+        &self.cache.color_theme_custom
+    }
+    pub fn set_color_theme_custom(&mut self, hex: impl Into<String>) {
+        self.cache.color_theme_custom = hex.into();
+    }
+    /// Whether a wallpaper recolours the interface (on by default).
+    pub fn immersive_colors(&self) -> bool {
+        !self.cache.immersive_colors_disabled
+    }
+    pub fn set_immersive_colors(&mut self, on: bool) {
+        self.cache.immersive_colors_disabled = !on;
+    }
     pub fn panel_font(&self) -> u32 {
         if self.cache.panel_font == 0 {
             100
@@ -1465,6 +1489,45 @@ impl ConfigStore {
     }
     pub fn set_panel_font(&mut self, percent: u32) {
         self.cache.panel_font = percent.clamp(80, 160);
+    }
+    /// SSH keepalive on/off (Settings › Connection, #515). On by default.
+    pub fn ssh_keepalive_enabled(&self) -> bool {
+        !self.cache.ssh_keepalive_disabled
+    }
+    /// Seconds of server silence before a keepalive is sent.
+    pub fn ssh_keepalive_interval(&self) -> u32 {
+        let (lo, hi) = crate::ssh::KEEPALIVE_INTERVAL_RANGE;
+        match self.cache.ssh_keepalive_interval {
+            0 => crate::ssh::KEEPALIVE_DEFAULT_INTERVAL,
+            v => v.clamp(lo, hi),
+        }
+    }
+    /// Unanswered keepalives before a connection counts as dead.
+    pub fn ssh_keepalive_max(&self) -> u32 {
+        let (lo, hi) = crate::ssh::KEEPALIVE_MAX_RANGE;
+        match self.cache.ssh_keepalive_max {
+            0 => crate::ssh::KEEPALIVE_DEFAULT_MAX,
+            v => v.clamp(lo, hi),
+        }
+    }
+    /// Store the keepalive setting and apply it to connections opened from
+    /// now on (existing connections keep the values they were opened with).
+    pub fn set_ssh_keepalive(&mut self, enabled: bool, interval_secs: u32, max_missed: u32) {
+        let (lo, hi) = crate::ssh::KEEPALIVE_INTERVAL_RANGE;
+        self.cache.ssh_keepalive_disabled = !enabled;
+        self.cache.ssh_keepalive_interval = interval_secs.clamp(lo, hi);
+        let (lo, hi) = crate::ssh::KEEPALIVE_MAX_RANGE;
+        self.cache.ssh_keepalive_max = max_missed.clamp(lo, hi);
+        self.apply_ssh_keepalive();
+    }
+    /// Push the saved keepalive into the SSH layer. Called on load so the
+    /// GUI, `meatshell mcp serve` and automation all use the saved value.
+    fn apply_ssh_keepalive(&self) {
+        crate::ssh::set_keepalive(
+            self.ssh_keepalive_enabled(),
+            self.ssh_keepalive_interval(),
+            self.ssh_keepalive_max(),
+        );
     }
     pub fn sftp_panel_width(&self) -> f32 {
         let w = self.cache.sftp_panel_width;
@@ -2633,6 +2696,27 @@ mod tests {
         assert!(!store.paste_confirm_enabled());
         assert!(!store.extra_paste_shortcuts_enabled());
         assert!(store.zen_mode());
+    }
+
+    #[test]
+    fn issue_515_ssh_keepalive_defaults_on_and_clamps() {
+        let mut store = temp_store();
+        // Configs written before #515 keep the 30 s / 3 keepalive from #160.
+        store.cache = serde_json::from_str("{}").unwrap();
+        assert!(store.ssh_keepalive_enabled());
+        assert_eq!(store.ssh_keepalive_interval(), 30);
+        assert_eq!(store.ssh_keepalive_max(), 3);
+
+        store.set_ssh_keepalive(false, 1, 0);
+        assert!(!store.ssh_keepalive_enabled());
+        assert_eq!(store.ssh_keepalive_interval(), 5);
+        assert_eq!(store.ssh_keepalive_max(), 2);
+        store.set_ssh_keepalive(true, 9_999, 99);
+        assert_eq!(store.ssh_keepalive_interval(), 300);
+        assert_eq!(store.ssh_keepalive_max(), 10);
+
+        // The setter also updates the process-wide SSH setting; put it back.
+        store.set_ssh_keepalive(true, 30, 3);
     }
 
     #[test]

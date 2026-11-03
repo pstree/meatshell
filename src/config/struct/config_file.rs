@@ -304,9 +304,30 @@ pub struct ConfigFile {
     /// Interface › Wallpaper opacity slider. 0 = use the current default.
     #[serde(default)]
     pub wallpaper_overlay: f32,
+    /// Colour theme preset id (Settings › Wallpaper & theme). Empty = default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub color_theme: String,
+    /// `#RRGGBB` for the "custom" colour theme.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub color_theme_custom: String,
+    /// Turn off immersive colours: a wallpaper stays, but no longer recolours
+    /// the interface or switches light/dark. Default false keeps them on.
+    #[serde(default)]
+    pub immersive_colors_disabled: bool,
     /// Settings-panel font scale, percent (80–160). 0 = 100% default (v0.5).
     #[serde(default)]
     pub panel_font: u32,
+    /// Turn off SSH keepalives (Settings › Connection, #515). Default false =
+    /// keepalive on, as since #160.
+    #[serde(default)]
+    pub ssh_keepalive_disabled: bool,
+    /// Seconds of server silence before a keepalive is sent. 0 = default (30).
+    #[serde(default)]
+    pub ssh_keepalive_interval: u32,
+    /// Unanswered keepalives before the connection is treated as dead.
+    /// 0 = default (3).
+    #[serde(default)]
+    pub ssh_keepalive_max: u32,
     /// Disable the startup "new version available" check (#184). Default false =
     /// keep checking (preserves existing behaviour for upgrading users); turning
     /// it on stops the GitHub releases query and the banner.

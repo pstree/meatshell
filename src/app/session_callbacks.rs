@@ -227,6 +227,17 @@ pub(super) fn wire_session_callbacks(
             w.set_dialog_rdp_resolution(RDP_RESOLUTION_DEFAULT.into());
             w.set_dialog_rdp_width("1280".into());
             w.set_dialog_rdp_height("720".into());
+            w.set_dialog_rdp_legacy_tls(false);
+            w.set_dialog_rdp_admin(false);
+            w.set_dialog_rdp_smart_sizing(false);
+            w.set_dialog_rdp_cert_policy("ignore".into());
+            w.set_dialog_rdp_network("auto".into());
+            w.set_dialog_rdp_sound(false);
+            w.set_dialog_rdp_clipboard(true);
+            w.set_dialog_rdp_gfx(false);
+            w.set_dialog_rdp_extra_args("".into());
+            w.set_dialog_rdp_show_advanced(false);
+            w.set_dialog_rdp_preview("".into());
             w.set_dialog_encoding("UTF-8".into());
             w.set_dialog_vt100_drawing(false);
             w.set_dialog_term_type(crate::config::DEFAULT_TERM_TYPE.into());
@@ -503,6 +514,17 @@ pub(super) fn wire_session_callbacks(
                 );
                 w.set_dialog_rdp_width(session.rdp_width.to_string().into());
                 w.set_dialog_rdp_height(session.rdp_height.to_string().into());
+                w.set_dialog_rdp_legacy_tls(session.rdp_legacy_tls);
+                w.set_dialog_rdp_admin(session.rdp_admin);
+                w.set_dialog_rdp_smart_sizing(session.rdp_smart_sizing);
+                w.set_dialog_rdp_cert_policy(session.rdp_cert_policy.clone().into());
+                w.set_dialog_rdp_network(session.rdp_network.clone().into());
+                w.set_dialog_rdp_sound(session.rdp_sound);
+                w.set_dialog_rdp_clipboard(session.rdp_clipboard);
+                w.set_dialog_rdp_gfx(session.rdp_gfx);
+                w.set_dialog_rdp_extra_args(session.rdp_extra_args.clone().into());
+                w.set_dialog_rdp_show_advanced(!session.rdp_extra_args.is_empty());
+                w.set_dialog_rdp_preview("".into());
                 w.set_dialog_encoding(session.encoding.clone().into());
                 w.set_dialog_vt100_drawing(session.vt100_drawing);
                 w.set_dialog_term_type(session.effective_term_type().into());
@@ -839,6 +861,14 @@ pub(super) fn wire_session_callbacks(
             // Saving and testing use the same draft conversion, including blank-secret retention.
             let existing = store.borrow().get(&id).cloned();
             let new_session = session_from_draft(&draft, existing.as_ref(), forwards, triggers);
+            if new_session.kind == crate::config::SessionKind::Rdp {
+                if let Err(message) = crate::rdp::validate_options(&new_session) {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_dialog_test_status(message.into());
+                    }
+                    return;
+                }
+            }
             if let Err(err) = store.borrow().resolve_jump_chain(&new_session) {
                 if let Some(w) = weak.upgrade() {
                     w.set_dialog_test_status(err.to_string().into());
@@ -863,6 +893,15 @@ pub(super) fn wire_session_callbacks(
             }
         });
     }
+
+    // Preview from unsaved draft; the saved password is never rendered.
+    window.on_session_dialog_preview_rdp(move |draft: SessionDraft| {
+        let session = session_from_draft(&draft, None, Vec::new(), Vec::new());
+        if session.kind != crate::config::SessionKind::Rdp {
+            return String::new().into();
+        }
+        crate::rdp::preview_args(&session).unwrap_or_else(|message| message).into()
+    });
 
     // Test connection from the session dialog. SSH tests use the same handshake,
     // host-key verification, proxy/jump routing, and authentication as a real
@@ -1320,6 +1359,8 @@ pub(super) fn wire_session_callbacks(
                 title: tab_title.into(),
                 kind: "terminal".into(),
                 connected: false,
+                // Local shells offer "Add to session list" (#501).
+                local: session.kind == SessionKind::Local,
             });
             // Each session keeps its own SFTP collapse state + sizes, seeded from
             // the global defaults (the "collapse SFTP by default" pref and the
@@ -1375,6 +1416,18 @@ pub(super) fn wire_session_callbacks(
                     super::sftp_places::string_model(&places.recent)
                 },
                 sftp_bookmarked: false,
+                // Split view starts off; the local pane remembers the home
+                // folder until it is first opened (listing is lazy).
+                sftp_dual: false,
+                sftp_local_path: home_display().into(),
+                sftp_local_entries: ModelRc::from(std::rc::Rc::new(
+                    VecModel::<SftpEntry>::default(),
+                )),
+                sftp_local_status: "".into(),
+                sftp_local_loading: false,
+                sftp_local_selected_count: 0,
+                // 0 = an even local/remote split; set when the divider is dragged.
+                sftp_local_pane_width: 0.0,
                 font_size: 0,
                 tunnels: ModelRc::from(std::rc::Rc::new(VecModel::<TunnelInfo>::default())),
                 sftp_collapsed: !has_sftp || sftp_collapsed_default,
@@ -1637,12 +1690,16 @@ pub(super) fn listen_for_config_changes(ctx: &WinCtx, sessions_model: &Rc<VecMod
                 w.invoke_refresh_agent_launchers();
                 // Re-apply the theme to the chrome AND every open terminal buffer.
                 apply_dark_mode(&w, &bufs, theme_pref_is_dark(&store.borrow()));
+                // Colour theme preset + immersive switch (Wallpaper & theme).
+                super::color_theme::apply_color_theme(&w, &store.borrow());
                 // Language translations are process-global; refresh our flag only.
                 w.set_lang_en(crate::i18n::is_en());
                 // Command-bar visibility is a global preference.
                 w.set_cmd_bar_hidden(store.borrow().cmd_bar_hidden());
                 // Persisted terminal font size (settings stepper) is global too.
                 w.set_term_font_size(store.borrow().font_size() as f32);
+                // SSH keepalive (#515) is a client-wide setting.
+                super::settings_callbacks::sync_ssh_keepalive(&w, &store.borrow());
                 // Docked vs detached editor (#494) is a global preference.
                 w.set_editor_embedded(store.borrow().editor_embedded());
                 if let Some(editor) = editor_weak.upgrade() {

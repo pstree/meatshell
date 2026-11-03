@@ -14,7 +14,7 @@ import "fonts/MeatshellMono-Regular.ttf";
 import "fonts/MeatshellMono-Bold.ttf";
 import "fonts/MaterialIcons-Regular.ttf";
 
-import { Theme } from "theme.slint";
+import { Theme, ThemePalette } from "theme.slint";
 import { Sidebar, DiskInfo } from "sidebar.slint";
 import { TabBar, TabInfo, LaunchItem } from "tabs.slint";
 import { Welcome, SessionInfo } from "welcome.slint";
@@ -28,12 +28,12 @@ import { ProcWindow, ProcRow } from "proc_window.slint";
 import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
 import { EditorWindow } from "editor_window.slint";
 import { EditorPane, EditorFindResult, EditorDoc } from "editor_pane.slint";
-import { InterfacePanel, OutputRuleItem, WslProfileInfo, CustomAgentInfo, UpdateMirrorRow } from "interface_panel.slint";
+import { InterfacePanel, OutputRuleItem, WslProfileInfo, CustomAgentInfo, UpdateMirrorRow, ColorThemeItem } from "interface_panel.slint";
 // Re-export so `slint::include_modules!` generates the detached Rust window types.
 export { ProcWindow, SystemInfoWindow, EditorWindow }
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
-export { SessionInfo, LaunchItem, SessionDraft, JumpHop, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd, WslProfileInfo, CustomAgentInfo, UpdateMirrorRow, EditorFindResult }
+export { SessionInfo, LaunchItem, SessionDraft, JumpHop, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd, WslProfileInfo, CustomAgentInfo, UpdateMirrorRow, ThemePalette, ColorThemeItem, EditorFindResult }
 
 // --- TerminalState ---------------------------------------------------------
 // Per-terminal view-model exposed to Rust. A TabInfo has the metadata; the
@@ -88,6 +88,16 @@ export struct TerminalState {
     sftp-bookmarks: [string],   // this session's bookmarked folders (#500)
     sftp-recent: [string],      // recently visited folders, newest first (#500)
     sftp-bookmarked: bool,      // current sftp-path is bookmarked (#500)
+    // Split view (dual pane): the left half browses this machine's filesystem,
+    // the right half keeps the remote listing. Local state lives per tab so
+    // switching tabs returns to the folder you left.
+    sftp-dual: bool,
+    sftp-local-path: string,
+    sftp-local-entries: [SftpEntry],
+    sftp-local-status: string,
+    sftp-local-loading: bool,
+    sftp-local-selected-count: int,
+    sftp-local-pane-width: length,   // 0 = even split; set by dragging the divider
     font-size: int,             // per-session zoom override in px (0 = follow window)
     tunnels: [TunnelInfo],      // runtime SSH tunnels (#206)
     sftp-collapsed: bool,       // SFTP panel minimised — per session (#v0.5)
@@ -711,6 +721,17 @@ export component AppWindow inherits Window {
     // User-adjustable wallpaper overlay opacity (0.30–1.00), persisted.
     in-out property <float> wallpaper-overlay <=> Theme.panel-alpha;
     callback persist-wallpaper-overlay(float);
+    // Colour theme presets + the immersive-colours switch (Settings ›
+    // Wallpaper & theme). Rust fills the palettes from the chosen preset.
+    in-out property <ThemePalette> theme-palette-dark <=> Theme.palette-dark;
+    in-out property <ThemePalette> theme-palette-light <=> Theme.palette-light;
+    in-out property <bool> immersive-colors <=> Theme.immersive;
+    in property <[ColorThemeItem]> color-themes;
+    in-out property <string> color-theme: "default";
+    in-out property <string> color-theme-custom: "#4A90E2";
+    callback set-color-theme(string);
+    callback set-color-theme-custom(string) -> bool;
+    callback set-immersive-colors(bool);
     in property <[string]> term-fonts;             // installed monospace families
     in-out property <bool> interface-open: false;  // Interface settings overlay
     // Interface card position (draggable by its title bar, clamped inside the
@@ -793,6 +814,11 @@ export component AppWindow inherits Window {
     callback set-paste-confirm-enabled(bool);
     in-out property <bool> extra-paste-shortcuts-enabled: true;
     callback set-extra-paste-shortcuts-enabled(bool);
+    // SSH keepalive (Settings › Connection, #515).
+    in-out property <bool> ssh-keepalive-enabled: true;
+    in-out property <int> ssh-keepalive-interval: 30;
+    in-out property <int> ssh-keepalive-max: 3;
+    callback set-ssh-keepalive(bool, int, int);
     in-out property <bool> zen-mode: false;
     callback set-zen-mode(bool);
     // Zen empties/restores the whole dock stack without resizing the frame, so
@@ -831,6 +857,8 @@ export component AppWindow inherits Window {
     in-out property <bool> mcp-use-saved-credentials: true;
     in-out property <bool> mcp-allow-commands: true;
     in-out property <bool> mcp-allow-file-transfers: true;
+    // MCP client config snippet shown in Settings › MCP (set by Rust).
+    in property <string> mcp-config-json;
     callback set-mcp-permissions(bool, bool, bool, bool);
     callback add-wsl-profile(string, string, string);
     callback remove-wsl-profile(string);
@@ -1106,6 +1134,17 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-rdp-resolution: "1280x720";
     in-out property <string> dialog-rdp-width: "1280";
     in-out property <string> dialog-rdp-height: "720";
+    in-out property <bool> dialog-rdp-legacy-tls: false;
+    in-out property <bool> dialog-rdp-admin: false;
+    in-out property <bool> dialog-rdp-smart-sizing: false;
+    in-out property <string> dialog-rdp-cert-policy: "ignore";
+    in-out property <string> dialog-rdp-network: "auto";
+    in-out property <bool> dialog-rdp-sound: false;
+    in-out property <bool> dialog-rdp-clipboard: true;
+    in-out property <bool> dialog-rdp-gfx: false;
+    in-out property <string> dialog-rdp-extra-args: "";
+    in-out property <bool> dialog-rdp-show-advanced: false;
+    in-out property <string> dialog-rdp-preview: "";
     in-out property <string> dialog-encoding: "UTF-8";
     in-out property <bool> dialog-vt100-drawing: false;
     in-out property <string> dialog-term-type: "xterm-256color";
@@ -1182,6 +1221,7 @@ export component AppWindow inherits Window {
     callback remove-session(string /* session-id */);
     callback session-dialog-submit(SessionDraft);
     callback session-dialog-test(SessionDraft);
+    callback session-dialog-preview-rdp(SessionDraft) -> string;
     callback session-dialog-cancel();
     callback session-dialog-closed();
     callback session-dialog-stop-test();
@@ -1223,6 +1263,8 @@ export component AppWindow inherits Window {
     // Rename an open session's tab. Request pre-fills the dialog (Rust reads
     // the current title); submit applies the new display name.
     callback tab-rename-request(string /* tab-id */);
+    // Save the ssh connection running in a local tab as a session (#501).
+    callback tab-save-session(string /* tab-id */);
     callback rename-tab(string /* tab-id */, string /* new-title */);
     in-out property <bool> tab-rename-open: false;
     in-out property <string> tab-rename-id: "";
@@ -1293,6 +1335,8 @@ export component AppWindow inherits Window {
     callback sftp-open-file(string /* tab-id */, string /* remote-path */);   // (#493)
     // Trigger an upload: Rust opens a file-picker dialog then transfers.
     callback sftp-upload-clicked(string /* tab-id */, string /* remote-dir */, bool /* folder */);
+    // Upload the files / folders on the OS clipboard (#508).
+    callback sftp-paste-upload(string /* tab-id */, string /* remote-dir */);
     // Refresh the current directory listing.
     callback sftp-refresh(string /* tab-id */, string /* path */);
     // Toggle expand/collapse of a tree node (also navigates to that directory).
@@ -1330,6 +1374,25 @@ export component AppWindow inherits Window {
     in-out property <string> sftp-prompt-value;  // user input
     callback sftp-prompt-submit(string /* tab */, string /* kind */, string /* target */, string /* value */);
     callback sftp-copy-path(string);             // put the path on the clipboard
+
+    // --- Split (dual-pane) SFTP view --------------------------------------
+    // The left pane browses local folders, the right pane the remote host; the
+    // transfer buttons in between copy the checked (or clicked) entries.
+    callback sftp-toggle-dual(string /* tab-id */);
+    callback sftp-local-navigate(string /* tab-id */, string /* path */);   // "..", "~" or a path
+    callback sftp-local-up(string /* tab-id */);
+    callback sftp-local-home(string /* tab-id */);
+    callback sftp-local-refresh(string /* tab-id */);
+    callback sftp-local-open(string /* tab-id */, string /* local-path */);  // OS default app
+    callback sftp-local-toggle-select(string /* tab-id */, int /* row */);
+    callback sftp-local-select-range(string /* tab-id */, int /* from */, int /* to */);
+    callback sftp-local-copy-path(string /* local-path */);
+    callback sftp-local-upload(string /* tab-id */, string /* local-path */);
+    callback sftp-local-upload-selected(string /* tab-id */);
+    callback sftp-download-to-local(string /* tab-id */, string /* remote-path */);
+    callback sftp-download-selected-to-local(string /* tab-id */);
+    // Split-view divider moved (0 = back to an even split).
+    callback persist-sftp-local-pane-width(string /* tab-id */, length /* px */);
 
     // Visual chmod dialog (#84). Rust decomposes the current mode into nine
     // bools when opening and recomposes on apply (Slint has no bitwise ops).
@@ -2052,6 +2115,7 @@ export component AppWindow inherits Window {
                         merge-pane() => { root.pane-merge(pane.id); }
                         tab-duplicate(id) => { root.tab-duplicate(id); }
                         tab-rename-request(id) => { root.tab-rename-request(id); }
+                        tab-save-session(id) => { root.tab-save-session(id); }
                         tab-drag-move(id, ax, ay, own-strip) => {
                             root.tab-drag-px = ax - pane-area.absolute-position.x;
                             root.tab-drag-py = ay - pane-area.absolute-position.y;
@@ -2187,6 +2251,16 @@ export component AppWindow inherits Window {
                         sftp-sort-key: term.sftp-sort-key;
                         sftp-sort-dir: term.sftp-sort-dir;
                         sftp-available: term.sftp-available;
+                        sftp-dual: term.sftp-dual;
+                        sftp-local-path: term.sftp-local-path;
+                        sftp-local-entries: term.sftp-local-entries;
+                        sftp-local-status: term.sftp-local-status;
+                        sftp-local-loading: term.sftp-local-loading;
+                        sftp-local-selected-count: term.sftp-local-selected-count;
+                        sftp-local-pane-width: term.sftp-local-pane-width;
+                        persist-sftp-local-pane-width(v) => {
+                            root.persist-sftp-local-pane-width(term.id, v);
+                        }
                         tunnels: term.tunnels;
                         quick-commands: root.quick-commands;
                         quick-sidebar-enabled: root.quick-commands-as-sidebar;
@@ -2252,6 +2326,7 @@ export component AppWindow inherits Window {
                         sftp-download(path) => { root.sftp-download(term.id, path); }
                         sftp-open-file(path) => { root.sftp-open-file(term.id, path); }
                         sftp-upload-clicked(dir, folder) => { root.sftp-upload-clicked(term.id, dir, folder); }
+                        sftp-paste-upload(dir) => { root.sftp-paste-upload(term.id, dir); }
                         sftp-refresh(path) => { root.sftp-refresh(term.id, path); }
                         sftp-tree-expand(path) => { root.sftp-tree-expand(term.id, path); }
                         sftp-toggle-select(i) => { root.sftp-toggle-select(term.id, i); }
@@ -2306,6 +2381,19 @@ export component AppWindow inherits Window {
                             root.sftp-chmod-open(term.id, path, name, mode);
                         }
                         sftp-copy-path(path) => { root.sftp-copy-path(path); }
+                        sftp-toggle-dual() => { root.sftp-toggle-dual(term.id); }
+                        sftp-local-navigate(path) => { root.sftp-local-navigate(term.id, path); }
+                        sftp-local-up() => { root.sftp-local-up(term.id); }
+                        sftp-local-home() => { root.sftp-local-home(term.id); }
+                        sftp-local-refresh() => { root.sftp-local-refresh(term.id); }
+                        sftp-local-open(path) => { root.sftp-local-open(term.id, path); }
+                        sftp-local-toggle-select(i) => { root.sftp-local-toggle-select(term.id, i); }
+                        sftp-local-select-range(a, b) => { root.sftp-local-select-range(term.id, a, b); }
+                        sftp-local-copy-path(path) => { root.sftp-local-copy-path(path); }
+                        sftp-local-upload(path) => { root.sftp-local-upload(term.id, path); }
+                        sftp-local-upload-selected() => { root.sftp-local-upload-selected(term.id); }
+                        sftp-download-to-local(path) => { root.sftp-download-to-local(term.id, path); }
+                        sftp-download-selected-to-local() => { root.sftp-download-selected-to-local(term.id); }
                         sftp-new-folder(dir) => {
                             root.sftp-prompt-kind = "mkdir";
                             root.sftp-prompt-tab = term.id;
@@ -4667,6 +4755,17 @@ export component AppWindow inherits Window {
         draft-rdp-resolution <=> root.dialog-rdp-resolution;
         draft-rdp-width <=> root.dialog-rdp-width;
         draft-rdp-height <=> root.dialog-rdp-height;
+        draft-rdp-legacy-tls <=> root.dialog-rdp-legacy-tls;
+        draft-rdp-admin <=> root.dialog-rdp-admin;
+        draft-rdp-smart-sizing <=> root.dialog-rdp-smart-sizing;
+        draft-rdp-cert-policy <=> root.dialog-rdp-cert-policy;
+        draft-rdp-network <=> root.dialog-rdp-network;
+        draft-rdp-sound <=> root.dialog-rdp-sound;
+        draft-rdp-clipboard <=> root.dialog-rdp-clipboard;
+        draft-rdp-gfx <=> root.dialog-rdp-gfx;
+        draft-rdp-extra-args <=> root.dialog-rdp-extra-args;
+        show-rdp-advanced <=> root.dialog-rdp-show-advanced;
+        rdp-preview <=> root.dialog-rdp-preview;
         draft-encoding <=> root.dialog-encoding;
         draft-vt100-drawing <=> root.dialog-vt100-drawing;
         draft-term-type <=> root.dialog-term-type;
@@ -4680,6 +4779,7 @@ export component AppWindow inherits Window {
         triggers: root.dialog-triggers;
         submit(draft) => { root.session-dialog-submit(draft); }
         test-connection(draft) => { root.session-dialog-test(draft); }
+        preview-rdp(draft) => { root.session-dialog-preview-rdp(draft) }
         cancel => { root.session-dialog-cancel(); }
         closed => { root.session-dialog-closed(); }
         stop-test => { root.session-dialog-stop-test(); }
@@ -5149,6 +5249,9 @@ export component AppWindow inherits Window {
                     session-log-dir-custom: root.session-log-dir-custom;
                     paste-confirm-enabled <=> root.paste-confirm-enabled;
                     extra-paste-shortcuts-enabled <=> root.extra-paste-shortcuts-enabled;
+                    ssh-keepalive-enabled <=> root.ssh-keepalive-enabled;
+                    ssh-keepalive-interval <=> root.ssh-keepalive-interval;
+                    ssh-keepalive-max <=> root.ssh-keepalive-max;
                     zen-mode <=> root.zen-mode;
                     welcome-as-sidebar <=> root.welcome-as-sidebar;
                     quick-commands-as-sidebar <=> root.quick-commands-as-sidebar;
@@ -5178,6 +5281,8 @@ export component AppWindow inherits Window {
                     mcp-use-saved-credentials <=> root.mcp-use-saved-credentials;
                     mcp-allow-commands <=> root.mcp-allow-commands;
                     mcp-allow-file-transfers <=> root.mcp-allow-file-transfers;
+                    mcp-config-json: root.mcp-config-json;
+                    copy-text(t) => { root.copy-text(t); }
                     wallpaper-overlay <=> root.wallpaper-overlay;
                     current-wallpaper: root.current-wallpaper;
                     custom-wallpaper-name: root.custom-wallpaper-name;
@@ -5190,6 +5295,13 @@ export component AppWindow inherits Window {
                     agent-new-directory <=> root.agent-new-directory;
                     set-wallpaper(v) => { root.set-wallpaper(v); }
                     pick-wallpaper-file() => { root.pick-wallpaper-file(); }
+                    color-themes: root.color-themes;
+                    color-theme: root.color-theme;
+                    color-theme-custom <=> root.color-theme-custom;
+                    immersive-colors: root.immersive-colors;
+                    set-color-theme(id) => { root.set-color-theme(id); }
+                    set-color-theme-custom(hex) => { root.set-color-theme-custom(hex) }
+                    set-immersive-colors(v) => { root.set-immersive-colors(v); }
                     set-term-font(v) => { root.set-term-font(v); }
                     set-term-font-size(v) => { root.set-term-font-size(v); }
                     set-terminal-line-spacing(v) => { root.set-terminal-line-spacing(v); }
@@ -5230,6 +5342,7 @@ export component AppWindow inherits Window {
                     open-session-log-dir => { root.open-session-log-dir(); }
                     set-paste-confirm-enabled(v) => { root.set-paste-confirm-enabled(v); }
                     set-extra-paste-shortcuts-enabled(v) => { root.set-extra-paste-shortcuts-enabled(v); }
+                    set-ssh-keepalive(on, interval, max) => { root.set-ssh-keepalive(on, interval, max); }
                     set-zen-mode(v) => { root.set-zen-mode(v); }
                     set-welcome-as-sidebar(v) => { root.set-welcome-as-sidebar(v); }
                     set-quick-commands-as-sidebar(v) => {

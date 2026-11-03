@@ -98,13 +98,14 @@ open /Applications/meatshell.app
     / `~/.config/meatshell/sessions.json` (Linux)
     / `~/Library/Application Support/meatshell/sessions.json` (macOS)
 - [x] SSH (`russh`, pure Rust): password / private key / encrypted key (passphrase)
-- [x] SFTP browser + upload / download (drag-and-drop) + in-terminal ZMODEM (`sz` download / `rz` multi-file upload)
+- [x] SFTP browser + upload / download (drag-and-drop) + split local/remote view (drag between panes) + in-terminal ZMODEM (`sz` download / `rz` multi-file upload)
 - [x] SSH port forwarding / tunnels: local -L / remote -R / dynamic -D (SOCKS5)
   - The connected session's Tunnels panel can add, stop, restart, and delete forwards. Rules can be saved to the SSH session with optional automatic startup on reconnect.
 - [x] System tray: closing the main window keeps sessions running; restore or create a window from the tray, or choose Quit to exit.
 - [x] Quick commands + command box (broadcast to all sessions) + command history
 - [x] Serial / Telnet sessions
 - [x] RDP remote desktop: stores host / port / user / password / domain with a resolution choice (full screen / common sizes / custom) and hands the session to a remote desktop client (`mstsc` on Windows; FreeRDP's `xfreerdp3` / `xfreerdp` on Linux / macOS — install it yourself, or use the Flatpak build, which bundles it)
+  - On Linux / macOS, each RDP session can select certificate policy, network profile, sound, clipboard, GFX, and legacy TLS compatibility. Advanced arguments accept one native FreeRDP argument per line (for example `/bpp:24` or `/drive:share,/tmp/path`) or supported aliases such as `network=lan`, `sound=on`, `网络=局域网`, and `音频=开`. Preview shows the final argument list without the saved password. Host, identity, certificate, and display switches cannot be overridden there; passwords stay on stdin. These FreeRDP options do not apply to Windows `mstsc`.
 - [x] Outbound proxy (SOCKS5 / HTTP)
 - [x] Import `~/.ssh/config`
 - [x] Session passwords encrypted at rest (ChaCha20-Poly1305)
