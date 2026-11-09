@@ -46,6 +46,7 @@ mod shortcuts;
 mod sidebar;
 mod single_instance;
 mod tab_callbacks;
+mod tab_session_log;
 mod tab_transfer;
 mod term_output;
 mod terminal_ui;
@@ -94,7 +95,7 @@ use self::window_events::*;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 #[path = "../tests/app/terminal_ingest/mod.rs"]
@@ -134,7 +135,7 @@ use crate::terminal::{
 #[cfg(test)]
 use crate::terminal::{
     build_row, highlight_plain_output, log_level_marker, normalize_pasted_newlines,
-    text_cell_width, vt_span_colors, CompiledOutputRule, HistSpan, Line,
+    text_cell_width, vt_span_colors, CompiledOutputRule, HistLine, HistSpan, Line,
 };
 #[cfg(any(target_os = "windows", test))]
 use crate::terminal::{windows_process_ctrl_release, CtrlKeySide};

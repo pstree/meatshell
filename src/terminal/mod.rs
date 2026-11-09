@@ -45,7 +45,7 @@ pub(crate) use input::{
     store_pending_paste, take_pending_paste, terminal_uses_bracketed_paste, PendingPaste,
 };
 pub(crate) use charset::CharsetTracker;
-pub(crate) use session_log::{SessionLogSpec, SessionLogger};
+pub(crate) use session_log::{default_log_stem, SessionLogSpec, SessionLogger};
 pub(crate) use encoding::TerminalEncoding;
 pub(crate) use glyph_fallback::{
     install_glyph_fallback, Coverage, GlyphFallback, BUNDLED_TERM_FONT,
@@ -64,6 +64,6 @@ pub(crate) use render::{
     RAW_CAP,
 };
 pub(crate) use state::{
-    BuiltScreen, CompiledOutputRule, CsiState, HistSpan, Line, OutputHighlightPreset, RenderGates,
-    TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
+    BuiltScreen, CompiledOutputRule, CsiState, HistLine, HistSpan, Line, OutputHighlightPreset,
+    RenderGates, TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
 };

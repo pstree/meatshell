@@ -60,6 +60,7 @@ fn terminal(
         is_alt_screen: false,
         mouse_tracked: false,
         find_matches: ModelRc::from(Rc::new(VecModel::default())),
+        find_current: Default::default(),
         selection: ModelRc::from(Rc::new(VecModel::default())),
         sftp_path: "/home/me".into(),
         sftp_entries: ModelRc::from(Rc::new(VecModel::from(remote_entries))),
@@ -80,6 +81,11 @@ fn terminal(
         sftp_local_loading: false,
         sftp_local_selected_count: 0,
         sftp_local_pane_width: local_pane_width,
+        sftp_local_quick_places: ModelRc::from(Rc::new(VecModel::default())),
+        sftp_local_drive_places: ModelRc::from(Rc::new(VecModel::default())),
+        sftp_local_bookmarks: ModelRc::from(Rc::new(VecModel::default())),
+        sftp_local_recent: ModelRc::from(Rc::new(VecModel::default())),
+        sftp_local_bookmarked: false,
         font_size: 0,
         tunnels: ModelRc::from(Rc::new(VecModel::default())),
         sftp_collapsed: false,
@@ -254,6 +260,69 @@ fn split_view_defaults_to_an_even_split() {
             "divider at x={} should be in the middle (550)",
             best.0
         );
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn split_view_honours_the_remembered_ratio() {
+    // A divider share saved from a previous session (#532) must place the
+    // divider and the OS-drop hit test at the same x.
+    std::thread::spawn(|| {
+        let (ui, window) = build_ui(true, 300.0, 0.0, 1100, 800, "bottom");
+        ui.set_sftp_local_split(0.3);
+        let pixels = render_frame(&window, 1100, 800);
+        let width = 1100usize;
+        let is_border = |pixel: Rgb8Pixel| {
+            pixel.r.abs_diff(58) < 8 && pixel.g.abs_diff(61) < 8 && pixel.b.abs_diff(70) < 8
+        };
+        let mut best = (0usize, 0usize);
+        for x in 120..980 {
+            let count = (520..780).filter(|&y| is_border(pixels[y * width + x])).count();
+            if count > best.1 {
+                best = (x, count);
+            }
+        }
+        assert!(best.1 > 120, "split divider not found (best {best:?})");
+        assert!(
+            (best.0 as i32 - 330).abs() <= 8,
+            "divider at x={} should honour a 30% share (330)",
+            best.0
+        );
+        let (_, rect) = active_sftp_local_pane_rect(&ui).expect("local half");
+        assert!(
+            (rect.w - 330.0).abs() <= 8.0,
+            "hit-test width {} should match the 30% share",
+            rect.w
+        );
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn local_places_are_mirrored_into_tabs() {
+    // The bookmarks / recent lists are machine-wide AppWindow properties; every
+    // tab keeps a copy for its menu, and the star follows the folder it shows.
+    std::thread::spawn(|| {
+        let (ui, _window) = build_ui(true, 300.0, 0.0, 1100, 800, "bottom");
+        let folder = SharedString::from("C:\\Users\\me\\work");
+        ui.set_local_bookmarks(ModelRc::from(Rc::new(VecModel::from(vec![folder.clone()]))));
+        ui.set_local_recent(ModelRc::from(Rc::new(VecModel::from(vec![folder]))));
+        publish_local_places(&ui);
+
+        let terminals = ui.get_terminals();
+        let model = terminals
+            .as_any()
+            .downcast_ref::<VecModel<TerminalState>>()
+            .expect("terminals model");
+        let row = model.row_data(0).expect("tab");
+        assert_eq!(row.sftp_local_bookmarks.row_count(), 1);
+        assert_eq!(row.sftp_local_recent.row_count(), 1);
+        // The harness tab is showing that same folder, so the star lights up.
+        #[cfg(windows)]
+        assert!(row.sftp_local_bookmarked, "the current folder is bookmarked");
     })
     .join()
     .unwrap();
@@ -533,6 +602,228 @@ fn dragging_a_checked_row_drags_the_whole_checked_set() {
             "a checked row drags the whole checked set"
         );
         assert!(uploads.borrow().is_empty(), "single-item upload must not run");
+    })
+    .join()
+    .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Wheel scrolling in the remote file list (#540)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wheel_over_file_rows_scrolls_the_list() {
+    std::thread::spawn(|| {
+        let (ui, window) = build_ui(false, 700.0, 0.0, 1400, 900, "right");
+        // Enough folders to overflow the list (folder icons are accent-coloured).
+        {
+            let terminals = ui.get_terminals();
+            let model = terminals.as_any().downcast_ref::<VecModel<TerminalState>>().unwrap();
+            let mut row = model.row_data(0).unwrap();
+            let entries: Vec<SftpEntry> =
+                (0..80).map(|i| self::row(&format!("dir{i:02}"), true, "", "2026-11-01 10:00")).collect();
+            row.sftp_entries = ModelRc::from(Rc::new(VecModel::from(entries)));
+            model.set_row_data(0, row);
+        }
+        // The file-name column's pixels: rows move in whole-row steps, so a
+        // scroll shows up as different names, not as a shifted first row.
+        let name_column = |window: &MinimalSoftwareWindow| -> Vec<(u8, u8, u8)> {
+            let frame = render_frame(window, 1400, 900);
+            (160..880)
+                .flat_map(|y| (745..800).map(move |x| (x, y)))
+                .map(|(x, y)| {
+                    let p = frame[y * 1400 + x];
+                    (p.r, p.g, p.b)
+                })
+                .collect()
+        };
+        let wheel = |x: f32, y: f32, dy: f32| {
+            window.dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(x, y) });
+            window.dispatch_event(WindowEvent::PointerScrolled {
+                position: LogicalPosition::new(x, y),
+                delta_x: 0.0,
+                delta_y: dy,
+            });
+        };
+        let top = name_column(&window);
+        // Over a row's file name, the list itself must scroll.
+        wheel(770.0, 400.0, -120.0);
+        assert!(name_column(&window) != top, "wheel over a file name did not scroll the list");
+    })
+    .join()
+    .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Tab menu: start / stop a session log (#535)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tab_menu_session_log_item_toggles_that_tab() {
+    std::thread::spawn(|| {
+        let (ui, window) = build_ui(false, 700.0, 0.0, 1400, 900, "right");
+        let toggled = Rc::new(RefCell::new(Vec::<String>::new()));
+        ui.on_tab_log_active(|_tab: SharedString| false);
+        {
+            let toggled = toggled.clone();
+            ui.on_tab_log_toggle(move |tab: SharedString| toggled.borrow_mut().push(tab.to_string()));
+        }
+        render_frame(&window, 1400, 900);
+        let right_click = |x: f32, y: f32| {
+            window.dispatch_event(WindowEvent::PointerPressed {
+                position: LogicalPosition::new(x, y),
+                button: PointerEventButton::Right,
+            });
+            window.dispatch_event(WindowEvent::PointerReleased {
+                position: LogicalPosition::new(x, y),
+                button: PointerEventButton::Right,
+            });
+        };
+        // The "host" tab sits at the left of the tab strip.
+        right_click(40.0, 55.0);
+        let menu = render_frame(&window, 1400, 900);
+        let bytes: Vec<u8> = menu.iter().flat_map(|p| [p.r, p.g, p.b]).collect();
+        image::save_buffer(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tab-log-menu-qa.png"),
+            &bytes,
+            1400,
+            900,
+            image::ColorType::Rgb8,
+        )
+        .unwrap();
+        // Fourth item: 4px padding + 3 × (28px item + 1px spacing) + half an item.
+        let item_y = 55.0 + 4.0 + 3.0 * 29.0 + 14.0;
+        press(&window, 100.0, item_y);
+        release(&window, 100.0, item_y);
+        assert_eq!(toggled.borrow().as_slice(), ["t1"]);
+    })
+    .join()
+    .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Deleting checked remote entries (#531)
+// ---------------------------------------------------------------------------
+
+/// Check (or uncheck) every remote entry and update the selected count.
+fn check_all_remote(ui: &AppWindow, checked: bool) {
+    let terminals = ui.get_terminals();
+    let model = terminals
+        .as_any()
+        .downcast_ref::<VecModel<TerminalState>>()
+        .unwrap();
+    let mut row = model.row_data(0).unwrap();
+    let entries = row
+        .sftp_entries
+        .as_any()
+        .downcast_ref::<VecModel<SftpEntry>>()
+        .unwrap();
+    for i in 0..entries.row_count() {
+        let mut entry = entries.row_data(i).unwrap();
+        entry.selected = checked;
+        entries.set_row_data(i, entry);
+    }
+    row.sftp_selected_count = if checked { entries.row_count() as i32 } else { 0 };
+    model.set_row_data(0, row);
+}
+
+/// Classic (single-pane) view docked right at full height, so the context
+/// menu opens below the rows without being pushed around by the window edge.
+/// Returns the y of the last remote row (nginx.conf).
+fn classic_right_dock() -> (AppWindow, Rc<MinimalSoftwareWindow>, f32) {
+    let (ui, window) = build_ui(false, 700.0, 0.0, 1400, 900, "right");
+    check_all_remote(&ui, true);
+    let frame = render_frame(&window, 1400, 900);
+    // Checked rows paint an accent checkbox at the start of the row.
+    let bands = accent_bands(&frame, 1400, 700, 760, 0, 900);
+    let row_y = bands
+        .last()
+        .map(|(start, end)| (*start + *end) as f32 / 2.0)
+        .expect("no checked remote row");
+    (ui, window, row_y)
+}
+
+/// Centre of the red "Delete" menu item (`#d86c6c` text) in a menu opened
+/// below `below_y` (the toolbar's red delete-checked icon sits above it).
+fn find_delete_item(pixels: &[Rgb8Pixel], width: usize, height: usize, below_y: f32) -> (f32, f32) {
+    let is_red =
+        |p: Rgb8Pixel| p.r.abs_diff(216) < 24 && p.g.abs_diff(108) < 24 && p.b.abs_diff(108) < 24;
+    let (mut x0, mut x1, mut y0, mut y1) = (usize::MAX, 0, usize::MAX, 0);
+    for y in (below_y as usize + 8)..height {
+        for x in 0..width {
+            if is_red(pixels[y * width + x]) {
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    assert!(x0 <= x1, "Delete menu item not painted");
+    ((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0)
+}
+
+#[test]
+fn context_menu_delete_on_a_checked_row_deletes_the_whole_selection() {
+    std::thread::spawn(|| {
+        let (ui, window, row_y) = classic_right_dock();
+        window.dispatch_event(WindowEvent::PointerPressed {
+            position: LogicalPosition::new(900.0, row_y),
+            button: PointerEventButton::Right,
+        });
+        window.dispatch_event(WindowEvent::PointerReleased {
+            position: LogicalPosition::new(900.0, row_y),
+            button: PointerEventButton::Right,
+        });
+        let menu = render_frame(&window, 1400, 900);
+        let bytes: Vec<u8> = menu.iter().flat_map(|p| [p.r, p.g, p.b]).collect();
+        image::save_buffer(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/sftp-delete-menu-qa.png"),
+            &bytes,
+            1400,
+            900,
+            image::ColorType::Rgb8,
+        )
+        .unwrap();
+        let (x, y) = find_delete_item(&menu, 1400, 900, row_y);
+        press(&window, x, y);
+        release(&window, x, y);
+        assert!(ui.get_confirm_delete_open(), "Delete must ask for confirmation");
+        assert!(
+            ui.get_confirm_delete_batch(),
+            "right-clicking a checked row must delete every checked entry, not only that row"
+        );
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn delete_key_deletes_checked_entries_or_the_highlighted_row() {
+    std::thread::spawn(|| {
+        use slint::platform::Key;
+        let (ui, window, row_y) = classic_right_dock();
+        let delete_key = || {
+            window.dispatch_event(WindowEvent::KeyPressed { text: Key::Delete.into() });
+            window.dispatch_event(WindowEvent::KeyReleased { text: Key::Delete.into() });
+        };
+        // A plain click highlights the row and focuses the list.
+        press(&window, 900.0, row_y);
+        release(&window, 900.0, row_y);
+        delete_key();
+        assert!(ui.get_confirm_delete_open(), "Del must open the delete confirmation");
+        assert!(ui.get_confirm_delete_batch(), "Del with checked entries deletes all of them");
+
+        ui.set_confirm_delete_open(false);
+        ui.set_confirm_delete_batch(false);
+        check_all_remote(&ui, false);
+        render_frame(&window, 1400, 900);
+        press(&window, 900.0, row_y);
+        release(&window, 900.0, row_y);
+        delete_key();
+        assert!(ui.get_confirm_delete_open());
+        assert!(!ui.get_confirm_delete_batch());
+        assert_eq!(ui.get_confirm_delete_path().as_str(), "/nginx.conf");
     })
     .join()
     .unwrap();

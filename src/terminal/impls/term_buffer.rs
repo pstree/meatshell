@@ -1,7 +1,7 @@
 use crate::terminal::{
     build_row, cell_prefix, char_after_cell_end, char_at_cell_start, detect_scroll,
-    highlight_plain_output, render_term_span, BuiltScreen, CsiState, Line, TermBuffer, MAX_HISTORY,
-    RAW_CAP,
+    highlight_plain_output, render_term_span, BuiltScreen, CsiState, HistLine, Line, TermBuffer,
+    MAX_HISTORY, RAW_CAP,
 };
 use crate::ui::TermMatch;
 
@@ -10,6 +10,24 @@ enum TerminalQuery {
     Status,
     CursorPosition { private: bool },
     PrimaryDeviceAttributes,
+}
+
+/// Char indices where `q` (already ASCII-lowercased) starts in `line`,
+/// non-overlapping, comparing ASCII case-insensitively (#535).
+fn match_starts<'a>(line: &'a str, q: &'a [char]) -> impl Iterator<Item = usize> + 'a {
+    let lower: Vec<char> = line.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let mut i = 0usize;
+    std::iter::from_fn(move || {
+        while i + q.len() <= lower.len() {
+            if lower[i..i + q.len()] == q[..] {
+                let start = i;
+                i += q.len();
+                return Some(start);
+            }
+            i += 1;
+        }
+        None
+    })
 }
 
 fn terminal_query(sequence: &[u8]) -> Option<TerminalQuery> {
@@ -50,6 +68,49 @@ impl TermBuffer {
             self.session_log = None;
         }
         Ok(())
+    }
+
+    /// Path of the file this tab is recording to, if any (#535).
+    pub(crate) fn session_log_path(&self) -> Option<std::path::PathBuf> {
+        self.session_log.as_ref().map(|log| log.path().to_path_buf())
+    }
+
+    /// Name the tab menu proposes for a manual log: `<name>_<timestamp>.log`.
+    pub(crate) fn default_session_log_file_name(&self) -> Option<String> {
+        let spec = self.session_log_spec.as_ref()?;
+        Some(format!(
+            "{}.log",
+            crate::terminal::default_log_stem(&spec.name, chrono::Local::now())
+        ))
+    }
+
+    /// Start recording into `path`, chosen from the tab menu (#535). Any log
+    /// already open is closed first. The tab's mode becomes "on" for the rest
+    /// of its life, so a later change to the global setting doesn't stop it.
+    pub(crate) fn start_session_log_at(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let Some(spec) = self.session_log_spec.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this tab has no terminal output to record",
+            ));
+        };
+        let mut log = crate::terminal::SessionLogger::create_at(path, &spec.name, &spec.target)?;
+        spec.mode = crate::config::SessionLogMode::On;
+        self.session_log = None; // closes a previous file with its footer
+        log.write_screen_snapshot(&self.screen_text_to_cursor());
+        self.session_log = Some(log);
+        Ok(())
+    }
+
+    /// Stop recording from the tab menu (#535); returns the closed file.
+    /// The tab's mode becomes "off" so the global setting won't restart it.
+    pub(crate) fn stop_session_log(&mut self) -> Option<std::path::PathBuf> {
+        if let Some(spec) = self.session_log_spec.as_mut() {
+            spec.mode = crate::config::SessionLogMode::Off;
+        }
+        let path = self.session_log_path();
+        self.session_log = None;
+        path
     }
 
     /// Screen rows down to the cursor row, the cursor row cut at the cursor
@@ -98,6 +159,7 @@ impl TermBuffer {
     /// except the decision of whether to also recreate `self.parser`.
     fn reset_light_state(&mut self) {
         self.find_query.clear();
+        self.find_cursor = None;
         self.history = std::collections::VecDeque::new();
         self.prev = Vec::new();
         self.view_offset = 0;
@@ -219,8 +281,8 @@ impl TermBuffer {
         let Some(match_idx) = self
             .history
             .iter()
-            .map(|line| &line.0)
-            .chain(live.iter().map(|line| &line.0))
+            .map(HistLine::plain)
+            .chain(live.iter().map(|line| line.0.as_str()))
             .position(|line| line.to_lowercase().contains(&q))
         else {
             return false;
@@ -232,6 +294,124 @@ impl TermBuffer {
         }
         self.view_offset = new_offset;
         true
+    }
+
+    // ---- Find navigation (#535) --------------------------------------------
+
+    /// Every match of `query` as (combined row, char index), in buffer order,
+    /// over scrollback + live screen (only the screen on the alternate
+    /// screen, whose scrollback can't be scrolled to). Same rule as the
+    /// on-screen highlights: ASCII case-insensitive, matches don't overlap.
+    pub(crate) fn find_all(&self, query: &str) -> Vec<(usize, usize)> {
+        let q: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if !self.parser.screen().alternate_screen() {
+            for (row, line) in self.history.iter().enumerate() {
+                out.extend(match_starts(line.plain(), &q).map(|start| (row, start)));
+            }
+        }
+        let hist_len = self.history.len();
+        let (live, _) = self.live_rows();
+        for (r, line) in live.iter().enumerate() {
+            out.extend(match_starts(&line.0, &q).map(|start| (hist_len + r, start)));
+        }
+        out
+    }
+
+    /// Settle on (`dir` 0), or step to the next (1) / previous (-1) match of
+    /// `query`, wrapping at either end, and scroll it into view. Returns the
+    /// 1-based position and the total (0, 0 when nothing matches).
+    pub(crate) fn find_step(&mut self, query: &str, dir: i32) -> (usize, usize) {
+        let matches = self.find_all(query);
+        if matches.is_empty() {
+            self.find_cursor = None;
+            return (0, 0);
+        }
+        let rows = self.parser.screen().size().0 as usize;
+        let (_, live_used) = self.live_rows();
+        let top = self.view_top_abs(live_used);
+        let bottom = top + rows;
+        let last = matches.len() - 1;
+        let index = match (dir, self.find_cursor) {
+            (0, Some(cursor)) => matches
+                .iter()
+                .position(|m| *m == cursor)
+                .or_else(|| matches.iter().position(|m| m.0 >= top))
+                .unwrap_or(0),
+            // A new query: the first match on screen, else the next one below.
+            (0, None) => matches
+                .iter()
+                .position(|m| m.0 >= top && m.0 < bottom)
+                .or_else(|| matches.iter().position(|m| m.0 >= top))
+                .unwrap_or(0),
+            (d, Some(cursor)) if d > 0 => matches.iter().position(|m| *m > cursor).unwrap_or(0),
+            (_, Some(cursor)) => matches.iter().rposition(|m| *m < cursor).unwrap_or(last),
+            (d, None) if d > 0 => matches.iter().position(|m| m.0 >= top).unwrap_or(0),
+            (_, None) => matches.iter().rposition(|m| m.0 < bottom).unwrap_or(last),
+        };
+        let current = matches[index];
+        self.find_cursor = Some(current);
+        self.scroll_row_into_view(current.0);
+        (index + 1, matches.len())
+    }
+
+    /// Scroll so combined row `abs` is visible, about a third from the top
+    /// when it was off screen. No-op on the alternate screen.
+    fn scroll_row_into_view(&mut self, abs: usize) {
+        if self.parser.screen().alternate_screen() {
+            return;
+        }
+        let rows = self.parser.screen().size().0 as usize;
+        let (_, live_used) = self.live_rows();
+        let top = self.view_top_abs(live_used);
+        if abs >= top && abs < top + rows {
+            return;
+        }
+        let combined_len = self.history.len() + rows;
+        let new_top = abs
+            .saturating_sub(rows / 3)
+            .min(combined_len.saturating_sub(rows));
+        self.view_offset = combined_len.saturating_sub(rows + new_top);
+    }
+
+    /// Highlight rectangle of the current find match if it is on screen.
+    pub(crate) fn find_current_rect(&self) -> Option<TermMatch> {
+        let (abs, start) = self.find_cursor?;
+        let q: Vec<char> = self.find_query.chars().map(|c| c.to_ascii_lowercase()).collect();
+        if q.is_empty() {
+            return None;
+        }
+        let rows = self.parser.screen().size().0 as usize;
+        let (live, live_used) = self.live_rows();
+        let top = self.view_top_abs(live_used);
+        if abs < top || abs >= top + rows {
+            return None;
+        }
+        let hist_len = self.history.len();
+        let text = if abs < hist_len {
+            self.history.get(abs)?.plain().to_string()
+        } else {
+            live.into_iter().nth(abs - hist_len)?.0
+        };
+        let chars: Vec<char> = text.chars().collect();
+        // Output may have rewritten the row (or old history was dropped).
+        if start + q.len() > chars.len()
+            || chars[start..start + q.len()]
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .ne(q.iter().copied())
+        {
+            return None;
+        }
+        let prefix = cell_prefix(&chars);
+        Some(TermMatch {
+            row: (abs - top) as i32,
+            col: prefix[start] as i32,
+            len: (prefix[start + q.len()] - prefix[start]) as i32,
+        })
     }
 
     /// Extract the selected text from the combined buffer (whole selection,
@@ -334,7 +514,7 @@ impl TermBuffer {
         let mut out = String::new();
         for r in lo_r..=hi_r {
             let line: &str = if r < hist_len {
-                &self.history[r].0
+                self.history[r].plain()
             } else if r - hist_len < live.len() {
                 &live[r - hist_len].0
             } else {
@@ -364,7 +544,7 @@ impl TermBuffer {
             };
             out.push_str(seg.trim_end());
             let wrapped = if r < hist_len {
-                self.history[r].2
+                self.history[r].wrapped
             } else if r - hist_len < live.len() {
                 live[r - hist_len].2
             } else {
@@ -444,6 +624,12 @@ impl TermBuffer {
                         self.csi_pending.push(byte);
                         self.csi_state = CsiState::Designate(byte);
                     } else {
+                        if byte == b'c' {
+                            // RIS (`ESC c`, what `reset` sends) restores G0/G1
+                            // to US-ASCII, so a TUI that died in line-drawing
+                            // mode can't leave the shell drawn as `q x l` (#543).
+                            self.charset = crate::terminal::CharsetTracker::default();
+                        }
                         display.extend(self.csi_pending.drain(..));
                         if byte == 0x1b {
                             self.csi_pending.push(byte);
@@ -546,19 +732,29 @@ impl TermBuffer {
         if bytes.is_empty() {
             return;
         }
-        // Retain the (post-rewrite) stream, capped, so a resize can replay it at
-        // the new width and reflow already-printed output (#169).
-        self.raw.extend(bytes.iter().copied());
         // CSI 3 J means "erase saved lines". The vt100 crate clears its own
         // scrollback, but MeatShell maintains a separate rendered history and a
         // raw replay stream for resize reflow. Drop both sides of that history,
         // including when the CSI sequence was split across SSH reads (#319).
+        //
+        // Only the new bytes (plus the last 3 retained ones, for a split
+        // sequence) can contain a new CSI 3 J. Scanning the whole retained
+        // stream instead cost a 2 MiB memmove + scan per chunk, which
+        // dominated ingest during log floods.
+        let carry = self.raw.len().min(3);
+        let window_start = self.raw.len() - carry;
         let erase_saved_through = {
-            let raw = self.raw.make_contiguous();
-            raw.windows(4)
+            let mut probe = Vec::with_capacity(carry + bytes.len());
+            probe.extend(self.raw.range(window_start..).copied());
+            probe.extend_from_slice(bytes);
+            probe
+                .windows(4)
                 .rposition(|window| window == b"\x1b[3J")
-                .map(|position| position + 4)
+                .map(|position| window_start + position + 4)
         };
+        // Retain the (post-rewrite) stream, capped, so a resize can replay it at
+        // the new width and reflow already-printed output (#169).
+        self.raw.extend(bytes.iter().copied());
         if let Some(end) = erase_saved_through {
             self.raw.drain(..end);
             self.history.clear();
@@ -696,7 +892,7 @@ impl TermBuffer {
         if !self.prev.is_empty() {
             let k = detect_scroll(&self.prev, &curr);
             for line in self.prev.iter().take(k) {
-                self.history.push_back(line.clone());
+                self.history.push_back(HistLine::from(line));
             }
             while self.history.len() > MAX_HISTORY {
                 self.history.pop_front();
@@ -787,20 +983,19 @@ impl TermBuffer {
         let mut spans = Vec::new();
         let mut displayed = Vec::with_capacity(win);
         for (d, idx) in (start..end).enumerate() {
-            let line: &Line = if idx < hist_len {
-                &self.history[idx]
+            let (plain, runs) = if idx < hist_len {
+                let line = &self.history[idx];
+                (line.plain(), line.spans())
             } else {
-                &live[idx - hist_len]
+                let line = &live[idx - hist_len];
+                (line.0.as_str(), line.1.clone())
             };
-            let runs = highlight_plain_output(
-                line.1.clone(),
-                self.output_highlight,
-                &self.custom_highlight_rules,
-            );
+            let runs =
+                highlight_plain_output(runs, self.output_highlight, &self.custom_highlight_rules);
             for hs in &runs {
                 spans.extend(render_term_span(hs, d as i32, self.is_dark));
             }
-            displayed.push(line.0.trim_end().to_string());
+            displayed.push(plain.trim_end().to_string());
         }
         while displayed.len() < win {
             displayed.push(String::new());

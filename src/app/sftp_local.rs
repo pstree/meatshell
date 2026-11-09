@@ -13,6 +13,7 @@
 
 use super::*;
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 /// A local listing can be huge (`C:\Windows\WinSxS` has 100k+ entries) and the
@@ -80,7 +81,12 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 /// Resolve what the user typed (or `..`, `~`) against the pane's current folder.
-pub(super) fn resolve_path(current: &str, input: &str) -> Result<PathBuf, String> {
+///
+/// Pure path arithmetic: this never touches the filesystem. The listing thread
+/// reports "no such folder" / "not a folder" instead, because probing the path
+/// here ran on the UI thread and a dead mapped drive or sleeping NAS could
+/// freeze the whole window while `std::fs::metadata` waited for a timeout.
+pub(super) fn resolve_path(current: &str, input: &str) -> PathBuf {
     let trimmed = input.trim();
     let target = if trimmed.is_empty() || trimmed == "~" {
         home_dir()
@@ -99,22 +105,7 @@ pub(super) fn resolve_path(current: &str, input: &str) -> Result<PathBuf, String
             Path::new(current).join(typed)
         }
     };
-    let resolved = normalize(&target);
-    let meta = std::fs::metadata(&resolved).map_err(|e| {
-        format!(
-            "{} {}: {e}",
-            t("无法访问", "Cannot open"),
-            display_path(&resolved)
-        )
-    })?;
-    if !meta.is_dir() {
-        return Err(format!(
-            "{}: {}",
-            t("不是文件夹", "Not a folder"),
-            display_path(&resolved)
-        ));
-    }
-    Ok(resolved)
+    normalize(&target)
 }
 
 /// `C:` / `D:` without a separator are drive roots, not relative names.
@@ -245,13 +236,21 @@ fn publish_local_listing(
         note.unwrap_or_default()
     };
     let entries = ModelRc::from(Rc::new(VecModel::from(listing.entries)));
+    let shown = listing.path.clone();
+    let bookmarked = bookmarked_in(&model_strings(&window.get_local_bookmarks()), &shown);
     update_terminal_row(model, tab_id, |row| {
-        row.sftp_local_path = listing.path.into();
+        row.sftp_local_path = shown.clone().into();
         row.sftp_local_entries = entries.clone();
         row.sftp_local_loading = false;
         row.sftp_local_selected_count = 0;
         row.sftp_local_status = status.into();
+        row.sftp_local_bookmarked = bookmarked;
     });
+    // Remember the folder for the next tab / restart (#532). Written to the
+    // global property, persisted with the rest of the layout on close.
+    window.set_sftp_last_local_dir(listing.path.into());
+    // Most recent first, like the remote pane's history (#500).
+    record_recent(window, &shown);
 }
 
 /// Read `dir` on a worker thread and publish it when it comes back.
@@ -300,20 +299,71 @@ pub(super) fn load_dir_with_status(
     });
 }
 
-/// Navigate the local pane: `..`, `~`, an absolute path, or a folder name.
-pub(super) fn navigate(window: &AppWindow, tab_id: &str, input: &str) {
-    let current = current_path(window, tab_id);
-    match resolve_path(&current, input) {
-        Ok(dir) => load_dir(window, tab_id, dir),
-        Err(message) => {
-            let terminals = window.get_terminals();
-            if let Some(model) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() {
-                update_terminal_row(model, tab_id, |row| {
-                    row.sftp_local_status = message.into();
-                });
-            }
+/// Open a remembered folder, falling back to `fallback` when it is gone.
+///
+/// Used the first time a pane opens with a folder restored from the config: a
+/// removed USB stick or unmounted network drive should land on the home folder
+/// instead of an error strip (#532). The existence check runs on the listing
+/// thread, like every other local read.
+pub(super) fn load_dir_or_fallback(
+    window: &AppWindow,
+    tab_id: &str,
+    dir: PathBuf,
+    fallback: PathBuf,
+) {
+    {
+        let terminals = window.get_terminals();
+        if let Some(model) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() {
+            update_terminal_row(model, tab_id, |row| row.sftp_local_loading = true);
         }
     }
+    let weak = window.as_weak();
+    let tab = tab_id.to_string();
+    std::thread::spawn(move || {
+        let (result, note) = match list_dir(&dir) {
+            Ok(listing) => (Ok(listing), None),
+            Err(message) => {
+                if !same_dir(&display_path(&dir), &display_path(&fallback)) {
+                    match list_dir(&fallback) {
+                        Ok(listing) => (
+                            Ok(listing),
+                            Some(format!(
+                                "{}: {message}",
+                                t(
+                                    "上次的本地目录不可用，已回到主目录",
+                                    "Last local folder is gone — opened the home folder instead"
+                                )
+                            )),
+                        ),
+                        Err(_) => (Err(message), None),
+                    }
+                } else {
+                    (Err(message), None)
+                }
+            }
+        };
+        let _ = weak.upgrade_in_event_loop(move |window| match result {
+            Ok(listing) => publish_local_listing(&window, &tab, listing, note),
+            Err(message) => {
+                let terminals = window.get_terminals();
+                if let Some(model) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() {
+                    update_terminal_row(model, &tab, |row| {
+                        row.sftp_local_loading = false;
+                        row.sftp_local_status = message.into();
+                    });
+                }
+            }
+        });
+    });
+}
+
+/// Navigate the local pane: `..`, `~`, an absolute path, or a folder name.
+///
+/// Resolution is pure; the folder is read (and any "not found / not a folder"
+/// error reported) by the listing thread.
+pub(super) fn navigate(window: &AppWindow, tab_id: &str, input: &str) {
+    let current = current_path(window, tab_id);
+    load_dir(window, tab_id, resolve_path(&current, input));
 }
 
 /// Go to the parent folder (no-op at a drive root).
@@ -408,6 +458,216 @@ pub(super) fn select_range(model: &VecModel<TerminalState>, tab_id: &str, from: 
     0
 }
 
+// ---------------------------------------------------------------------------
+// Places dropdown (#532): user folders + drives
+// ---------------------------------------------------------------------------
+
+/// One row of the local pane's places dropdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LocalPlace {
+    pub label: String,
+    pub path: String,
+    pub icon: &'static str,
+    /// The pane is showing this folder.
+    pub current: bool,
+}
+
+fn home_place(current: &str) -> LocalPlace {
+    let path = home_display();
+    LocalPlace {
+        label: t("主目录", "Home").to_string(),
+        current: same_dir(&path, current),
+        path,
+        icon: "\u{E88A}",
+    }
+}
+
+/// Home, desktop, downloads and documents — whichever of them exist.
+pub(super) fn quick_places(current: &str) -> Vec<LocalPlace> {
+    let Some(dirs) = directories::UserDirs::new() else {
+        return vec![home_place(current)];
+    };
+    let mut places = vec![home_place(current)];
+    for (zh, en, dir, icon) in [
+        ("桌面", "Desktop", dirs.desktop_dir(), "\u{E30C}"),
+        ("下载", "Downloads", dirs.download_dir(), "\u{E2C4}"),
+        ("文档", "Documents", dirs.document_dir(), "\u{E24D}"),
+    ] {
+        let Some(dir) = dir else { continue };
+        let path = display_path(dir);
+        places.push(LocalPlace {
+            label: t(zh, en).to_string(),
+            current: same_dir(&path, current),
+            path,
+            icon,
+        });
+    }
+    places
+}
+
+/// Drives (Windows) / mount points, labelled with the volume name when known.
+///
+/// `sysinfo` asks the OS for every drive's volume information, so this runs
+/// off the UI thread (see [`refresh_places`]): a mapped drive that has gone
+/// away can otherwise wait for a network timeout.
+pub(super) fn drive_places(current: &str) -> Vec<LocalPlace> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let mut seen = HashSet::new();
+    let mut places = Vec::new();
+    for disk in disks.list() {
+        let path = display_path(disk.mount_point());
+        // Windows also reports folder mount points inside a drive; the menu
+        // only wants whole drives (`C:\`).
+        #[cfg(windows)]
+        if path.len() != 3 || !path.ends_with('\\') {
+            continue;
+        }
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let label = disk.name().to_string_lossy().trim().to_string();
+        let letter = path.trim_end_matches(['\\', '/']);
+        places.push(LocalPlace {
+            label: if label.is_empty() {
+                letter.to_string()
+            } else {
+                format!("{letter} — {label}")
+            },
+            current: same_dir(&path, current),
+            path,
+            icon: "\u{E30C}",
+        });
+    }
+    places.sort_by(|a, b| a.path.cmp(&b.path));
+    places
+}
+
+fn into_slint_place(place: LocalPlace) -> SftpLocalPlace {
+    SftpLocalPlace {
+        label: place.label.into(),
+        path: place.path.into(),
+        icon: place.icon.into(),
+        current: place.current,
+    }
+}
+
+/// Slint `[string]` model → `Vec<String>` (the machine-wide places live in
+/// AppWindow properties; the config only sees them when the window closes).
+pub(super) fn model_strings(model: &ModelRc<SharedString>) -> Vec<String> {
+    model.iter().map(|item| item.to_string()).collect()
+}
+
+fn places_from(window: &AppWindow) -> crate::config::LocalPlaces {
+    crate::config::LocalPlaces {
+        bookmarks: model_strings(&window.get_local_bookmarks()),
+        recent: model_strings(&window.get_local_recent()),
+    }
+}
+
+fn bookmarked_in(bookmarks: &[String], path: &str) -> bool {
+    crate::config::LocalPlaces {
+        bookmarks: bookmarks.to_vec(),
+        recent: Vec::new(),
+    }
+    .is_bookmarked(path)
+}
+
+/// Mirror the machine-wide bookmarks / recent folders into every tab (the menu
+/// and the star read the tab's copy) and re-check the star against the folder
+/// each tab is showing.
+pub(super) fn publish_local_places(window: &AppWindow) {
+    let places = places_from(window);
+    let bookmarks = super::sftp_places::string_model(&places.bookmarks);
+    let recent = super::sftp_places::string_model(&places.recent);
+    let terminals = window.get_terminals();
+    let Some(model) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() else {
+        return;
+    };
+    for index in 0..model.row_count() {
+        let Some(row) = model.row_data(index) else {
+            continue;
+        };
+        let path = row.sftp_local_path.to_string();
+        let bookmarked = bookmarked_in(&places.bookmarks, &path);
+        update_terminal_row(model, row.id.as_str(), |row| {
+            row.sftp_local_bookmarks = bookmarks.clone();
+            row.sftp_local_recent = recent.clone();
+            row.sftp_local_bookmarked = bookmarked;
+        });
+    }
+}
+
+fn write_places(window: &AppWindow, places: &crate::config::LocalPlaces) {
+    window.set_local_bookmarks(super::sftp_places::string_model(&places.bookmarks));
+    window.set_local_recent(super::sftp_places::string_model(&places.recent));
+    publish_local_places(window);
+}
+
+/// Star clicked: bookmark / un-bookmark the folder the tab is showing.
+pub(super) fn toggle_bookmark(window: &AppWindow, tab_id: &str) {
+    let path = current_path(window, tab_id);
+    if path.is_empty() {
+        return;
+    }
+    let mut places = places_from(window);
+    places.toggle_bookmark(&path);
+    write_places(window, &places);
+}
+
+/// Remove a bookmark from the places menu.
+pub(super) fn remove_bookmark(window: &AppWindow, path: &str) {
+    let mut places = places_from(window);
+    places.remove_bookmark(path);
+    write_places(window, &places);
+}
+
+/// "Clear recent" in the places menu.
+pub(super) fn clear_recent(window: &AppWindow) {
+    let mut places = places_from(window);
+    places.clear_recent();
+    write_places(window, &places);
+}
+
+/// Record a folder at the top of the recent list (called when a listing lands).
+fn record_recent(window: &AppWindow, path: &str) {
+    let mut places = places_from(window);
+    if places.record_visit(path) {
+        write_places(window, &places);
+    }
+}
+
+/// Rebuild the places dropdown for a tab and publish it.
+///
+/// Runs off the UI thread because enumerating drives asks the OS for volume
+/// information and may wait on a dead network drive.
+pub(super) fn refresh_places(window: &AppWindow, tab_id: &str) {
+    let current = current_path(window, tab_id);
+    let weak = window.as_weak();
+    let tab = tab_id.to_string();
+    std::thread::spawn(move || {
+        let quick: Vec<SftpLocalPlace> = quick_places(&current)
+            .into_iter()
+            .map(into_slint_place)
+            .collect();
+        let drives: Vec<SftpLocalPlace> = drive_places(&current)
+            .into_iter()
+            .map(into_slint_place)
+            .collect();
+        let _ = weak.upgrade_in_event_loop(move |window| {
+            let terminals = window.get_terminals();
+            let Some(model) = terminals.as_any().downcast_ref::<VecModel<TerminalState>>() else {
+                return;
+            };
+            let quick = ModelRc::from(Rc::new(VecModel::from(quick)));
+            let drives = ModelRc::from(Rc::new(VecModel::from(drives)));
+            update_terminal_row(model, &tab, |row| {
+                row.sftp_local_quick_places = quick.clone();
+                row.sftp_local_drive_places = drives.clone();
+            });
+        });
+    });
+}
+
 /// Copy a path dropped from the OS file manager into `dir` (the split view's
 /// local half). A name that is already taken is kept side by side, like a file
 /// manager's copy. The work runs off the UI thread and reports the outcome in
@@ -453,17 +713,82 @@ pub(super) fn copy_into(window: &AppWindow, tab_id: &str, dir: PathBuf, source: 
     });
 }
 
-/// Recursively copy a file or a whole folder (symlinks are followed, like a
-/// normal file-manager copy).
+/// How deep a folder copy may descend. A symbolic-link or junction loop that
+/// `canonicalize` cannot collapse would otherwise recurse until the stack (or
+/// the disk) gives out.
+const MAX_COPY_DEPTH: u32 = 32;
+
+/// Recursively copy a file or a whole folder, like a file manager's copy.
+///
+/// Symlinks are followed (a linked folder is copied by content), but a physical
+/// folder that was already copied is skipped, so `C:\a\loop -> C:\a` cannot
+/// recurse forever. Copying a folder into its own subtree is refused up front:
+/// the new folder would appear inside the tree being walked and grow without
+/// end.
 fn copy_recursive(source: &Path, target: &Path) -> Result<(), String> {
     let meta = std::fs::metadata(source).map_err(|e| format!("{}: {e}", display_path(source)))?;
+    if meta.is_dir() && target_lies_inside(source, target) {
+        return Err(t(
+            "不能把文件夹复制到它自己的子目录里",
+            "Cannot copy a folder into its own subfolder",
+        )
+        .to_string());
+    }
+    let mut visited = HashSet::new();
+    copy_tree(source, target, 0, &mut visited)
+}
+
+/// True when the folder `target` would end up inside `source` (lexically or
+/// through links). `target` need not exist yet: its parent is resolved.
+fn target_lies_inside(source: &Path, target: &Path) -> bool {
+    let Ok(source_canon) = std::fs::canonicalize(source) else {
+        // Unresolvable source (already an error elsewhere): fall back to the
+        // lexical check so an obvious `a` → `a/b` still gets caught.
+        return target.starts_with(source);
+    };
+    let probe = target.parent().unwrap_or(target);
+    let Ok(probe) = std::fs::canonicalize(probe) else {
+        return target.starts_with(&source_canon);
+    };
+    probe.starts_with(&source_canon)
+}
+
+fn copy_tree(
+    source: &Path,
+    target: &Path,
+    depth: u32,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<(), String> {
+    if depth > MAX_COPY_DEPTH {
+        return Err(format!(
+            "{} ({})",
+            t(
+                "目录层级过深，可能遇到符号链接环",
+                "Folder nesting too deep — possible symlink loop"
+            ),
+            display_path(source)
+        ));
+    }
+    let meta = std::fs::metadata(source).map_err(|e| format!("{}: {e}", display_path(source)))?;
     if meta.is_dir() {
+        // A link/junction that leads back into a folder we already copied is
+        // skipped instead of duplicating its contents (or looping).
+        if let Ok(identity) = std::fs::canonicalize(source) {
+            if !visited.insert(identity) {
+                return Ok(());
+            }
+        }
         std::fs::create_dir_all(target).map_err(|e| format!("{}: {e}", display_path(target)))?;
         let entries =
             std::fs::read_dir(source).map_err(|e| format!("{}: {e}", display_path(source)))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("{}: {e}", display_path(source)))?;
-            copy_recursive(&entry.path(), &target.join(entry.file_name()))?;
+            copy_tree(
+                &entry.path(),
+                &target.join(entry.file_name()),
+                depth + 1,
+                visited,
+            )?;
         }
         return Ok(());
     }

@@ -211,7 +211,53 @@ const PROMPT_SETUP_SUFFIX: &str = "__ms7'";
 #[cfg(test)]
 const PROMPT_SETUP_HISTORY_MARKER: &str = "__MEATSHELL_INTERNAL_SETUP_1";
 const PROMPT_SETUP_DONE: &str = "\u{1b}]699;ready\u{07}";
-const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; __msc; }; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; for __mb in \"^[[H=beginning-of-line\" \"^[OH=beginning-of-line\" \"^[[1~=beginning-of-line\" \"^[[F=end-of-line\" \"^[OF=end-of-line\" \"^[[4~=end-of-line\" \"^[[3~=delete-char\" \"^[[2~=overwrite-mode\" \"^[[5~=beginning-of-buffer-or-history\" \"^[[6~=end-of-buffer-or-history\"; do for __mm in emacs viins; do case \"$(bindkey -M $__mm \"${__mb%%=*}\" 2>/dev/null)\" in *undefined-key) bindkey -M $__mm \"${__mb%%=*}\" \"${__mb#*=}\";; esac; done; done; unset __mb __mm; else PROMPT_COMMAND=\"declare -F __ms7 >/dev/null && __ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; : __MEATSHELL_INTERNAL_SETUP_1; if [ -n \"$BASH_VERSION\" ]; then __md=\"$(history 2>/dev/null | { __md=\"\"; while read -r __mn __mr; do case \"$__mr\" in *\"__ms7()\"*\"PROMPT_COMMAND=\"*) __mn=\"${__mn%\\*}\"; __md=\"$__mn $__md\";; esac; done; printf \"%s\" \"$__md\"; })\"; for __mn in $__md; do history -d \"$__mn\" 2>/dev/null; done; unset __md __mn __mr; fi; __cl=\"$(fc -ln -1 2>/dev/null)\"; printf \"\\033]699;ready\\007\"; __ms7'";
+
+// The setup command is typed into the remote shell, so it must fit one
+// canonical tty line: macOS (BSD) caps that at MAX_CANON = 1024 bytes and
+// silently drops the rest, including the final `\r`. A single body for both
+// shells grew to ~1.3 KB with the zsh key bindings (#519); on macOS hosts
+// the command was cut, never ran, its completion marker never came, and the
+// terminal stayed hidden after "Last login" (#541). The probe already knows
+// the shell, so each shell gets only its own part. Each part keeps its own
+// runtime guard, so a shell swapped by an rc file just skips it.
+macro_rules! prompt_setup_head {
+    () => {
+        "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; __msc; }; "
+    };
+}
+macro_rules! prompt_setup_tail {
+    () => {
+        "__cl=\"$(fc -ln -1 2>/dev/null)\"; printf \"\\033]699;ready\\007\"; __ms7'"
+    };
+}
+/// zsh: precmd hook plus default bindings for keys left unbound (#519).
+const PROMPT_BODY_ZSH: &str = concat!(
+    prompt_setup_head!(),
+    "if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; for __mb in \"^[[H=beginning-of-line\" \"^[OH=beginning-of-line\" \"^[[1~=beginning-of-line\" \"^[[F=end-of-line\" \"^[OF=end-of-line\" \"^[[4~=end-of-line\" \"^[[3~=delete-char\" \"^[[2~=overwrite-mode\" \"^[[5~=beginning-of-buffer-or-history\" \"^[[6~=end-of-buffer-or-history\"; do for __mm in emacs viins; do case \"$(bindkey -M $__mm \"${__mb%%=*}\" 2>/dev/null)\" in *undefined-key) bindkey -M $__mm \"${__mb%%=*}\" \"${__mb#*=}\";; esac; done; done; unset __mb __mm; fi; ",
+    prompt_setup_tail!()
+);
+/// bash: PROMPT_COMMAND hook, then drop the setup line from history.
+const PROMPT_BODY_BASH: &str = concat!(
+    prompt_setup_head!(),
+    "if [ -n \"$BASH_VERSION\" ]; then PROMPT_COMMAND=\"declare -F __ms7 >/dev/null && __ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; : __MEATSHELL_INTERNAL_SETUP_1; __md=\"$(history 2>/dev/null | { __md=\"\"; while read -r __mn __mr; do case \"$__mr\" in *\"__ms7()\"*\"PROMPT_COMMAND=\"*) __mn=\"${__mn%\\*}\"; __md=\"$__mn $__md\";; esac; done; printf \"%s\" \"$__md\"; })\"; for __mn in $__md; do history -d \"$__mn\" 2>/dev/null; done; unset __md __mn __mr; fi; ",
+    prompt_setup_tail!()
+);
+
+/// Login shells that receive the prompt-integration setup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptShell {
+    Bash,
+    Zsh,
+}
+
+impl PromptShell {
+    fn setup_body(self) -> &'static str {
+        match self {
+            PromptShell::Bash => PROMPT_BODY_BASH,
+            PromptShell::Zsh => PROMPT_BODY_ZSH,
+        }
+    }
+}
 const PROMPT_SHELL_PROBE: &[u8] = b"if [ -n \"$BASH_VERSION\" ]; then printf '__MEATSHELL_SHELL__:bash\\n'; elif [ -n \"$ZSH_VERSION\" ]; then printf '__MEATSHELL_SHELL__:zsh\\n'; else printf '__MEATSHELL_SHELL__:other\\n'; fi";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,13 +371,15 @@ async fn open_auxiliary_channel(
     }
 }
 
-fn prompt_setup_supported(probe_output: &str) -> Option<bool> {
-    if probe_output.contains("__MEATSHELL_SHELL__:bash")
-        || probe_output.contains("__MEATSHELL_SHELL__:zsh")
-    {
-        Some(true)
+/// Read the probe's answer: `Some(Some(shell))` for bash / zsh, `Some(None)`
+/// for any other shell, `None` while the output is still inconclusive.
+fn prompt_setup_supported(probe_output: &str) -> Option<Option<PromptShell>> {
+    if probe_output.contains("__MEATSHELL_SHELL__:bash") {
+        Some(Some(PromptShell::Bash))
+    } else if probe_output.contains("__MEATSHELL_SHELL__:zsh") {
+        Some(Some(PromptShell::Zsh))
     } else if probe_output.contains("__MEATSHELL_SHELL__:other") {
-        Some(false)
+        Some(None)
     } else {
         None
     }
@@ -341,14 +389,14 @@ fn prompt_setup_supported(probe_output: &str) -> Option<bool> {
 /// never see the long interactive prompt-integration command. In particular,
 /// BusyBox ash (used by OpenWrt) ignores `PROMPT_COMMAND`; injecting into its
 /// line editor only risks a visible partial command or continuation prompt.
-async fn remote_supports_prompt_setup(handle: &Handle<ClientHandler>) -> bool {
+async fn remote_supports_prompt_setup(handle: &Handle<ClientHandler>) -> Option<PromptShell> {
     let probe = async {
         let mut channel = handle.channel_open_session().await.ok()?;
         channel.exec(true, PROMPT_SHELL_PROBE).await.ok()?;
         let _ = channel.eof().await;
 
         let mut output = String::new();
-        let mut supported: Option<bool> = None;
+        let mut supported: Option<Option<PromptShell>> = None;
         // Drain the channel fully, including the server's CHANNEL_CLOSE. Do not
         // return as soon as the marker is seen (the old code dropped the Channel
         // mid-flight) and do not just send `channel.close()` without awaiting the
@@ -364,7 +412,7 @@ async fn remote_supports_prompt_setup(handle: &Handle<ClientHandler>) -> bool {
                         if let Some(s) = prompt_setup_supported(&output) {
                             supported = Some(s);
                         } else if output.len() > 256 {
-                            supported = Some(false);
+                            supported = Some(None);
                         }
                     }
                 }
@@ -379,7 +427,7 @@ async fn remote_supports_prompt_setup(handle: &Handle<ClientHandler>) -> bool {
         .await
         .ok()
         .flatten()
-        .unwrap_or(false)
+        .flatten()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -507,6 +555,159 @@ fn bound_prompt_setup_echo(text: &mut String) {
     let mut tail: String = text.chars().rev().take(KEEP_CHARS).collect();
     tail = tail.chars().rev().collect();
     *text = tail;
+}
+
+/// How long output stays hidden waiting for the setup's OSC 699 marker
+/// before it is released anyway (#524).
+const PROMPT_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Give up waiting for the OSC 699 completion marker and return everything
+/// buffered so far, minus our own setup echo (#524).
+///
+/// The setup is injected after the first non-empty output, which on many
+/// hosts is only the `Last login:` banner printed before the login shell's rc
+/// files run. If those rc files flush or consume pending input, `exec` another
+/// program, or run a menu, the setup never executes, the marker never comes,
+/// and every later byte — prompt and keystroke echo included — used to be
+/// buffered forever, leaving a frozen terminal.
+///
+/// If the echo hasn't arrived (or arrived only partly), `late_pending` is
+/// armed so the normal output path still strips it when it shows up.
+fn release_prompt_setup_buffer(buf: &mut String, late_pending: &mut bool) -> String {
+    let mut text = std::mem::take(buf);
+    *late_pending = !strip_late_prompt_setup_echo(&mut text);
+    text
+}
+
+/// Drop a completion marker that arrives after suppression already ended.
+fn strip_prompt_setup_done(text: &mut String) {
+    if text.contains(PROMPT_SETUP_DONE) {
+        *text = text.replace(PROMPT_SETUP_DONE, "");
+    }
+}
+
+/// How long the shell must stay quiet after its last output before the setup
+/// command is typed (#524). The first output is often only the `Last login:`
+/// banner, printed before the login shell's rc files run; typing then hands
+/// our command to whatever those rc files start (a menu, `read`, a bastion
+/// host picker) instead of to the shell's line editor.
+const PROMPT_SETUP_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Keep `line` equal to the text after the last newline seen so far, i.e. the
+/// row the remote cursor is on, bounded so a newline-free stream can't grow it.
+fn track_current_line(line: &mut String, chunk: &str) {
+    match chunk.rfind('\n') {
+        Some(pos) => {
+            line.clear();
+            line.push_str(&chunk[pos + 1..]);
+        }
+        None => line.push_str(chunk),
+    }
+    const MAX_LINE: usize = 4096;
+    if line.len() > MAX_LINE {
+        let mut cut = line.len() - MAX_LINE / 4;
+        while !line.is_char_boundary(cut) {
+            cut += 1;
+        }
+        line.drain(..cut);
+    }
+}
+
+/// Printable text of one terminal row: CSI / OSC / other escape sequences and
+/// control characters removed, and only what follows the last carriage return
+/// (a redraw overwrites the row from column 0).
+fn visible_line_text(raw: &str) -> String {
+    let raw = raw.rsplit('\r').next().unwrap_or("");
+    let mut out = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    // CSI: parameters/intermediates until a final byte @..~
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') | Some('P') | Some('_') | Some('^') => {
+                    // OSC / DCS / APC / PM: until BEL or ST (ESC \)
+                    while let Some(c) = chars.next() {
+                        if c == '\u{07}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether the row the cursor is on looks like an idle shell prompt that can
+/// safely receive the setup command (#524). An empty row means the shell (or
+/// an rc file) is still working. A question must never be answered by our
+/// command: rows ending in `:` / `?` (`Password:`, `Select [1-3]:`), or in
+/// `)` / `]` like `Activate env (y/n)` / `cd to workdir [Y/n]`, and any row
+/// offering y/n or yes/no, as interactive login scripts do (#542). Failing
+/// this check only costs shell integration until a real prompt shows.
+fn ready_for_prompt_setup(current_line: &str) -> bool {
+    let text = visible_line_text(current_line);
+    let text = text.trim_end();
+    if text.is_empty() || text.ends_with([':', '?', '：', '？', ')', ']', '）', '】']) {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    !(lower.contains("y/n") || lower.contains("yes/no"))
+}
+
+/// What input typed before the setup went out means for injecting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreSetupInput {
+    /// An automatic terminal reply (cursor position, device attributes,
+    /// focus in/out, OSC): not the user, changes nothing.
+    TerminalReply,
+    /// The user is editing a line (text, arrows, Backspace): hold the setup
+    /// back so it never lands in the middle of their input.
+    Editing,
+    /// Enter, Ctrl+C or Ctrl+D ended the line; the setup may go out once the
+    /// shell is idle at a prompt again.
+    Submitted,
+}
+
+fn classify_pre_setup_input(bytes: &[u8]) -> PreSetupInput {
+    if bytes.iter().any(|&b| matches!(b, b'\r' | b'\n' | 0x03 | 0x04)) {
+        return PreSetupInput::Submitted;
+    }
+    let is_reply = match bytes {
+        [0x1b, b']', ..] => true,                       // OSC reply (colours)
+        [0x1b, b'[', b'I'] | [0x1b, b'[', b'O'] => true, // focus in / out
+        [0x1b, b'[', rest @ ..] => {
+            // CPR `ESC [ r ; c R` and device attributes `ESC [ ? … c` / `ESC [ > … c`.
+            let (last, body) = match rest.split_last() {
+                Some((last, body)) => (*last, body),
+                None => (0, &[][..]),
+            };
+            let params = body.strip_prefix(b"?").or_else(|| body.strip_prefix(b">")).unwrap_or(body);
+            (last == b'R' || last == b'c')
+                && !params.is_empty()
+                && params.iter().all(|&b| b.is_ascii_digit() || b == b';')
+        }
+        _ => false,
+    };
+    if is_reply {
+        PreSetupInput::TerminalReply
+    } else {
+        PreSetupInput::Editing
+    }
 }
 
 /// Find a meatshell command-capture sequence (`ESC ] 697 ; <command> BEL|ST`)
@@ -1645,8 +1846,12 @@ async fn run_session(
     // The integration body is Bash/Zsh-specific. Probe out-of-band before the
     // interactive channel exists, so ash/dash/fish/unknown shells never receive
     // (and therefore can never display or get stuck parsing) the setup command.
-    let prompt_setup_supported =
-        !session.disable_shell_integration && remote_supports_prompt_setup(&handle).await;
+    let prompt_shell = if session.disable_shell_integration {
+        None
+    } else {
+        remote_supports_prompt_setup(&handle).await
+    };
+    let prompt_setup_supported = prompt_shell.is_some();
 
     // --- Shell channel --------------------------------------------------
     let mut channel = network_stage(
@@ -1703,6 +1908,20 @@ async fn run_session(
     // session makes recalling an accidentally saved setup command clear normal
     // terminal rows (#289).
     let mut late_prompt_echo_pending = false;
+    // When to stop waiting for the setup's completion marker and show the
+    // buffered output anyway (#524). `Some` only while `suppress_echo`.
+    let mut suppress_deadline: Option<tokio::time::Instant> = None;
+    // Before injecting, wait for the shell to settle at a prompt (#524):
+    // `inject_deadline` is pushed back by every output chunk, and
+    // `setup_current_line` holds the row the remote cursor is on so the
+    // setup is never typed into an rc-file menu or a `Password:` question.
+    // `user_line_dirty` holds the setup back while the user has typed into
+    // the current line (a login-script answer, a command) and not yet
+    // submitted it, so the two never interleave. Answering login questions
+    // no longer turns integration off for the whole session (#542).
+    let mut inject_deadline: Option<tokio::time::Instant> = None;
+    let mut setup_current_line = String::new();
+    let mut user_line_dirty = false;
     // After a ZMODEM transfer finishes we briefly ignore ZMODEM detection so the
     // sender's lingering close frames can't spawn a spurious second receive (#76).
     let mut zmodem_done_at: Option<std::time::Instant> = None;
@@ -1747,7 +1966,11 @@ async fn run_session(
     // The echoed setup line is discarded through the private OSC 699 completion
     // marker emitted after installation (see the suppress block below), so zsh
     // redraws and soft wrapping cannot make the internal command visible.
-    let prompt_setup = format!(" {}\r", PROMPT_BODY);
+    // Only this shell's part, so the line fits a macOS canonical tty (#541).
+    let prompt_setup = format!(
+        " {}\r",
+        prompt_shell.map(PromptShell::setup_body).unwrap_or_default()
+    );
     // --- Remote resource monitor (separate exec channel) ----------------
     // A tiny remote loop streams /proc/stat + /proc/meminfo every 2s; we parse
     // it into CPU% / mem / swap for the sidebar.  Best-effort: if the channel
@@ -1837,6 +2060,60 @@ async fn run_session(
     loop {
         tokio::select! {
             _ = async {
+                match inject_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                inject_deadline = None;
+                if !prompt_injected
+                    && !user_line_dirty
+                    && ready_for_prompt_setup(&setup_current_line)
+                {
+                    // A separate exec probe already confirmed bash or zsh, and
+                    // the shell has been quiet at a prompt-like row for
+                    // PROMPT_SETUP_SETTLE, so its line editor gets the command.
+                    prompt_injected = true;
+                    suppress_echo = true;
+                    suppress_deadline = Some(tokio::time::Instant::now() + PROMPT_SETUP_TIMEOUT);
+                    setup_current_line.clear();
+                    // The shell prints its prompt again once the setup returns.
+                    // Clear the copy already on screen so it isn't drawn twice
+                    // (the echoed command in between is buffered and dropped).
+                    let _ = events.send(SessionEvent::Output("\r\x1b[2K".into()));
+                    let _ = channel.data(prompt_setup.as_bytes()).await;
+                }
+                // Otherwise keep waiting: the next output chunk re-arms the
+                // deadline. If the row never looks like a prompt the session
+                // simply runs without shell integration.
+            }
+            _ = async {
+                match suppress_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                suppress_deadline = None;
+                if suppress_echo {
+                    suppress_echo = false;
+                    tracing::warn!(
+                        "[SESSION_START] id={} shell integration setup did not complete within {:?}; showing output without it",
+                        session.id,
+                        PROMPT_SETUP_TIMEOUT
+                    );
+                    let text = release_prompt_setup_buffer(
+                        &mut echo_buf,
+                        &mut late_prompt_echo_pending,
+                    );
+                    if !text.is_empty() {
+                        if let Some(cwd) = cwd_tracker.feed(&text) {
+                            let _ = events.send(SessionEvent::CwdChanged(cwd));
+                        }
+                        let _ = events.send(SessionEvent::Output(text));
+                    }
+                }
+            }
+            _ = async {
                 match auxiliary_deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending().await,
@@ -1882,6 +2159,20 @@ async fn run_session(
                         // Only log the byte count — never the bytes themselves,
                         // which are raw keystrokes and may contain passwords (#15).
                         tracing::debug!("ssh channel.data len={} bytes", bytes.len());
+                        if !prompt_injected && prompt_setup_supported {
+                            // The user is already talking to the remote side (a
+                            // login question, an rc-file menu, the shell). Hold
+                            // the setup back until their line is submitted and
+                            // the shell is idle at a prompt again (#524, #542).
+                            match classify_pre_setup_input(&bytes) {
+                                PreSetupInput::TerminalReply => {}
+                                PreSetupInput::Editing => {
+                                    user_line_dirty = true;
+                                    inject_deadline = None;
+                                }
+                                PreSetupInput::Submitted => user_line_dirty = false,
+                            }
+                        }
                         cwd_tracker.input(&bytes);
                         let bytes = terminal_encoder.encode(&bytes);
                         if let Err(err) = channel.data(&bytes[..]).await {
@@ -2081,48 +2372,22 @@ async fn run_session(
                             );
                         }
 
-                        // Inject PROMPT_COMMAND after the first real shell output,
-                        // unless shell integration is disabled for this session
-                        // (e.g. a Windows pwsh/cmd server) (#140).
-                        if !prompt_injected
-                            && !chunk.trim().is_empty()
-                            && prompt_setup_supported
-                        {
-                            prompt_injected = true;
-                            suppress_echo = true;
-                            // A separate exec probe already confirmed bash or zsh.
-                            // Keep buffering until the hook's OSC 7 arrives: slow
-                            // Linux/macOS PTYs may echo this command after several
-                            // seconds, while unsupported Windows shells never enter
-                            // this branch.
-                            // Paint the banner/prompt immediately so the first
-                            // usable terminal frame no longer waits for shell
-                            // integration (later output carrying the injected
-                            // setup command is still buffered and stripped).
-                            // On hosts without a login banner this frame IS the
-                            // shell prompt, and the shell prints an identical one
-                            // after the setup command returns — rendering it
-                            // twice. Drop the trailing prompt line here so only
-                            // the post-setup prompt (sent via the normal path
-                            // below) is shown; any banner text above it is
-                            // preserved.
-                            let mut painted = chunk.clone();
-                            if let Some(prompt_line) = painted.rsplit('\n').next() {
-                                if prompt_line
-                                    .trim_end()
-                                    .ends_with(['#', '$', '%', '>'])
-                                {
-                                    if let Some(pos) = painted.rfind(prompt_line) {
-                                        painted.truncate(pos);
-                                    }
-                                }
+                        // Schedule the PROMPT_COMMAND setup, unless shell
+                        // integration is disabled for this session (e.g. a
+                        // Windows pwsh/cmd server) (#140). It used to be typed
+                        // on the first non-empty chunk, which is often only the
+                        // `Last login:` banner printed before the rc files run;
+                        // a menu or `read` they start then swallowed the command
+                        // and the terminal froze (#524). Now every chunk is shown
+                        // as it arrives and pushes the injection back until the
+                        // shell has been quiet for PROMPT_SETUP_SETTLE (see the
+                        // `inject_deadline` arm above).
+                        if !prompt_injected && prompt_setup_supported {
+                            track_current_line(&mut setup_current_line, &chunk);
+                            if inject_deadline.is_some() || !chunk.trim().is_empty() {
+                                inject_deadline =
+                                    Some(tokio::time::Instant::now() + PROMPT_SETUP_SETTLE);
                             }
-                            if let Some(cwd) = cwd_tracker.feed(&painted) {
-                                let _ = events.send(SessionEvent::CwdChanged(cwd));
-                            }
-                            let _ = events.send(SessionEvent::Output(painted));
-                            let _ = channel.data(prompt_setup.as_bytes()).await;
-                            continue;
                         }
 
                         // While suppressing, wait for the private OSC 699 completion
@@ -2137,6 +2402,7 @@ async fn run_session(
                             echo_buf.push_str(&chunk);
                         if let Some(tail) = take_after_prompt_setup_done(&mut echo_buf) {
                             suppress_echo = false;
+                            suppress_deadline = None;
                             late_prompt_echo_pending = false;
                             tail
                         } else {
@@ -2149,6 +2415,10 @@ async fn run_session(
                                 &mut clean,
                                 &mut late_prompt_echo_pending,
                             );
+                            if prompt_injected {
+                                // A marker arriving after the #524 timeout.
+                                strip_prompt_setup_done(&mut clean);
+                            }
                             clean
                         };
 
@@ -3174,39 +3444,191 @@ mod keepalive_tests {
 #[cfg(test)]
 mod prompt_setup_echo_tests {
     use super::{
-        bound_prompt_setup_echo, prompt_setup_echo_end, prompt_setup_supported,
-        strip_late_prompt_setup_echo, strip_pending_prompt_setup_echo, strip_prompt_setup_echo,
-        take_after_prompt_setup_done, PROMPT_BODY, PROMPT_SETUP_DONE, PROMPT_SETUP_HISTORY_MARKER,
-        PROMPT_SETUP_PREFIX,
+        bound_prompt_setup_echo, classify_pre_setup_input, prompt_setup_echo_end,
+        prompt_setup_supported, PreSetupInput,
+        ready_for_prompt_setup, release_prompt_setup_buffer, strip_late_prompt_setup_echo,
+        strip_pending_prompt_setup_echo, strip_prompt_setup_done, strip_prompt_setup_echo,
+        take_after_prompt_setup_done, track_current_line, visible_line_text, PromptShell,
+        PROMPT_BODY_BASH, PROMPT_BODY_ZSH, PROMPT_SETUP_DONE, PROMPT_SETUP_HISTORY_MARKER,
+        PROMPT_SETUP_PREFIX, PROMPT_SETUP_SUFFIX,
     };
+
+    #[test]
+    fn each_setup_line_fits_a_macos_canonical_tty_line() {
+        // #541: macOS drops a canonical-mode line beyond MAX_CANON (1024
+        // bytes), Enter included; the combined body had grown to 1297 bytes.
+        // Keep headroom so a later addition does not silently cross it.
+        for shell in [PromptShell::Bash, PromptShell::Zsh] {
+            let injected = format!(" {}\r", shell.setup_body());
+            assert!(injected.len() <= 960, "{shell:?} setup is {} bytes", injected.len());
+            let body = shell.setup_body();
+            assert!(body.starts_with(PROMPT_SETUP_PREFIX), "{shell:?}");
+            assert!(body.ends_with(PROMPT_SETUP_SUFFIX), "{shell:?}");
+            assert!(body.contains("699;ready"), "{shell:?}");
+        }
+        // Each shell gets only its own part.
+        assert!(!PROMPT_BODY_BASH.contains("bindkey"));
+        assert!(!PROMPT_BODY_ZSH.contains("history -d"));
+        assert!(!PROMPT_BODY_ZSH.contains("PROMPT_COMMAND="));
+    }
+
+    #[test]
+    fn banner_alone_is_not_a_prompt() {
+        // #524: the setup used to be typed right after this banner, before the
+        // rc files ran. A finished line leaves the cursor on an empty row.
+        let mut line = String::new();
+        track_current_line(&mut line, "Last login: Fri Oct 31 09:12:01 2026 from 10.8.0.2\r\n");
+        assert!(!ready_for_prompt_setup(&line));
+    }
+
+    #[test]
+    fn shell_prompts_are_ready() {
+        for prompt in [
+            "[root@host ~]# ",
+            "user@host:~$ ",
+            "host% ",
+            "\u{1b}[01;32muser@host\u{1b}[00m:\u{1b}[01;34m~\u{1b}[00m$ ",
+            "\u{1b}]0;user@host: ~\u{07}user@host:~$ ",
+            "\r\u{1b}[K\u{276f} ", // starship-style redraw
+        ] {
+            let mut line = String::new();
+            track_current_line(&mut line, &format!("Last login: today\r\n{prompt}"));
+            assert!(ready_for_prompt_setup(&line), "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn questions_and_menus_are_not_ready() {
+        for row in [
+            "Password: ",
+            "Please select a host [1-3]: ",
+            "Continue connecting (yes/no)? ",
+            "请输入编号：",
+            "",
+        ] {
+            let mut line = String::new();
+            track_current_line(&mut line, &format!("1) web01\r\n2) db01\r\n{row}"));
+            assert!(!ready_for_prompt_setup(&line), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn current_line_spans_chunks_and_resets_on_newline() {
+        let mut line = String::new();
+        track_current_line(&mut line, "user@ho");
+        track_current_line(&mut line, "st:~$ ");
+        assert_eq!(visible_line_text(&line), "user@host:~$ ");
+        track_current_line(&mut line, "\r\nmotd\r\n");
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn current_line_stays_bounded() {
+        let mut line = String::new();
+        for _ in 0..2000 {
+            track_current_line(&mut line, "数据");
+        }
+        assert!(line.len() <= 4096);
+    }
+
+    #[test]
+    fn terminal_replies_do_not_count_as_typing() {
+        use PreSetupInput::*;
+        assert_eq!(classify_pre_setup_input(b"\x1b[24;80R"), TerminalReply);
+        assert_eq!(classify_pre_setup_input(b"\x1b[?62;22c"), TerminalReply);
+        assert_eq!(classify_pre_setup_input(b"\x1b[>0;95;0c"), TerminalReply);
+        assert_eq!(classify_pre_setup_input(b"\x1b[I"), TerminalReply);
+        assert_eq!(classify_pre_setup_input(b"\x1b]11;rgb:0000/0000/0000\x07"), TerminalReply);
+        // Typing, including arrows / Backspace editing the line.
+        assert_eq!(classify_pre_setup_input(b"y"), Editing);
+        assert_eq!(classify_pre_setup_input(b"\x1b[A"), Editing);
+        assert_eq!(classify_pre_setup_input(b"\x1bOD"), Editing);
+        assert_eq!(classify_pre_setup_input(&[0x7f]), Editing);
+        // Ending the line.
+        assert_eq!(classify_pre_setup_input(b"\r"), Submitted);
+        assert_eq!(classify_pre_setup_input(b"y\r"), Submitted);
+        assert_eq!(classify_pre_setup_input(&[3]), Submitted);
+    }
+
+    #[test]
+    fn login_script_yes_no_questions_are_not_prompts() {
+        // #542: interactive login scripts ask before the shell prompt appears.
+        for row in [
+            "Change to the work directory? [Y/n]",
+            "Activate the conda environment (y/n)",
+            "Enter zsh [yes/no]",
+            "进入工作目录 (Y/n) ",
+            "继续【是/否】",
+        ] {
+            let mut line = String::new();
+            track_current_line(&mut line, row);
+            assert!(!ready_for_prompt_setup(&line), "{row:?}");
+        }
+        for prompt in ["(base) user@host:~$ ", "user@host ~ % ", "[root@host ~]# "] {
+            let mut line = String::new();
+            track_current_line(&mut line, prompt);
+            assert!(ready_for_prompt_setup(&line), "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn timeout_releases_prompt_when_setup_never_runs() {
+        // #524: rc files swallowed the injected setup, so no echo and no
+        // completion marker ever arrive. The prompt must still be shown.
+        let mut buffered = String::from("[root@host ~]# ");
+        let mut pending = false;
+        let text = release_prompt_setup_buffer(&mut buffered, &mut pending);
+        assert_eq!(text, "[root@host ~]# ");
+        assert!(buffered.is_empty());
+        // The echo may still show up later; keep stripping armed.
+        assert!(pending);
+    }
+
+    #[test]
+    fn timeout_release_strips_setup_echo_already_buffered() {
+        let mut buffered = format!("{} && eval 'body; __ms7'\r\n[root@host ~]# ", PROMPT_SETUP_PREFIX);
+        let mut pending = false;
+        let text = release_prompt_setup_buffer(&mut buffered, &mut pending);
+        assert!(!text.contains(PROMPT_SETUP_PREFIX));
+        assert!(text.ends_with("[root@host ~]# "));
+        assert!(!pending);
+    }
+
+    #[test]
+    fn late_completion_marker_is_dropped() {
+        let mut text = format!("{PROMPT_SETUP_DONE}[root@host ~]# ");
+        strip_prompt_setup_done(&mut text);
+        assert_eq!(text, "[root@host ~]# ");
+    }
 
     #[test]
     fn only_bash_and_zsh_receive_prompt_setup() {
         assert_eq!(
             prompt_setup_supported("__MEATSHELL_SHELL__:bash\n"),
-            Some(true)
+            Some(Some(PromptShell::Bash))
         );
         assert_eq!(
             prompt_setup_supported("__MEATSHELL_SHELL__:zsh\n"),
-            Some(true)
+            Some(Some(PromptShell::Zsh))
         );
         assert_eq!(
             prompt_setup_supported("__MEATSHELL_SHELL__:other\n"),
-            Some(false)
+            Some(None)
         );
         assert_eq!(prompt_setup_supported("ash: syntax error\n"), None);
     }
 
     #[test]
     fn bash_setup_removes_current_and_stale_history_entries() {
-        assert!(PROMPT_BODY.contains(PROMPT_SETUP_HISTORY_MARKER));
-        assert!(PROMPT_BODY.contains("history 2>/dev/null"));
-        assert!(PROMPT_BODY.contains("__ms7()"));
-        assert!(PROMPT_BODY.contains("history -d \"$__mn\""));
+        let body = PROMPT_BODY_BASH;
+        assert!(body.contains(PROMPT_SETUP_HISTORY_MARKER));
+        assert!(body.contains("history 2>/dev/null"));
+        assert!(body.contains("__ms7()"));
+        assert!(body.contains("history -d \"$__mn\""));
         // Re-prime command capture only after deleting the setup entry, so the
         // previous real user command does not get reported as newly executed.
-        assert!(PROMPT_BODY.find("history -d").unwrap() < PROMPT_BODY.rfind("__cl=").unwrap());
-        assert!(PROMPT_BODY.contains("699;ready"));
+        assert!(body.find("history -d").unwrap() < body.rfind("__cl=").unwrap());
+        assert!(body.contains("699;ready"));
     }
 
     #[test]
@@ -3214,17 +3636,16 @@ mod prompt_setup_echo_tests {
         // #496: when the server exports PROMPT_COMMAND, child shells (tmux,
         // `bash`, `su`) inherit "__ms7;…" but not the function, so every
         // prompt printed "__ms7: command not found". Only call it if defined.
-        assert!(PROMPT_BODY
+        assert!(PROMPT_BODY_BASH
             .contains("PROMPT_COMMAND=\"declare -F __ms7 >/dev/null && __ms7${PROMPT_COMMAND:+;"));
-        assert!(!PROMPT_BODY.contains("PROMPT_COMMAND=\"__ms7"));
+        assert!(!PROMPT_BODY_BASH.contains("PROMPT_COMMAND=\"__ms7"));
     }
 
     #[test]
     fn zsh_gets_default_bindings_only_for_unbound_keys() {
         // #519: bare / starship-only zsh has no Home/End/PageUp/PageDown/Delete
         // bindings. The setup fills them in, inside the zsh branch only.
-        let zsh = &PROMPT_BODY[PROMPT_BODY.find("if [ -n \"$ZSH_VERSION\" ]").unwrap()
-            ..PROMPT_BODY.find("else PROMPT_COMMAND=").unwrap()];
+        let zsh = &PROMPT_BODY_ZSH[PROMPT_BODY_ZSH.find("if [ -n \"$ZSH_VERSION\" ]").unwrap()..];
         for binding in [
             "^[[H=beginning-of-line",
             "^[OH=beginning-of-line",
