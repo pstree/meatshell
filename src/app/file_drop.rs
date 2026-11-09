@@ -66,15 +66,18 @@ pub(super) fn handle_file_drop(
     path: std::path::PathBuf,
     hovered_pos: Option<(f32, f32)>,
 ) {
-    let Some((client_x, client_y)) = hovered_pos else {
-        // No CursorMoved was ever observed for this drag (e.g. the file was
-        // dropped the instant it entered the window). Without a position we
-        // cannot tell which panel it landed on, so do nothing rather than
-        // guess — matches the previous no-op rather than uploading to the
-        // wrong place.
-        return;
-    };
-    handle_file_drop_at(win, sftp_handles, path, client_x, client_y);
+    match hovered_pos {
+        Some((client_x, client_y)) => {
+            handle_file_drop_at(win, sftp_handles, path, client_x, client_y);
+        }
+        // No CursorMoved was observed for this drag. Wayland's native DnD
+        // protocol (as exposed by the winit fork) carries no hover-motion
+        // events at all, so the last pointer position belongs to an earlier
+        // pointer session and must not be trusted. Don't drop the file on the
+        // floor: upload it to the active session's current remote directory,
+        // i.e. exactly what the SFTP upload button does.
+        None => upload_to_active_session(win, sftp_handles, path),
+    }
 }
 
 /// Shared drop-position → upload logic for both platform front-ends above.
@@ -106,6 +109,25 @@ pub(super) fn handle_file_drop_at(
         return;
     }
 
+    upload_to_active_session(win, sftp_handles, path);
+}
+
+/// Upload `path` to the active session's current remote directory.
+///
+/// Coordinate-free core shared by the precise drop path above and the Wayland
+/// fallback in `handle_file_drop` (native DnD there delivers no hover motion,
+/// so no drop point is available). Every safety gate of the precise path is
+/// kept: welcome page, unknown remote directory and missing SFTP handle all
+/// return without touching anything.
+fn upload_to_active_session(
+    win: &AppWindow,
+    sftp_handles: &SftpHandles,
+    path: std::path::PathBuf,
+) {
+    let active = win.get_active_tab_id().to_string();
+    if active.is_empty() || active == "welcome" {
+        return;
+    }
     let dir = active_sftp_path(win, &active);
     if dir.is_empty() {
         return;

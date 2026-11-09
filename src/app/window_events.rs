@@ -136,15 +136,26 @@ pub(super) fn install_window_event_hook(
                         // the focused Slint TextInput keeps owning text input as before.
                         slint_window.with_winit_window(|window| window.set_ime_allowed(true));
                     }
+                    // A drag entered the window: discard any pointer position
+                    // recorded before it. It belongs to an earlier pointer
+                    // session and the window may have been resized or scrolled
+                    // since. Wayland DnD delivers no hover motion at all, so
+                    // this leaves the position `None` for the whole drag and
+                    // `handle_file_drop` falls back to uploading to the active
+                    // session instead of silently dropping the file.
+                    WEvent::HoveredFile(_) | WEvent::HoveredFileCancelled => {
+                        last_cursor_logical = None;
+                    }
                     WEvent::DroppedFile(path) => {
                         if let Some(win) = weak.upgrade() {
                             // On Windows the handler queries the OS cursor
                             // position itself (see `cursor_pos`), since OLE
                             // drag-and-drop hover suppresses WM_MOUSEMOVE.
-                            // On macOS/X11/Wayland the compositor delivers
-                            // pointer motion during drag-hover as ordinary
-                            // CursorMoved events, so the last one we saw is
-                            // the drop point (#356).
+                            // On macOS/X11 the compositor delivers pointer
+                            // motion during drag-hover as ordinary CursorMoved
+                            // events, so the last one we saw is the drop point
+                            // (#356); on Wayland the position stays `None` and
+                            // the handler uploads to the active session.
                             handle_file_drop(&win, &sh, path.clone(), last_cursor_logical);
                         }
                     }
