@@ -9,6 +9,7 @@ mod agents;
 mod auth_dialogs;
 mod aux_windows;
 mod color_theme;
+mod terminal_scheme;
 pub(crate) mod core;
 mod dock_stacks;
 mod drag_out;
@@ -24,6 +25,7 @@ mod editor_syntax;
 mod jump_list;
 mod key_input;
 pub mod launch;
+mod local_shells;
 mod misc_callbacks;
 mod open_window;
 mod panes;
@@ -50,6 +52,8 @@ mod tab_session_log;
 mod tab_transfer;
 mod term_output;
 mod terminal_ui;
+mod transfer_rate;
+mod transfer_speeds;
 mod tray;
 mod update;
 mod tunnel_callbacks;
@@ -117,7 +121,9 @@ use crate::resource::system::{format_bytes_per_sec, format_mem};
 use crate::resource::{LocalSnap, NetHist, TabStatus, TabStatuses};
 use crate::resource::{SystemSampler, SystemSnapshot};
 use crate::session::{ConnectCtx, PendingCred, PendingHostKey, PendingMfa};
-use crate::sftp::{download_target_path, spawn_sftp, DownloadConflict, SftpHandles, SftpLastCwd};
+use crate::sftp::{
+    download_target_path, spawn_sftp, DownloadConflict, SftpHandles, SftpLastCwd, UploadConflict,
+};
 use crate::ssh::{
     format_mtime, format_size, spawn_session, test_session_auth, ProcInfo, SessionCommand,
     SessionEvent, SessionHandle, SystemDetails,

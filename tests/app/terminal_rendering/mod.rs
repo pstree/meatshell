@@ -1,3 +1,4 @@
+use crate::terminal::ScreenDims as _;
 use super::*;
 
 fn hist_line(s: &str) -> Line {
@@ -15,7 +16,7 @@ fn make_buf(
     live_lines: &[&str],
     view_offset: usize,
 ) -> TermBuffer {
-    let mut parser = vt100::Parser::new(rows, cols, 0);
+    let mut parser = crate::terminal::vt_parser(rows, cols, 0);
     parser.process(live_lines.join("\r\n").as_bytes());
     TermBuffer {
         parser,
@@ -161,15 +162,65 @@ fn session_override_off_wins_over_global_on() {
 #[test]
 fn leaving_alternate_screen_after_shrinking_keeps_cursor_in_bounds() {
     for (start, rows, cols) in [("\x1b[40;1H", 20, 120), ("\x1b[40;100H", 20, 60)] {
-        let mut parser = vt100::Parser::new(40, 120, 0);
+        let mut parser = crate::terminal::vt_parser(40, 120, 0);
         parser.process(start.as_bytes());
         parser.process(b"\x1b[?1049h");
-        parser.screen_mut().set_size(rows, cols);
+        parser.screen_mut().set_dims(rows, cols);
         parser.process(b"\x1b[?1049l");
         parser.process("x\u{4e2d}".as_bytes());
         let (row, col) = parser.screen().cursor_position();
         assert!(row < rows && col <= cols, "cursor {row},{col} outside {rows}x{cols}");
     }
+}
+
+/// #544: inside tmux (alternate screen) a resize goes straight to vt100's
+/// `set_size`. When a shrink cut a wide CJK glyph in half at the right edge,
+/// vt100 0.16.2 kept the orphaned half and the next write there panicked
+/// (`screen.rs` unwrap / `row.rs` index out of bounds) — with
+/// `panic = "abort"` the app just vanished. Fixed upstream in vt100 0.17+.
+#[test]
+fn shrinking_through_a_wide_glyph_at_the_right_edge_does_not_panic() {
+    let mut parser = crate::terminal::vt_parser(5, 10, 0);
+    parser.process(b"\x1b[?1049h");
+    parser.process("\x1b[1;9H\u{4e2d}".as_bytes()); // 中 in the last two columns
+    parser.screen_mut().set_dims(5, 9); // cut it in half
+    parser.process(b"\x1b[1;9Hx\x1b[1;1H\x1b[K");
+    parser.screen_mut().set_dims(5, 12);
+    parser.process("\x1b[1;11H\u{6587}\x1b[?1049l".as_bytes());
+    assert_eq!(parser.screen().dims(), (5, 12));
+}
+
+/// #544: vt100 0.18's `set_size` pulls rows back out of its own scrollback
+/// when the screen grows. MeatShell already moved scrolled-off rows into
+/// `history`, so growing the window inside tmux and leaving it must not put
+/// those rows on the live screen a second time.
+#[test]
+fn growing_inside_alt_screen_does_not_duplicate_history_rows() {
+    let mut buf = make_buf(10, 20, &[], &[], 0);
+    buf.parser = crate::terminal::vt_parser(10, 20, 5000);
+    for i in 0..30 {
+        let _ = buf.ingest(format!("line{i}\r\n").as_bytes());
+    }
+    let _ = buf.ingest(b"\x1b[?1049h");
+    buf.parser.screen_mut().set_dims(15, 20);
+    let _ = buf.ingest(b"\x1b[?1049l");
+    let live = buf.parser.screen().contents();
+    for h in &buf.history {
+        let text = h.plain().trim_end();
+        if text.is_empty() {
+            continue;
+        }
+        assert!(
+            !live.lines().any(|l| l.trim_end() == text),
+            "{text:?} is both in history and on the live screen"
+        );
+    }
+    // A shrink-then-grow round trip still restores the hidden screen.
+    let _ = buf.ingest(b"\x1b[?1049h");
+    buf.parser.screen_mut().set_dims(5, 20);
+    buf.parser.screen_mut().set_dims(15, 20);
+    let _ = buf.ingest(b"\x1b[?1049l");
+    assert!(buf.parser.screen().contents().contains("line29"));
 }
 
 /// Log-flood throughput probe (not a correctness test). Run with:
@@ -241,7 +292,7 @@ fn run_tuples(runs: &[HistSpan]) -> Vec<(String, i32, i32, bool, bool, bool, Str
 
 #[test]
 fn compact_history_line_round_trips_styled_runs() {
-    let mut parser = vt100::Parser::new(2, 60, 0);
+    let mut parser = crate::terminal::vt_parser(2, 60, 0);
     parser.process(
         "12:00 \x1b[32mINFO\x1b[0m svc \x1b[1;35mFlood\x1b[0m 中文 ok \x1b[44m   \x1b[0m"
             .as_bytes(),
@@ -371,4 +422,209 @@ fn tab_menu_session_log_starts_and_stops_independently_of_the_setting() {
     assert!(text.contains("show version"));
     assert!(text.contains("session log closed"));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Replays a captured log flood (`target/flood.typescript.gz`, recorded with
+/// `script` from the log-flood heavy profile) through ingest + render + the
+/// span-model sync the way the session pump and UI flush do, and prints how
+/// the cost develops as history fills. `FLOOD_MB` limits the replay. Run with
+/// `cargo test --bin meatshell flood_replay_profile -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn flood_replay_profile() {
+    use slint::Model as _;
+    use std::io::Read as _;
+    use std::time::{Duration, Instant};
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/flood.typescript.gz");
+    let mut data = Vec::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(&path).expect("capture"))
+        .read_to_end(&mut data)
+        .unwrap();
+    let limit = std::env::var("FLOOD_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(data.len(), |mb| (mb << 20).min(data.len()));
+    let data = &data[..limit];
+
+    let mut buf = make_buf(40, 180, &[], &[], 0);
+    buf.is_dark = true;
+    buf.output_highlight = OutputHighlightPreset::DevOps;
+    buf.json_format_output = true;
+    let model = slint::VecModel::<crate::ui::TermSpan>::default();
+
+    const CHUNK: usize = 64 * 1024;
+    let total = data.len().div_ceil(CHUNK);
+    let every = (total / 16).max(1);
+    let (mut ingest, mut ingest_max, mut render) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let (mut spans, mut spans_max, mut changed, mut changed_max, mut bytes) = (0usize, 0, 0, 0, 0);
+    println!(
+        "{:>6} {:>8} {:>8} {:>10} {:>9} {:>7} {:>9} {:>7} {:>8}",
+        "MiB", "history", "MB/s", "ingestmax", "render", "spans", "spansmax", "changed", "chgmax"
+    );
+    for (i, chunk) in data.chunks(CHUNK).enumerate() {
+        let t = Instant::now();
+        let _ = buf.ingest(chunk);
+        let d = t.elapsed();
+        ingest += d;
+        ingest_max = ingest_max.max(d);
+        bytes += chunk.len();
+
+        let t = Instant::now();
+        let built = buf.render();
+        render += t.elapsed();
+        let before: Vec<_> = model.iter().collect();
+        let n = built.spans.len();
+        crate::app::terminal_ui::sync_span_model(&model, built.spans);
+        let c = (0..model.row_count())
+            .filter(|&r| before.get(r) != model.row_data(r).as_ref())
+            .count();
+        spans += n;
+        spans_max = spans_max.max(n);
+        changed += c;
+        changed_max = changed_max.max(c);
+
+        if (i + 1) % every == 0 || i + 1 == total {
+            let n = ((i % every) + 1) as u32;
+            println!(
+                "{:>6.1} {:>8} {:>8.1} {:>8.1}ms {:>7.2}ms {:>7} {:>9} {:>7} {:>8}",
+                ((i + 1) * CHUNK) as f64 / 1048576.0,
+                buf.history.len(),
+                bytes as f64 / 1e6 / ingest.as_secs_f64().max(1e-9),
+                ingest_max.as_secs_f64() * 1e3,
+                (render / n).as_secs_f64() * 1e3,
+                spans / n as usize,
+                spans_max,
+                changed / n as usize,
+                changed_max,
+            );
+            (ingest, ingest_max, render) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            (spans, spans_max, changed, changed_max, bytes) = (0, 0, 0, 0, 0);
+        }
+    }
+}
+
+/// While a pump thread ingests the captured flood as fast as it can (a
+/// backlog), the UI thread does what one scrollbar-drag step does every 8 ms:
+/// lock the buffer, move `view_offset`, render. Prints how long each step
+/// waited for the lock. Run with
+/// `cargo test --release --bin meatshell flood_scrollbar_lock_wait -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn flood_scrollbar_lock_wait() {
+    use std::io::Read as _;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/flood.typescript.gz");
+    let mut data = Vec::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(&path).expect("capture"))
+        .read_to_end(&mut data)
+        .unwrap();
+    data.truncate(96 << 20);
+
+    let mut buf = make_buf(40, 180, &[], &[], 0);
+    buf.is_dark = true;
+    buf.output_highlight = OutputHighlightPreset::DevOps;
+    buf.json_format_output = true;
+    // Start with full history so drags have somewhere to go.
+    for chunk in data[..(24 << 20)].chunks(16 * 1024) {
+        let _ = buf.ingest(chunk);
+    }
+    let handle = Arc::new(Mutex::new(buf));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let pump = {
+        let handle = handle.clone();
+        let stop = stop.clone();
+        let rest = data[(24 << 20)..].to_vec();
+        std::thread::spawn(move || {
+            let mut bytes = 0usize;
+            for chunk in rest.chunks(16 * 1024) {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let _ = crate::app::term_output::with_pump_lock(&handle, |b| b.ingest(chunk));
+                bytes += chunk.len();
+            }
+            bytes
+        })
+    };
+
+    let mut waits = Vec::new();
+    let mut renders = Vec::new();
+    let started = Instant::now();
+    let mut step = 0usize;
+    while started.elapsed() < Duration::from_secs(4) {
+        let t = Instant::now();
+        let mut b = crate::app::term_output::lock_for_ui(&handle);
+        waits.push(t.elapsed());
+        let max = b.history.len().max(1);
+        b.view_offset = 1 + (step * 37) % max;
+        let t = Instant::now();
+        let _ = b.render();
+        renders.push(t.elapsed());
+        drop(b);
+        step += 1;
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let pumped = pump.join().unwrap();
+
+    waits.sort();
+    renders.sort();
+    let pct = |v: &[Duration], p: f64| v[((v.len() - 1) as f64 * p) as usize].as_secs_f64() * 1e3;
+    println!(
+        "drag steps {} | pump ingested {:.1} MiB in 4 s",
+        waits.len(),
+        pumped as f64 / 1048576.0
+    );
+    println!(
+        "lock wait  p50 {:.2}ms  p90 {:.2}ms  p99 {:.2}ms  max {:.2}ms",
+        pct(&waits, 0.5),
+        pct(&waits, 0.9),
+        pct(&waits, 0.99),
+        pct(&waits, 1.0)
+    );
+    println!(
+        "render     p50 {:.2}ms  p99 {:.2}ms  max {:.2}ms",
+        pct(&renders, 0.5),
+        pct(&renders, 0.99),
+        pct(&renders, 1.0)
+    );
+}
+
+#[test]
+fn selection_stays_on_its_text_while_a_full_scrollback_evicts_lines() {
+    let history: Vec<String> = (0..crate::terminal::MAX_HISTORY)
+        .map(|i| format!("line {i:06}"))
+        .collect();
+    let refs: Vec<&str> = history.iter().map(String::as_str).collect();
+    let mut buf = make_buf(5, 20, &refs, &["live"], 1000);
+    // Prime the previous-screen snapshot so later output is captured.
+    let _ = buf.ingest(b"\r\nprime\r\n");
+
+    // Select one whole history line while scrolled back.
+    let row = buf
+        .history
+        .iter()
+        .position(|line| line.plain().trim_end() == "line 090000")
+        .expect("line in history");
+    buf.sel_ranges = vec![((row, 0), (row, 10))];
+    buf.sel_anchor = Some((row, 0));
+    buf.sel_focus = Some((row, 10));
+    let before = buf.extract_selection_text();
+    assert_eq!(before.trim_end(), "line 090000");
+    let top_before = buf.vis_to_abs(0);
+    let first_visible_before = buf.history[top_before].plain().to_string();
+
+    // A burst of output evicts lines from the front of the full history.
+    for i in 0..60 {
+        let _ = buf.ingest(format!("new {i}\r\n").as_bytes());
+    }
+    assert_eq!(buf.history.len(), crate::terminal::MAX_HISTORY);
+
+    // The view and the selection both still show the same text.
+    assert_eq!(buf.history[buf.vis_to_abs(0)].plain(), first_visible_before);
+    assert_eq!(buf.extract_selection_text(), before);
 }

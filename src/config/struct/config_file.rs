@@ -28,6 +28,21 @@ pub struct CustomAgent {
     pub directory: String,
 }
 
+/// A user-defined local shell (#538), e.g. nushell, MSYS2 zsh or fish. Unlike
+/// a custom agent, `program` is started directly as the tab's shell (no
+/// PowerShell around it), with `args` (one line, split like a command line)
+/// and an optional start `directory`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomShell {
+    pub id: String,
+    pub name: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: String,
+    #[serde(default)]
+    pub directory: String,
+}
+
 // Testing-stage MCP defaults. Switch these serde defaults to false before the
 // feature is promoted from preview to a stable release.
 fn default_mcp_preview_enabled() -> bool {
@@ -98,6 +113,9 @@ pub struct ConfigFile {
     /// User-defined agent launchers shown next to the detected ones (#427).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_agents: Vec<CustomAgent>,
+    /// User-defined local shells listed with the built-in ones (#538).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_shells: Vec<CustomShell>,
     /// Preset SFTP download directory. Empty = ask each time.
     #[serde(default)]
     pub download_dir: String,
@@ -184,6 +202,9 @@ pub struct ConfigFile {
     /// existing configurations unless the user explicitly disables it (#300).
     #[serde(default)]
     pub paste_confirm_disabled: bool,
+    /// Right-click copies a selection or pastes when no selection exists.
+    #[serde(default)]
+    pub right_click_copy: bool,
     /// Stored inverted so Ctrl+Alt+V, Shift+Insert, and middle-click paste stay
     /// enabled for existing users (#300).
     #[serde(default)]
@@ -273,6 +294,14 @@ pub struct ConfigFile {
     /// Machine-wide: the same folders exist for every session.
     #[serde(default, skip_serializing_if = "super::LocalPlaces::is_empty")]
     pub local_places: super::LocalPlaces,
+    /// Local pane display options (#532 follow-up): show hidden / system
+    /// entries, and which column the list is sorted by.
+    #[serde(default)]
+    pub sftp_local_show_hidden: bool,
+    #[serde(default)]
+    pub sftp_local_sort_key: String,
+    #[serde(default)]
+    pub sftp_local_sort_dir: i32,
     /// Last window size in logical px (0 = unset → use the built-in default).
     /// Lets users keep their preferred window size across restarts.
     #[serde(default)]
@@ -328,6 +357,13 @@ pub struct ConfigFile {
     /// the interface or switches light/dark. Default false keeps them on.
     #[serde(default)]
     pub immersive_colors_disabled: bool,
+    /// Terminal colour scheme used in dark mode (Settings › Terminal colours).
+    /// Empty = the default MeatShell terminal colours.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub terminal_scheme_dark: String,
+    /// Terminal colour scheme used in light mode. Empty = default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub terminal_scheme_light: String,
     /// Settings-panel font scale, percent (80–160). 0 = 100% default (v0.5).
     #[serde(default)]
     pub panel_font: u32,

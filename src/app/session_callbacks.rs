@@ -1373,6 +1373,9 @@ pub(super) fn wire_session_callbacks(
                 local_dir,
                 local_bookmarks,
                 local_recent,
+                local_show_hidden,
+                local_sort_key,
+                local_sort_dir,
             ) = weak
                 .upgrade()
                 .map(|w| {
@@ -1384,6 +1387,9 @@ pub(super) fn wire_session_callbacks(
                         w.get_sftp_last_local_dir().to_string(),
                         w.get_local_bookmarks(),
                         w.get_local_recent(),
+                        w.get_sftp_local_show_hidden(),
+                        w.get_sftp_local_sort_key().to_string(),
+                        w.get_sftp_local_sort_dir(),
                     )
                 })
                 .unwrap_or((
@@ -1394,6 +1400,9 @@ pub(super) fn wire_session_callbacks(
                     String::new(),
                     ModelRc::from(std::rc::Rc::new(VecModel::<SharedString>::default())),
                     ModelRc::from(std::rc::Rc::new(VecModel::<SharedString>::default())),
+                    false,
+                    String::new(),
+                    0,
                 ));
             terminals_model.push(TerminalState {
                 id: tab_id.clone().into(),
@@ -1464,6 +1473,13 @@ pub(super) fn wire_session_callbacks(
                 sftp_local_bookmarks: local_bookmarks,
                 sftp_local_recent: local_recent,
                 sftp_local_bookmarked: false,
+                sftp_local_show_hidden: local_show_hidden,
+                sftp_local_sort_key: local_sort_key.into(),
+                sftp_local_sort_dir: local_sort_dir,
+                sftp_local_filter: "".into(),
+                sftp_local_all_entries: ModelRc::from(std::rc::Rc::new(
+                    VecModel::<SftpEntry>::default(),
+                )),
                 font_size: 0,
                 tunnels: ModelRc::from(std::rc::Rc::new(VecModel::<TunnelInfo>::default())),
                 sftp_collapsed: !has_sftp || sftp_collapsed_default,
@@ -1501,7 +1517,7 @@ pub(super) fn wire_session_callbacks(
             bufs.lock().unwrap().insert(
                 tab_id.clone(),
                 Arc::new(Mutex::new(TermBuffer {
-                    parser: vt100::Parser::new(24, 80, 5000),
+                    parser: crate::terminal::vt_parser(24, 80, 5000),
                     find_query: String::new(),
                     find_cursor: None,
                     is_dark: is_dark_now,
@@ -1666,7 +1682,7 @@ pub(super) fn wire_session_callbacks(
                 let saved = store.borrow().get(&session_id).map(|s| s.name.clone());
                 saved
                     .or_else(|| {
-                        session_models::builtin_local_sessions(store.borrow().wsl_profiles())
+                        session_models::system_shell_sessions(&store.borrow())
                             .into_iter()
                             .find(|s| s.id == session_id)
                             .map(|s| s.name)
@@ -1738,7 +1754,9 @@ pub(super) fn listen_for_config_changes(ctx: &WinCtx, sessions_model: &Rc<VecMod
                 sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
                 // Custom agents (#427): launch menu and Settings list.
                 w.invoke_refresh_agent_launchers();
-                // Re-apply the theme to the chrome AND every open terminal buffer.
+                // Terminal colour schemes, then re-apply the theme to the
+                // chrome AND every open terminal buffer (re-renders them).
+                super::terminal_scheme::apply_terminal_schemes(&w, &store.borrow());
                 apply_dark_mode(&w, &bufs, theme_pref_is_dark(&store.borrow()));
                 // Colour theme preset + immersive switch (Wallpaper & theme).
                 super::color_theme::apply_color_theme(&w, &store.borrow());
@@ -1746,6 +1764,7 @@ pub(super) fn listen_for_config_changes(ctx: &WinCtx, sessions_model: &Rc<VecMod
                 w.set_lang_en(crate::i18n::is_en());
                 // Command-bar visibility is a global preference.
                 w.set_cmd_bar_hidden(store.borrow().cmd_bar_hidden());
+                w.set_right_click_copy(store.borrow().right_click_copy());
                 // Persisted terminal font size (settings stepper) is global too.
                 w.set_term_font_size(store.borrow().font_size() as f32);
                 // SSH keepalive (#515) is a client-wide setting.

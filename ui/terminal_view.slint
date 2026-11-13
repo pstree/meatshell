@@ -276,6 +276,8 @@ export component TerminalView inherits Rectangle {
     in property <bool> zen-mode: false;
     in property <float> terminal-line-spacing: 1.0;
     in property <bool> extra-paste-shortcuts-enabled: true;
+    in property <bool> right-click-copy: false;
+    callback right-click-copy-selection() -> bool;
     in property <bool> quick-sidebar-enabled: false;
     in property <bool> quick-panel-docked: false;
     in property <string> quick-external-command;
@@ -288,7 +290,7 @@ export component TerminalView inherits Rectangle {
     in property <int> cursor-row;       // cursor cell (grid coords)
     in property <int> cursor-col;
     in property <string> cursor-style: "block";
-    in property <color> cursor-color: Theme.term-fg;
+    in property <color> cursor-color: Theme.term-cursor;
     in property <int> rows-used;        // content rows, for viewport sizing
     in property <int> scroll-max;       // scrollback depth (max offset) (#103)
     in property <int> scroll-offset;    // current offset (0 = live bottom) (#103)
@@ -331,6 +333,11 @@ export component TerminalView inherits Rectangle {
     in property <[string]> sftp-local-bookmarks;
     in property <[string]> sftp-local-recent;
     in property <bool> sftp-local-bookmarked: false;
+    // Local list options (#532 follow-up).
+    in property <bool> sftp-local-show-hidden: false;
+    in property <string> sftp-local-sort-key;
+    in property <int> sftp-local-sort-dir: 0;
+    in property <string> sftp-local-filter;
     in property <float> sftp-local-split: 0.0;
     callback persist-sftp-split(bool);
     callback persist-sftp-local-split(float);
@@ -338,6 +345,12 @@ export component TerminalView inherits Rectangle {
     callback sftp-local-toggle-bookmark();
     callback sftp-local-remove-bookmark(string);
     callback sftp-local-clear-recent();
+    callback sftp-local-toggle-hidden();
+    callback sftp-local-sort(string);
+    callback sftp-local-set-filter(string);
+    callback sftp-local-remove-recent(string);
+    callback sftp-local-move-bookmark(string, int);
+    callback sftp-local-reveal();
 
     // Per-session now (#v0.5): the AppWindow stores these in each TerminalState
     // and writes back via the set-* callbacks, so each tab/pane keeps its own SFTP
@@ -827,9 +840,13 @@ export component TerminalView inherits Rectangle {
                                     // Any button press re-takes keyboard focus.
                                     ime-input.focus();
                                     if (ev.button == PointerEventButton.right) {
-                                        root.ctx-x = self.mouse-x;
-                                        root.ctx-y = self.mouse-y;
-                                        ctx-menu.show();
+                                        if root.right-click-copy && !ev.modifiers.shift {
+                                            if !root.right-click-copy-selection() { root.paste-from-clipboard(); }
+                                        } else {
+                                            root.ctx-x = self.mouse-x;
+                                            root.ctx-y = self.mouse-y;
+                                            ctx-menu.show();
+                                        }
                                     } else if (ev.button == PointerEventButton.left
                                             && root.mouse-tracked && !ev.modifiers.shift) {
                                         root.mouse-press-pending = true;
@@ -940,13 +957,14 @@ export component TerminalView inherits Rectangle {
                             }
                         }
 
-                        // Drag-selection highlights (under the text, blue tint).
+                        // Drag-selection highlights (under the text): the
+                        // terminal scheme's selection, else an accent tint.
                         for s in root.selection : Rectangle {
                             x: s.col * root.cell-w;
                             y: s.row * root.cell-h;
                             width: s.len * root.cell-w;
                             height: root.cell-h;
-                            background: Theme.accent.with-alpha(0.40);
+                            background: Theme.term-selection;
                         }
 
                         // Search-match highlights (behind the text).
@@ -1071,9 +1089,13 @@ export component TerminalView inherits Rectangle {
                                 if (ev.kind == PointerEventKind.down) {
                                     ime-input.focus();
                                     if (ev.button == PointerEventButton.right) {
-                                        root.ctx-x = self.mouse-x;
-                                        root.ctx-y = self.mouse-y;
-                                        ctx-menu.show();
+                                        if root.right-click-copy && !ev.modifiers.shift {
+                                            if !root.right-click-copy-selection() { root.paste-from-clipboard(); }
+                                        } else {
+                                            root.ctx-x = self.mouse-x;
+                                            root.ctx-y = self.mouse-y;
+                                            ctx-menu.show();
+                                        }
                                     } else if (ev.button == PointerEventButton.left
                                             && root.mouse-tracked && !ev.modifiers.shift) {
                                         // Mouse-tracking TUI (btop/htop/mc): forward the
@@ -2552,12 +2574,22 @@ export component TerminalView inherits Rectangle {
             local-bookmarks: root.sftp-local-bookmarks;
             local-recent: root.sftp-local-recent;
             local-bookmarked: root.sftp-local-bookmarked;
+            local-show-hidden: root.sftp-local-show-hidden;
+            local-sort-key: root.sftp-local-sort-key;
+            local-sort-dir: root.sftp-local-sort-dir;
+            local-filter: root.sftp-local-filter;
             local-split-ratio: root.sftp-local-split;
             persist-local-split-ratio(v) => { root.persist-sftp-local-split(v); }
             local-places-refresh() => { root.sftp-local-places-refresh(); }
             local-toggle-bookmark() => { root.sftp-local-toggle-bookmark(); }
             local-remove-bookmark(path) => { root.sftp-local-remove-bookmark(path); }
             local-clear-recent() => { root.sftp-local-clear-recent(); }
+            local-toggle-hidden() => { root.sftp-local-toggle-hidden(); }
+            local-sort(column) => { root.sftp-local-sort(column); }
+            local-set-filter(text) => { root.sftp-local-set-filter(text); }
+            local-remove-recent(path) => { root.sftp-local-remove-recent(path); }
+            local-move-bookmark(path, delta) => { root.sftp-local-move-bookmark(path, delta); }
+            local-reveal() => { root.sftp-local-reveal(); }
             toggle-dual()          => { root.sftp-toggle-dual(); }
             local-navigate(path)   => { root.sftp-local-navigate(path); }
             local-up()             => { root.sftp-local-up(); }

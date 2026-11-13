@@ -1,3 +1,4 @@
+use crate::terminal::ScreenDims as _;
 use crate::terminal::{
     build_row, cell_prefix, char_after_cell_end, char_at_cell_start, detect_scroll,
     highlight_plain_output, render_term_span, BuiltScreen, CsiState, HistLine, Line, TermBuffer,
@@ -118,7 +119,7 @@ impl TermBuffer {
     fn screen_text_to_cursor(&self) -> String {
         let screen = self.parser.screen();
         let (cursor_row, cursor_col) = screen.cursor_position();
-        let (_, cols) = screen.size();
+        let (_, cols) = screen.dims();
         let mut text = String::new();
         for row in screen.rows(0, cols).take(cursor_row as usize) {
             text.push_str(&row);
@@ -135,8 +136,8 @@ impl TermBuffer {
     }
 
     pub(crate) fn release_scrollback(&mut self) {
-        let (rows, cols) = self.parser.screen().size();
-        self.parser = vt100::Parser::new(rows, cols, 5000);
+        let (rows, cols) = self.parser.screen().dims();
+        self.parser = crate::terminal::vt_parser(rows, cols, 5000);
         self.reset_light_state();
     }
 
@@ -183,7 +184,7 @@ impl TermBuffer {
     /// Live screen rows plus the count of non-blank ones at the top.
     fn live_rows(&self) -> (Vec<Line>, usize) {
         let s = self.parser.screen();
-        let (rows, cols) = s.size();
+        let (rows, cols) = s.dims();
         let live: Vec<Line> = (0..rows).map(|r| build_row(s, r, cols)).collect();
         let used = live
             .iter()
@@ -193,9 +194,33 @@ impl TermBuffer {
         (live, used)
     }
 
+    /// `n` rows were evicted from the front of a full `history`, so every
+    /// absolute combined-row index now points `n` rows further on. The
+    /// scrolled view stays anchored through `view_offset`; move the selection
+    /// and the find cursor the same way so they stay on the text the user
+    /// picked. Without this, selecting while a log flood filled the scrollback
+    /// slid the selection down by one row per new line and selected far more
+    /// than was dragged over. A point whose row was evicted clamps to the top.
+    fn shift_marks_after_eviction(&mut self, n: usize) {
+        let shift = |(row, col): (usize, u16)| match row.checked_sub(n) {
+            Some(row) => (row, col),
+            None => (0, 0),
+        };
+        self.sel_anchor = self.sel_anchor.map(shift);
+        self.sel_focus = self.sel_focus.map(shift);
+        self.sel_ranges.retain(|&(a, f)| a.0 >= n || f.0 >= n);
+        for (a, f) in &mut self.sel_ranges {
+            *a = shift(*a);
+            *f = shift(*f);
+        }
+        self.find_cursor = self
+            .find_cursor
+            .and_then(|(row, idx)| row.checked_sub(n).map(|row| (row, idx)));
+    }
+
     /// Absolute combined-row index of the top visible row for the current view.
     fn view_top_abs(&self, _live_used: usize) -> usize {
-        let rows = self.parser.screen().size().0 as usize;
+        let rows = self.parser.screen().dims().0 as usize;
         let hist_len = self.history.len();
         if self.view_offset == 0 {
             // Live view: visible row 0 is live screen row 0 = combined[hist_len].
@@ -231,7 +256,7 @@ impl TermBuffer {
         }
         let (_, live_used) = self.live_rows();
         let top = self.view_top_abs(live_used);
-        let rows = self.parser.screen().size().0;
+        let rows = self.parser.screen().dims().0;
         let mut out = Vec::new();
         for ((ar, ac), (fr, fc)) in ranges {
             let (lo_r, lo_c, hi_r, hi_c) = if (ar, ac) <= (fr, fc) {
@@ -275,7 +300,7 @@ impl TermBuffer {
         }
         let q = query.to_lowercase();
         let (live, _) = self.live_rows();
-        let rows = self.parser.screen().size().0 as usize;
+        let rows = self.parser.screen().dims().0 as usize;
         let hist_len = self.history.len();
         let combined_len = hist_len + live.len();
         let Some(match_idx) = self
@@ -330,7 +355,7 @@ impl TermBuffer {
             self.find_cursor = None;
             return (0, 0);
         }
-        let rows = self.parser.screen().size().0 as usize;
+        let rows = self.parser.screen().dims().0 as usize;
         let (_, live_used) = self.live_rows();
         let top = self.view_top_abs(live_used);
         let bottom = top + rows;
@@ -364,7 +389,7 @@ impl TermBuffer {
         if self.parser.screen().alternate_screen() {
             return;
         }
-        let rows = self.parser.screen().size().0 as usize;
+        let rows = self.parser.screen().dims().0 as usize;
         let (_, live_used) = self.live_rows();
         let top = self.view_top_abs(live_used);
         if abs >= top && abs < top + rows {
@@ -384,7 +409,7 @@ impl TermBuffer {
         if q.is_empty() {
             return None;
         }
-        let rows = self.parser.screen().size().0 as usize;
+        let rows = self.parser.screen().dims().0 as usize;
         let (live, live_used) = self.live_rows();
         let top = self.view_top_abs(live_used);
         if abs < top || abs >= top + rows {
@@ -426,6 +451,18 @@ impl TermBuffer {
         self.sel_ranges
             .iter()
             .any(|(anchor, focus)| anchor != focus)
+    }
+
+    /// `None` requests paste; `Some("")` is still a selection and must not paste.
+    pub(crate) fn take_right_click_selection(&mut self) -> Option<String> {
+        if !self.selection_has_extent() {
+            return None;
+        }
+        let text = self.extract_selection_text();
+        self.sel_anchor = None;
+        self.sel_focus = None;
+        self.sel_ranges.clear();
+        Some(text)
     }
 
     pub(crate) fn extract_selection_text(&self) -> String {
@@ -775,7 +812,7 @@ impl TermBuffer {
     /// containing `\n` (#385). Does NOT touch `self.raw`, so it is reused by
     /// both live ingest and resize-reflow replay.
     fn feed_batched(&mut self, bytes: &[u8]) {
-        let (rows, cols) = self.parser.screen().size();
+        let (rows, cols) = self.parser.screen().dims();
         let rows = rows as usize;
         let batch_lines = (rows / 2).max(1);
         let cell_budget = batch_lines.saturating_mul(cols as usize).max(1);
@@ -830,7 +867,7 @@ impl TermBuffer {
     /// remote instead.
     pub(crate) fn reflow(&mut self, new_rows: u16, new_cols: u16) {
         let stream: Vec<u8> = self.raw.iter().copied().collect();
-        self.parser = vt100::Parser::new(new_rows, new_cols, 5000);
+        self.parser = crate::terminal::vt_parser(new_rows, new_cols, 5000);
         self.history.clear();
         self.prev.clear();
         self.view_offset = 0;
@@ -867,9 +904,20 @@ impl TermBuffer {
         self.sync_mouse_tracked();
         let (is_alt, rows, cols) = {
             let s = self.parser.screen();
-            let (r, c) = s.size();
+            let (r, c) = s.dims();
             (s.alternate_screen(), r, c)
         };
+        if !is_alt && self.parser.screen().scrollback_len() > 0 {
+            // MeatShell keeps its own `history` (filled by `detect_scroll`
+            // below), so vt100's copy of rows that scrolled off the normal
+            // screen is redundant. vt100 0.18's `set_size` also pulls rows
+            // back out of that scrollback when the screen grows: if it held
+            // rows we already moved into `history`, growing the window inside
+            // tmux/vim would show them twice after leaving the alt screen.
+            // Keeping it empty here means a resize only round-trips the rows
+            // the resize itself pushed out (#544).
+            self.parser.screen_mut().clear_scrollback();
+        }
         if is_alt {
             // Snap to live view whenever we're on the alt screen — this
             // prevents old history (accumulated before alt-screen was entered)
@@ -894,8 +942,13 @@ impl TermBuffer {
             for line in self.prev.iter().take(k) {
                 self.history.push_back(HistLine::from(line));
             }
+            let mut evicted = 0usize;
             while self.history.len() > MAX_HISTORY {
                 self.history.pop_front();
+                evicted += 1;
+            }
+            if evicted > 0 {
+                self.shift_marks_after_eviction(evicted);
             }
             // `view_offset` is measured backwards from the live bottom.  If
             // output scrolls while the user is reading history, keeping the
@@ -915,7 +968,7 @@ impl TermBuffer {
     pub(crate) fn render(&mut self) -> BuiltScreen {
         let (is_alt, rows, cols, cur_row, cur_col) = {
             let s = self.parser.screen();
-            let (r, c) = s.size();
+            let (r, c) = s.dims();
             let (cr, cc) = s.cursor_position();
             (s.alternate_screen(), r, c, cr, cc)
         };
@@ -1005,7 +1058,7 @@ impl TermBuffer {
             spans,
             cursor_row: (self.parser.screen().cursor_position().0 as i32
                 + self.view_offset as i32)
-                .min(self.parser.screen().size().0 as i32),
+                .min(self.parser.screen().dims().0 as i32),
             cursor_col: self.parser.screen().cursor_position().1 as i32,
             rows_used: win as i32,
             is_alt: false,

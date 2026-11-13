@@ -883,6 +883,14 @@ impl ConfigStore {
         !self.cache.paste_confirm_disabled
     }
 
+    pub fn right_click_copy(&self) -> bool {
+        self.cache.right_click_copy
+    }
+
+    pub fn set_right_click_copy(&mut self, enabled: bool) {
+        self.cache.right_click_copy = enabled;
+    }
+
     pub fn set_paste_confirm_enabled(&mut self, enabled: bool) {
         self.cache.paste_confirm_disabled = !enabled;
     }
@@ -1157,6 +1165,31 @@ impl ConfigStore {
 
     pub fn remove_custom_agent(&mut self, id: &str) {
         self.cache.custom_agents.retain(|agent| agent.id != id);
+    }
+
+    pub fn custom_shells(&self) -> &[CustomShell] {
+        &self.cache.custom_shells
+    }
+
+    /// Add a user-defined local shell (#538). Returns false (and adds nothing)
+    /// when the name or program is blank.
+    pub fn add_custom_shell(&mut self, name: &str, program: &str, args: &str, directory: &str) -> bool {
+        let (name, program) = (name.trim(), program.trim().trim_matches('"'));
+        if name.is_empty() || program.is_empty() {
+            return false;
+        }
+        self.cache.custom_shells.push(CustomShell {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            program: program.to_string(),
+            args: args.trim().to_string(),
+            directory: directory.trim().to_string(),
+        });
+        true
+    }
+
+    pub fn remove_custom_shell(&mut self, id: &str) {
+        self.cache.custom_shells.retain(|shell| shell.id != id);
     }
 
     pub fn quick_panel_open(&self) -> bool {
@@ -1484,6 +1517,22 @@ impl ConfigStore {
     pub fn set_immersive_colors(&mut self, on: bool) {
         self.cache.immersive_colors_disabled = !on;
     }
+    /// Terminal colour scheme id for dark (`dark == true`) or light mode;
+    /// "" = the default MeatShell terminal colours.
+    pub fn terminal_scheme(&self, dark: bool) -> &str {
+        if dark {
+            &self.cache.terminal_scheme_dark
+        } else {
+            &self.cache.terminal_scheme_light
+        }
+    }
+    pub fn set_terminal_scheme(&mut self, dark: bool, id: impl Into<String>) {
+        if dark {
+            self.cache.terminal_scheme_dark = id.into();
+        } else {
+            self.cache.terminal_scheme_light = id.into();
+        }
+    }
     pub fn panel_font(&self) -> u32 {
         if self.cache.panel_font == 0 {
             100
@@ -1657,7 +1706,41 @@ impl ConfigStore {
     pub fn local_places(&self) -> crate::config::LocalPlaces {
         self.cache.local_places.normalized()
     }
-    /// Edit the local places; empty entries are dropped so the config only
+    /// Local pane: show entries the OS marks hidden / system.
+    pub fn sftp_local_show_hidden(&self) -> bool {
+        self.cache.sftp_local_show_hidden
+    }
+    pub fn set_sftp_local_show_hidden(&mut self, show: bool) {
+        self.cache.sftp_local_show_hidden = show;
+    }
+    /// Local pane sort column ("" = folders first, natural name order).
+    pub fn sftp_local_sort_key(&self) -> String {
+        let key = self.cache.sftp_local_sort_key.trim();
+        match key {
+            "name" | "size" | "modified" | "type" => key.to_string(),
+            _ => String::new(),
+        }
+    }
+    pub fn set_sftp_local_sort_key(&mut self, key: &str) {
+        self.cache.sftp_local_sort_key = match key.trim() {
+            "name" | "size" | "modified" | "type" => key.trim().to_string(),
+            _ => String::new(),
+        };
+        if self.cache.sftp_local_sort_key.is_empty() {
+            self.cache.sftp_local_sort_dir = 0;
+        }
+    }
+    /// 0 = default order, 1 = ascending, -1 = descending.
+    pub fn sftp_local_sort_dir(&self) -> i32 {
+        if self.sftp_local_sort_key().is_empty() {
+            0
+        } else {
+            self.cache.sftp_local_sort_dir.clamp(-1, 1)
+        }
+    }
+    pub fn set_sftp_local_sort_dir(&mut self, dir: i32) {
+        self.cache.sftp_local_sort_dir = dir.clamp(-1, 1);
+    }    /// Edit the local places; empty entries are dropped so the config only
     /// carries a `local_places` object when something is actually saved.
     pub fn update_local_places<R>(
         &mut self,
@@ -2128,6 +2211,24 @@ mod tests {
     }
 
     #[test]
+    fn right_click_copy_is_opt_in_and_persists_without_disabling_paste_confirmation() {
+        let mut store = temp_store();
+        store.cache = serde_json::from_str("{}").unwrap();
+        assert!(!store.right_click_copy());
+        store.set_right_click_copy(true);
+        store.save().unwrap();
+        let disk: ConfigFile = serde_json::from_str(&std::fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert!(disk.right_click_copy);
+        assert!(!disk.paste_confirm_disabled);
+        store.set_right_click_copy(false);
+        store.save().unwrap();
+        let disk: ConfigFile = serde_json::from_str(&std::fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert!(!disk.right_click_copy);
+        let _ = std::fs::remove_file(&store.path);
+    }
+
+
+    #[test]
     fn terminal_cursor_style_defaults_and_validates() {
         let mut store = temp_store();
         assert_eq!(store.terminal_cursor_style(), "block");
@@ -2199,8 +2300,7 @@ mod tests {
     }
 
     #[test]
-    fn local_places_are_machine_wide_and_validated() {
-        let mut store = temp_store();
+    fn local_places_are_machine_wide_and_validated() {        let mut store = temp_store();
         store.cache = serde_json::from_str("{}").unwrap();
         assert!(store.local_places().is_empty());
 
@@ -2228,6 +2328,41 @@ mod tests {
         assert!(!serde_json::to_string(&store.cache)
             .unwrap()
             .contains("local_places"));
+    }
+
+    #[test]
+    fn local_list_options_round_trip_and_validate() {
+        let mut store = temp_store();
+        store.cache = serde_json::from_str("{}").unwrap();
+        // Defaults: hidden entries stay hidden, folders first by name.
+        assert!(!store.sftp_local_show_hidden());
+        assert_eq!(store.sftp_local_sort_key(), "");
+        assert_eq!(store.sftp_local_sort_dir(), 0);
+
+        store.set_sftp_local_show_hidden(true);
+        store.set_sftp_local_sort_key("modified");
+        store.set_sftp_local_sort_dir(-1);
+        assert!(store.sftp_local_show_hidden());
+        assert_eq!(store.sftp_local_sort_key(), "modified");
+        assert_eq!(store.sftp_local_sort_dir(), -1);
+
+        // Unknown columns fall back to the default order, and a cleared column
+        // clears the direction too.
+        store.set_sftp_local_sort_key("permissions");
+        assert_eq!(store.sftp_local_sort_key(), "");
+        assert_eq!(store.sftp_local_sort_dir(), 0);
+        store.set_sftp_local_sort_dir(5);
+        assert_eq!(store.sftp_local_sort_dir(), 0);
+
+        store.set_sftp_local_sort_key("size");
+        store.set_sftp_local_sort_dir(7);
+        assert_eq!(store.sftp_local_sort_dir(), 1);
+
+        let json = serde_json::to_string(&store.cache).unwrap();
+        let back: ConfigFile = serde_json::from_str(&json).unwrap();
+        assert!(back.sftp_local_show_hidden);
+        assert_eq!(back.sftp_local_sort_key, "size");
+        assert_eq!(back.sftp_local_sort_dir, 1);
     }
 
     #[test]

@@ -26,6 +26,10 @@ pub(super) fn save_layout(
     s.set_sftp_split_enabled(win.get_sftp_split_enabled());
     s.set_sftp_local_split(win.get_sftp_local_split());
     s.set_sftp_local_dir(&win.get_sftp_last_local_dir());
+    // Local list options (#532 follow-up).
+    s.set_sftp_local_show_hidden(win.get_sftp_local_show_hidden());
+    s.set_sftp_local_sort_key(&win.get_sftp_local_sort_key());
+    s.set_sftp_local_sort_dir(win.get_sftp_local_sort_dir());
     // Local bookmarks / recent folders (#532); the Slint models are the live
     // copy, the config only needs them on close.
     let places = crate::config::LocalPlaces {
@@ -120,6 +124,9 @@ pub(super) fn refresh_panes(
 ) {
     let (cw, ch) = (content.0.max(1.0), content.1.max(1.0));
     let (panes, splits) = layout.flatten(0.0, 0.0, cw, ch);
+    // With the custom title bar the toolbar icons sit in the title bar, so the
+    // tab row no longer needs to keep room for them.
+    let toolbar_in_tab_row = !window.get_custom_titlebar();
 
     let pane_infos: Vec<PaneInfo> = panes
         .iter()
@@ -148,8 +155,8 @@ pub(super) fn refresh_panes(
                 active_id: p.active.clone().into(),
                 focused: p.focused,
                 // Room for the seven top-right toolbar icons (30px each, incl. the
-                // pin #450 and Updates).
-                reserve_right: if top_right { 240.0 } else { 0.0 },
+                // pin #450 and Updates) — only when they float over the tab row (macOS).
+                reserve_right: if top_right && toolbar_in_tab_row { 240.0 } else { 0.0 },
                 tabs: ModelRc::from(Rc::new(VecModel::from(tabs))),
             }
         })

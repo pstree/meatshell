@@ -182,12 +182,14 @@ pub(super) fn open_window(
     wire_terminal_settings(&ctx);
     wire_ui_scale_and_wallpaper(&ctx);
     super::color_theme::wire(&ctx);
+    super::terminal_scheme::wire(&ctx);
 
     let sessions_model: Rc<VecModel<SessionInfo>> = Rc::new(VecModel::default());
     window.set_sessions(ModelRc::from(sessions_model.clone()));
     sync_sessions_to_model(&store.borrow(), &sessions_model);
     window.set_wsl_profiles(wsl_profile_model(&store.borrow()));
     window.set_launch_shells(launch_shell_model(&store.borrow()));
+    super::local_shells::wire_custom_shells(&ctx);
     super::agents::wire_agent_launchers(&ctx, &sessions_model);
     listen_for_config_changes(&ctx, &sessions_model);
     wire_wsl_profiles(&ctx, &sessions_model);
@@ -491,6 +493,7 @@ pub(super) fn open_window(
     // Repeated timers created below (system sampler). Parked in WindowState
     // so closing the window stops them instead of leaking.
     let window_timers: Rc<RefCell<Vec<slint::Timer>>> = Rc::new(RefCell::new(Vec::new()));
+    let transfer_speeds = super::transfer_speeds::TransferSpeeds::new(&window);
 
     // Expose this window's state to the rest of the process so tabs can be
     // dragged out into a new window or merged into another one (#tab-detach).
@@ -515,6 +518,7 @@ pub(super) fn open_window(
             panes_model: panes_model.clone(),
             splitters_model: splitters_model.clone(),
             timers: window_timers.clone(),
+            transfer_speeds: transfer_speeds.clone(),
             content_size: content_size.clone(),
             proc_win: proc_win.clone(),
             sys_win: sys_win.clone(),
@@ -661,7 +665,10 @@ pub(super) fn open_window(
     window.set_transfers(ModelRc::from(transfers_model.clone()));
     {
         let tm = transfers_model.clone();
-        window.on_clear_transfers(move || tm.set_vec(Vec::<TransferInfo>::new()));
+        window.on_clear_transfers(move || {
+            transfer_speeds.clear();
+            tm.set_vec(Vec::<TransferInfo>::new());
+        });
     }
     {
         // Cancel a transfer by id. The id is a UUID unique across sessions, so we
